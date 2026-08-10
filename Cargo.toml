@@ -1,0 +1,16 @@
+[package]
+name = "cce-browser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cce-ui = { path = "../cce-ui" }
+calloop = "0.13.0"
+wayland-client = { version = "0.31", features = ["system"] }
+servo = "0.4"
+url = "2"
+dpi = "0.1"
+euclid = "0.22"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+log = "0.4"
+env_logger = "0.11"
