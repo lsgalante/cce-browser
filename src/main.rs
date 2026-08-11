@@ -23,9 +23,10 @@ const BAR_MARGIN: f32 = 10.0;
 const BAR_H: f32 = 38.0;
 const BAR_RADIUS: f32 = 10.0;
 const BAR_PAD: f32 = 7.0;
-/// Utility-bar fill; the negative alpha marks the plate as blur-behind, so
-/// it frosts the page content drawn beneath it (|alpha| = blur strength).
-const BAR_FILL: [f32; 4] = [0.11, 0.12, 0.13, -0.58];
+/// Utility-bar fill; the negative alpha marks the plate as blur-behind.
+/// The blurred page is the base and this color tints it at |alpha|
+/// opacity — keep |alpha| low so the frosted content shows through.
+const BAR_FILL: [f32; 4] = [0.11, 0.12, 0.13, -0.28];
 const BTN_W: f32 = 30.0;
 const BTN_H: f32 = 26.0;
 const BTN_GAP: f32 = 6.0;
@@ -37,8 +38,8 @@ const LINE_PX: f64 = 76.0;
 const HOME_URL: &str = "https://servo.org";
 
 const PAGE_BG: [f32; 4] = [0.10, 0.10, 0.11, 1.0];
-const FIELD_BG: [f32; 4] = [0.09, 0.09, 0.10, 0.85];
-const BTN_BG: [f32; 4] = [0.20, 0.21, 0.23, 0.85];
+const FIELD_BG: [f32; 4] = [0.09, 0.09, 0.10, 0.40];
+const BTN_BG: [f32; 4] = [0.20, 0.21, 0.23, 0.40];
 const RIM: [f32; 4] = [0.22, 0.23, 0.25, 1.0];
 const RIM_FOCUS: [f32; 4] = [0.33, 0.48, 0.72, 1.0];
 const ACCENT: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
