@@ -374,16 +374,22 @@ impl Application for BrowserApp {
     type Message = Message;
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
-        let url = Url::parse(HOME_URL).expect("home url");
+        // Optional CLI arg: the start URL (same parsing as the URL bar).
+        let url = std::env::args()
+            .nth(1)
+            .and_then(|arg| parse_url_input(&arg))
+            .unwrap_or_else(|| Url::parse(HOME_URL).expect("home url"));
+        let url_input = url.to_string();
+        let cursor = url_input.len();
         let host = ServoHost::new(sender, url, (1200, 800));
         Self {
             host,
             win: (1200.0, 800.0),
             scale: 1.0,
             pointer: (0.0, 0.0),
-            url_input: HOME_URL.to_string(),
+            url_input,
             url_focused: false,
-            cursor: HOME_URL.len(),
+            cursor,
             loading: true,
             title: None,
         }

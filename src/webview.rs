@@ -17,10 +17,11 @@ use std::rc::Rc;
 use dpi::PhysicalSize;
 use euclid::Scale;
 use servo::{
-    DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent, Key as DomKey, KeyState,
-    KeyboardEvent, LoadStatus, MouseButton as DomMouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseMoveEvent, RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, WebView,
-    WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta, WheelEvent, WheelMode,
+    CreateNewWebViewRequest, DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent,
+    Key as DomKey, KeyState, KeyboardEvent, LoadStatus, MouseButton as DomMouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, Servo, ServoBuilder,
+    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta,
+    WheelEvent, WheelMode,
 };
 use url::Url;
 
@@ -40,11 +41,18 @@ struct TabSignals {
 struct HostShared {
     dirty: Cell<bool>,
     per: RefCell<HashMap<WebViewId, TabSignals>>,
+    /// WebViews created by pages (window.open / target=_blank), built in the
+    /// delegate and adopted as tabs by the next `pump`.
+    pending_new: RefCell<Vec<WebView>>,
 }
 
 struct Delegate {
     shared: Rc<HostShared>,
     wake: calloop::channel::Sender<Message>,
+    context: Rc<SoftwareRenderingContext>,
+    /// Handle to this same Rc'd delegate, so page-opened webviews can be
+    /// delegated back here; filled right after construction.
+    self_rc: RefCell<std::rc::Weak<Delegate>>,
 }
 
 impl Delegate {
@@ -70,6 +78,19 @@ impl WebViewDelegate for Delegate {
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
         self.with_tab(&webview, |t| t.loading = status != LoadStatus::Complete);
+    }
+
+    fn request_create_new(&self, _parent_webview: WebView, request: CreateNewWebViewRequest) {
+        let Some(delegate) = self.self_rc.borrow().upgrade() else {
+            return; // dropping the request denies it
+        };
+        let webview = request
+            .builder(self.context.clone())
+            .delegate(delegate)
+            .build();
+        self.shared.pending_new.borrow_mut().push(webview);
+        self.shared.dirty.set(true);
+        let _ = self.wake.send(Message::Spin);
     }
 }
 
@@ -126,7 +147,13 @@ impl ServoHost {
             .build();
 
         let shared = Rc::new(HostShared::default());
-        let delegate = Rc::new(Delegate { shared: shared.clone(), wake });
+        let delegate = Rc::new(Delegate {
+            shared: shared.clone(),
+            wake,
+            context: context.clone(),
+            self_rc: RefCell::new(std::rc::Weak::new()),
+        });
+        *delegate.self_rc.borrow_mut() = Rc::downgrade(&delegate);
 
         let mut host = Self {
             servo,
@@ -251,6 +278,19 @@ impl ServoHost {
     /// tab if it produced a frame. Returns (new frame, any state change).
     pub fn pump(&mut self) -> (bool, bool) {
         self.servo.spin_event_loop();
+        // Adopt page-opened webviews as tabs; like a browser popup, the
+        // newest one takes focus.
+        let opened: Vec<WebView> = self.shared.pending_new.borrow_mut().drain(..).collect();
+        for webview in opened {
+            self.tabs.push(Tab {
+                webview,
+                title: None,
+                url: None,
+                loading: true,
+                image: None,
+            });
+            self.activate(self.tabs.len() - 1);
+        }
         let dirty = self.shared.dirty.take();
         let mut active_frame = false;
         if dirty {
