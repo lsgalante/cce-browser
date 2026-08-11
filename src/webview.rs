@@ -19,13 +19,14 @@ use euclid::Scale;
 use servo::{
     CreateNewWebViewRequest, DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent,
     Key as DomKey, KeyState, KeyboardEvent, LoadStatus, MouseButton as DomMouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, Servo, ServoBuilder,
-    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta,
-    WheelEvent, WheelMode,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, RenderingContext,
+    Servo, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
+    WebViewId, WheelDelta, WheelEvent, WheelMode,
 };
 use servo::protocol_handler::ProtocolRegistry;
 use url::Url;
 
+use crate::downloads::{is_download_url, Downloads};
 use crate::pages::{Bookmarks, CceProtocol, History};
 use crate::Message;
 
@@ -49,12 +50,16 @@ struct HostShared {
     /// WebViews created by pages (window.open / target=_blank), built in the
     /// delegate and adopted as tabs by the next `pump`.
     pending_new: RefCell<Vec<WebView>>,
+    /// A navigation was diverted into a download; the app surfaces the
+    /// downloads page.
+    download_started: Cell<bool>,
 }
 
 struct Delegate {
     shared: Rc<HostShared>,
     wake: calloop::channel::Sender<Message>,
     context: Rc<SoftwareRenderingContext>,
+    downloads: std::sync::Arc<Downloads>,
     /// Handle to this same Rc'd delegate, so page-opened webviews can be
     /// delegated back here; filled right after construction.
     self_rc: RefCell<std::rc::Weak<Delegate>>,
@@ -83,6 +88,21 @@ impl WebViewDelegate for Delegate {
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
         self.with_tab(&webview, |t| t.loading = Some(status != LoadStatus::Complete));
+    }
+
+    fn request_navigation(&self, _webview: WebView, request: NavigationRequest) {
+        // Navigations to downloadable files become chrome downloads —
+        // Servo has no download path of its own.
+        if is_download_url(&request.url) {
+            let url = request.url.clone();
+            request.deny();
+            self.downloads.start(url);
+            self.shared.download_started.set(true);
+            self.shared.dirty.set(true);
+            let _ = self.wake.send(Message::Spin);
+        } else {
+            request.allow();
+        }
     }
 
     fn request_create_new(&self, _parent_webview: WebView, request: CreateNewWebViewRequest) {
@@ -151,8 +171,13 @@ impl ServoHost {
 
         let history = std::sync::Arc::new(History::load());
         let bookmarks = std::sync::Arc::new(Bookmarks::load());
+        let downloads = std::sync::Arc::new(Downloads::default());
         let mut protocols = ProtocolRegistry::default();
-        let handler = CceProtocol { history: history.clone(), bookmarks: bookmarks.clone() };
+        let handler = CceProtocol {
+            history: history.clone(),
+            bookmarks: bookmarks.clone(),
+            downloads: downloads.clone(),
+        };
         if let Err(e) = protocols.register("cce", handler) {
             log::error!("failed to register cce: protocol: {e:?}");
         }
@@ -167,6 +192,7 @@ impl ServoHost {
             shared: shared.clone(),
             wake,
             context: context.clone(),
+            downloads: downloads.clone(),
             self_rc: RefCell::new(std::rc::Weak::new()),
         });
         *delegate.self_rc.borrow_mut() = Rc::downgrade(&delegate);
@@ -354,6 +380,11 @@ impl ServoHost {
 
     pub fn loading(&self) -> bool {
         self.active_tab().loading
+    }
+
+    /// A navigation became a download since the last check.
+    pub fn take_download_started(&self) -> bool {
+        self.shared.download_started.take()
     }
 
     /// Whether the active tab's page is bookmarked.

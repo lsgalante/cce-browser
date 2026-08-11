@@ -6,6 +6,7 @@
 //! reload / URL field). Input over the page area is translated into Servo
 //! input events; the URL bar is a small hand-rolled line editor.
 
+mod downloads;
 mod pages;
 mod webview;
 
@@ -183,6 +184,9 @@ fn parse_url_input(input: &str) -> Option<Url> {
     if s.eq_ignore_ascii_case("about:bookmarks") {
         return Url::parse("cce://bookmarks").ok();
     }
+    if s.eq_ignore_ascii_case("about:downloads") {
+        return Url::parse("cce://downloads").ok();
+    }
     if let Ok(u) = Url::parse(s) {
         if matches!(u.scheme(), "http" | "https" | "file" | "data" | "about" | "cce") {
             return Some(u);
@@ -312,6 +316,27 @@ impl BrowserApp {
         self.sync_page_state();
     }
 
+    /// Show an internal page: reuse a tab already on it (reloading, so
+    /// live pages like downloads refresh), otherwise open a new one.
+    fn open_internal_page(&mut self, page: &str) {
+        let Ok(url) = Url::parse(page) else { return };
+        for i in 0..self.host.tab_count() {
+            let on_page = self
+                .host
+                .tab(i)
+                .and_then(|t| t.url.as_ref().map(|u| u.as_str().starts_with(page)))
+                .unwrap_or(false);
+            if on_page {
+                self.switch_tab(i);
+                self.host.reload();
+                return;
+            }
+        }
+        self.host.open_tab(url);
+        self.url_focused = false;
+        self.sync_page_state();
+    }
+
     /// Widest prefix of `text` fitting `avail`, with a "…"-style tail cut.
     fn fit_text(text: &str, sans: &str, size: f32, avail: f32) -> String {
         if measure_text_width(text, sans, size) <= avail {
@@ -428,6 +453,9 @@ impl Application for BrowserApp {
         match msg {
             Message::Spin => {
                 let (new_frame, dirty) = self.host.pump();
+                if self.host.take_download_started() {
+                    self.open_internal_page("cce://downloads");
+                }
                 if dirty {
                     self.sync_page_state();
                 }
@@ -558,14 +586,14 @@ impl Application for BrowserApp {
                     *needs_rebuild = true;
                     return self.close_tab(self.host.active_index());
                 }
-                Key::Character(c) if c == "h" || c == "b" => {
-                    let page = if c == "h" { "cce://history" } else { "cce://bookmarks" };
-                    if let Ok(url) = Url::parse(page) {
-                        self.host.open_tab(url);
-                        self.url_focused = false;
-                        self.sync_page_state();
-                        *needs_rebuild = true;
-                    }
+                Key::Character(c) if c == "h" || c == "b" || c == "j" => {
+                    let page = match c.as_str() {
+                        "h" => "cce://history",
+                        "b" => "cce://bookmarks",
+                        _ => "cce://downloads",
+                    };
+                    self.open_internal_page(page);
+                    *needs_rebuild = true;
                     return None;
                 }
                 Key::Character(c) if c == "d" => {

@@ -53,7 +53,7 @@ fn sanitize(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
 }
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -88,9 +88,10 @@ fn write_tsv(path: &PathBuf, entries: &[Entry]) {
 }
 
 /// Shared page skeleton for the internal pages (dark, DE-toned).
-fn page(title: &str, meta: &str, body: &str) -> String {
+/// `head_extra` lands in <head> (e.g. a refresh tag for live pages).
+pub(crate) fn page(title: &str, meta: &str, body: &str, head_extra: &str) -> String {
     format!(
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title}</title><style>\
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title}</title>{head_extra}<style>\
          :root{{color-scheme:dark}}\
          body{{background:#1a1b1d;color:#dcdce1;font-family:sans-serif;margin:0;padding:28px 36px}}\
          h1{{font-size:20px;font-weight:600;margin:0 0 4px}}\
@@ -179,7 +180,7 @@ impl History {
         } else {
             rows
         };
-        page("History", &meta, &body)
+        page("History", &meta, &body, "")
     }
 }
 
@@ -245,7 +246,7 @@ impl Bookmarks {
         } else {
             rows
         };
-        page("Bookmarks", &meta, &body)
+        page("Bookmarks", &meta, &body, "")
     }
 }
 
@@ -253,6 +254,7 @@ impl Bookmarks {
 pub struct CceProtocol {
     pub history: Arc<History>,
     pub bookmarks: Arc<Bookmarks>,
+    pub downloads: Arc<crate::downloads::Downloads>,
 }
 
 impl ProtocolHandler for CceProtocol {
@@ -279,6 +281,11 @@ impl ProtocolHandler for CceProtocol {
                     self.bookmarks.remove(&target);
                 }
                 Some(self.bookmarks.html())
+            }
+            "downloads" => Some(self.downloads.html()),
+            "downloads/clear" => {
+                self.downloads.clear_finished();
+                Some(self.downloads.html())
             }
             _ => None,
         };

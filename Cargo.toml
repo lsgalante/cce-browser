@@ -10,6 +10,7 @@ wayland-client = { version = "0.31", features = ["system"] }
 servo = "0.4"
 url = "2"
 http = "1"
+reqwest = { version = "0.12", features = ["blocking"] }
 dpi = "0.1"
 euclid = "0.22"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
