@@ -26,7 +26,7 @@ use servo::{
 use servo::protocol_handler::ProtocolRegistry;
 use url::Url;
 
-use crate::history::{CceProtocol, History};
+use crate::pages::{Bookmarks, CceProtocol, History};
 use crate::Message;
 
 /// Delegate-observed signals for one webview, polled by the app after each
@@ -129,6 +129,7 @@ pub struct ServoHost {
     shared: Rc<HostShared>,
     delegate: Rc<Delegate>,
     history: std::sync::Arc<History>,
+    bookmarks: std::sync::Arc<Bookmarks>,
     tabs: Vec<Tab>,
     active: usize,
     size_px: (u32, u32),
@@ -149,8 +150,10 @@ impl ServoHost {
             .expect("make software rendering context current");
 
         let history = std::sync::Arc::new(History::load());
+        let bookmarks = std::sync::Arc::new(Bookmarks::load());
         let mut protocols = ProtocolRegistry::default();
-        if let Err(e) = protocols.register("cce", CceProtocol { history: history.clone() }) {
+        let handler = CceProtocol { history: history.clone(), bookmarks: bookmarks.clone() };
+        if let Err(e) = protocols.register("cce", handler) {
             log::error!("failed to register cce: protocol: {e:?}");
         }
 
@@ -174,6 +177,7 @@ impl ServoHost {
             shared,
             delegate,
             history,
+            bookmarks,
             tabs: Vec::new(),
             // Sentinel so the first open_tab's activate() does the full
             // show/focus/resize dance instead of early-returning on 0 == 0.
@@ -350,6 +354,23 @@ impl ServoHost {
 
     pub fn loading(&self) -> bool {
         self.active_tab().loading
+    }
+
+    /// Whether the active tab's page is bookmarked.
+    pub fn active_bookmarked(&self) -> bool {
+        self.active_tab()
+            .url
+            .as_ref()
+            .is_some_and(|u| self.bookmarks.contains(u.as_str()))
+    }
+
+    /// Toggle the bookmark for the active tab's page.
+    pub fn toggle_bookmark(&self) {
+        let tab = self.active_tab();
+        if let Some(url) = &tab.url {
+            self.bookmarks
+                .toggle(url.as_str(), tab.title.as_deref().unwrap_or(""));
+        }
     }
 
     pub fn can_go_back(&self) -> bool {

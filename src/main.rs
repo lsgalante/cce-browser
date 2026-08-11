@@ -6,7 +6,7 @@
 //! reload / URL field). Input over the page area is translated into Servo
 //! input events; the URL bar is a small hand-rolled line editor.
 
-mod history;
+mod pages;
 mod webview;
 
 use url::Url;
@@ -148,13 +148,24 @@ fn btn_rect(i: usize) -> Rect {
     }
 }
 
+/// The bookmark star, at the right end of the controls row.
+fn star_rect(win_w: f32) -> Rect {
+    let bar = bar_rect(win_w);
+    Rect {
+        x: bar.x + bar.width - BAR_PAD - BTN_W,
+        y: controls_y(),
+        width: BTN_W,
+        height: BTN_H,
+    }
+}
+
 fn url_rect(win_w: f32) -> Rect {
     let bar = bar_rect(win_w);
     let x = BAR_MARGIN + BAR_PAD + 3.0 * (BTN_W + BTN_GAP) + 4.0;
     Rect {
         x,
         y: controls_y(),
-        width: (bar.x + bar.width - BAR_PAD - x).max(60.0),
+        width: (bar.x + bar.width - BAR_PAD - BTN_W - BTN_GAP - x).max(60.0),
         height: BTN_H,
     }
 }
@@ -168,6 +179,9 @@ fn parse_url_input(input: &str) -> Option<Url> {
     }
     if s.eq_ignore_ascii_case("about:history") {
         return Url::parse("cce://history").ok();
+    }
+    if s.eq_ignore_ascii_case("about:bookmarks") {
+        return Url::parse("cce://bookmarks").ok();
     }
     if let Ok(u) = Url::parse(s) {
         if matches!(u.scheme(), "http" | "https" | "file" | "data" | "about" | "cce") {
@@ -482,6 +496,8 @@ impl Application for BrowserApp {
                 self.host.forward();
             } else if hit(&btn_rect(2), pos.x, pos.y) {
                 self.host.reload();
+            } else if hit(&star_rect(self.win.0), pos.x, pos.y) {
+                self.host.toggle_bookmark();
             } else {
                 let field = url_rect(self.win.0);
                 if hit(&field, pos.x, pos.y) {
@@ -542,13 +558,19 @@ impl Application for BrowserApp {
                     *needs_rebuild = true;
                     return self.close_tab(self.host.active_index());
                 }
-                Key::Character(c) if c == "h" => {
-                    if let Ok(url) = Url::parse("cce://history") {
+                Key::Character(c) if c == "h" || c == "b" => {
+                    let page = if c == "h" { "cce://history" } else { "cce://bookmarks" };
+                    if let Ok(url) = Url::parse(page) {
                         self.host.open_tab(url);
                         self.url_focused = false;
                         self.sync_page_state();
                         *needs_rebuild = true;
                     }
+                    return None;
+                }
+                Key::Character(c) if c == "d" => {
+                    self.host.toggle_bookmark();
+                    *needs_rebuild = true;
                     return None;
                 }
                 Key::Named(NamedKey::Tab) if count > 1 => {
@@ -701,6 +723,20 @@ impl Application for BrowserApp {
                 color,
             );
         }
+
+        // Bookmark star: accent-lit when the page is bookmarked.
+        let star = star_rect(w);
+        pc.rounded_rect(star, 6.0, (true, true, true, true), BTN_BG);
+        let starred = self.host.active_bookmarked();
+        let star_color: [u8; 3] = if starred { [150, 190, 240] } else { TEXT_DIM };
+        let sw = measure_text_width("*", &sans, 17.0);
+        pc.text(
+            "*",
+            star.x + (star.width - sw) / 2.0,
+            cce_ui::layout::align_text_y(star.y, star.height, 17.0, 0.0) + 3.0,
+            17.0,
+            star_color,
+        );
 
         // URL field: rim + recess, brighter rim when focused.
         let f = url_rect(w);
