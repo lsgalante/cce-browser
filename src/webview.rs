@@ -1,14 +1,17 @@
 //! Servo embedding host: boots an in-process Servo against a software
-//! (CPU) rendering context, owns the single WebView, and pumps finished
-//! frames into cce-ui's image registry as RGBA uploads.
+//! (CPU) rendering context and owns one WebView per tab, all sharing that
+//! context — only the active tab is painted and read back (servoshell's
+//! model). Finished frames upload into cce-ui's image registry; each tab
+//! keeps its last frame so switching is instant.
 //!
 //! Everything here lives on the main thread. Servo wakes the calloop loop
 //! through `Waker` (a channel sender); the app then calls [`ServoHost::pump`],
 //! which spins Servo's event loop and, when the delegate has flagged a ready
-//! frame, paints and reads back pixels. `read_to_image` happens *without*
-//! `present()` so the buffer is still there to read.
+//! frame on the active tab, paints and reads back pixels. `read_to_image`
+//! happens *without* `present()` so the buffer is still there to read.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use dpi::PhysicalSize;
@@ -17,53 +20,56 @@ use servo::{
     DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent, Key as DomKey, KeyState,
     KeyboardEvent, LoadStatus, MouseButton as DomMouseButton, MouseButtonAction, MouseButtonEvent,
     MouseMoveEvent, RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, WebView,
-    WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
+    WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 
 use crate::Message;
 
-/// Page state observed by the delegate, polled by the app after each pump.
+/// Delegate-observed signals for one webview, polled by the app after each
+/// pump.
 #[derive(Default)]
-pub struct PageState {
-    frame_ready: Cell<bool>,
+struct TabSignals {
+    frame_ready: bool,
+    title: Option<String>,
+    url: Option<Url>,
+    loading: bool,
+}
+
+#[derive(Default)]
+struct HostShared {
     dirty: Cell<bool>,
-    title: RefCell<Option<String>>,
-    url: RefCell<Option<Url>>,
-    loading: Cell<bool>,
+    per: RefCell<HashMap<WebViewId, TabSignals>>,
 }
 
 struct Delegate {
-    state: Rc<PageState>,
+    shared: Rc<HostShared>,
     wake: calloop::channel::Sender<Message>,
 }
 
 impl Delegate {
-    fn touch(&self) {
-        self.state.dirty.set(true);
+    fn with_tab(&self, webview: &WebView, f: impl FnOnce(&mut TabSignals)) {
+        f(self.shared.per.borrow_mut().entry(webview.id()).or_default());
+        self.shared.dirty.set(true);
         let _ = self.wake.send(Message::Spin);
     }
 }
 
 impl WebViewDelegate for Delegate {
-    fn notify_new_frame_ready(&self, _webview: WebView) {
-        self.state.frame_ready.set(true);
-        self.touch();
+    fn notify_new_frame_ready(&self, webview: WebView) {
+        self.with_tab(&webview, |t| t.frame_ready = true);
     }
 
-    fn notify_page_title_changed(&self, _webview: WebView, title: Option<String>) {
-        *self.state.title.borrow_mut() = title;
-        self.touch();
+    fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
+        self.with_tab(&webview, |t| t.title = title);
     }
 
-    fn notify_url_changed(&self, _webview: WebView, url: Url) {
-        *self.state.url.borrow_mut() = Some(url);
-        self.touch();
+    fn notify_url_changed(&self, webview: WebView, url: Url) {
+        self.with_tab(&webview, |t| t.url = Some(url));
     }
 
-    fn notify_load_status_changed(&self, _webview: WebView, status: LoadStatus) {
-        self.state.loading.set(status != LoadStatus::Complete);
-        self.touch();
+    fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        self.with_tab(&webview, |t| t.loading = status != LoadStatus::Complete);
     }
 }
 
@@ -81,13 +87,25 @@ impl EventLoopWaker for Waker {
     }
 }
 
+/// One tab: its webview plus the app-visible page state and the last frame
+/// uploaded to the image registry (id, w px, h px).
+pub struct Tab {
+    webview: WebView,
+    pub title: Option<String>,
+    pub url: Option<Url>,
+    pub loading: bool,
+    image: Option<(u32, u32, u32)>,
+}
+
 pub struct ServoHost {
     servo: Servo,
-    webview: WebView,
     context: Rc<SoftwareRenderingContext>,
-    state: Rc<PageState>,
-    /// Current page frame in the cce-ui image registry: (id, w px, h px).
-    image: Option<(u32, u32, u32)>,
+    shared: Rc<HostShared>,
+    delegate: Rc<Delegate>,
+    tabs: Vec<Tab>,
+    active: usize,
+    size_px: (u32, u32),
+    scale: f32,
 }
 
 impl ServoHost {
@@ -107,103 +125,221 @@ impl ServoHost {
             .event_loop_waker(Box::new(Waker(wake.clone())))
             .build();
 
-        let state = Rc::new(PageState::default());
-        let webview = WebViewBuilder::new(&servo, context.clone())
-            .url(url)
-            .delegate(Rc::new(Delegate { state: state.clone(), wake }))
-            .build();
-        webview.show();
-        webview.focus();
+        let shared = Rc::new(HostShared::default());
+        let delegate = Rc::new(Delegate { shared: shared.clone(), wake });
 
-        Self { servo, webview, context, state, image: None }
+        let mut host = Self {
+            servo,
+            context,
+            shared,
+            delegate,
+            tabs: Vec::new(),
+            // Sentinel so the first open_tab's activate() does the full
+            // show/focus/resize dance instead of early-returning on 0 == 0.
+            active: usize::MAX,
+            size_px,
+            scale: 1.0,
+        };
+        host.open_tab(url);
+        host
     }
 
-    /// Spin Servo and swap any finished frame into the image registry.
-    /// Returns (new frame uploaded, page state changed).
-    pub fn pump(&mut self) -> (bool, bool) {
-        self.servo.spin_event_loop();
-        let dirty = self.state.dirty.take();
-        let mut new_frame = false;
-        if self.state.frame_ready.take() {
-            self.webview.paint();
-            let rect = DeviceIntRect::from_size(self.context.size2d().to_i32());
-            if let Some(img) = self.context.read_to_image(rect) {
-                let (w, h) = img.dimensions();
-                let id = cce_ui::vk::upload_rgba(img.into_raw(), w, h);
-                if let Some((old, ..)) = self.image.replace((id, w, h)) {
-                    cce_ui::vk::free_image(old);
-                }
-                new_frame = true;
+    fn build_webview(&self, url: Url) -> WebView {
+        WebViewBuilder::new(&self.servo, self.context.clone())
+            .url(url)
+            .delegate(self.delegate.clone())
+            .build()
+    }
+
+    /// Open a new tab and make it active.
+    pub fn open_tab(&mut self, url: Url) {
+        let webview = self.build_webview(url);
+        self.tabs.push(Tab {
+            webview,
+            title: None,
+            url: None,
+            loading: true,
+            image: None,
+        });
+        self.activate(self.tabs.len() - 1);
+    }
+
+    /// Close a tab. Returns false when that was the last tab (the app should
+    /// exit; the tab is gone either way).
+    pub fn close_tab(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return true;
+        }
+        let was_active = index == self.active;
+        let old_active = self.active;
+        let tab = self.tabs.remove(index);
+        self.shared.per.borrow_mut().remove(&tab.webview.id());
+        if let Some((id, ..)) = tab.image {
+            cce_ui::vk::free_image(id);
+        }
+        drop(tab); // last WebView handle: servo tears the page down
+        if self.tabs.is_empty() {
+            return false;
+        }
+        // Closing the active tab moves to its neighbor; closing a background
+        // tab keeps the current one (its index may have shifted down).
+        let next = if was_active {
+            index.min(self.tabs.len() - 1)
+        } else if old_active > index {
+            old_active - 1
+        } else {
+            old_active
+        };
+        self.active = usize::MAX; // force activate() to do the work
+        self.activate(next);
+        true
+    }
+
+    /// Make tab `index` the visible, focused one.
+    pub fn activate(&mut self, index: usize) {
+        if index >= self.tabs.len() || index == self.active {
+            return;
+        }
+        if let Some(old) = self.tabs.get(self.active) {
+            old.webview.blur();
+            old.webview.hide();
+        }
+        self.active = index;
+        let tab = &self.tabs[index];
+        tab.webview.show();
+        tab.webview.focus();
+        tab.webview.set_hidpi_scale_factor(Scale::new(self.scale));
+        tab.webview
+            .resize(PhysicalSize::new(self.size_px.0.max(1), self.size_px.1.max(1)));
+        // Composite whatever frame the tab already has so the switch shows
+        // content immediately; the resize above refreshes it right after.
+        self.paint_active();
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn tab(&self, index: usize) -> Option<&Tab> {
+        self.tabs.get(index)
+    }
+
+    fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    /// Paint the active webview into the shared context and swap the read
+    /// pixels into its registry image.
+    fn paint_active(&mut self) {
+        self.active_tab().webview.paint();
+        let rect = DeviceIntRect::from_size(self.context.size2d().to_i32());
+        if let Some(img) = self.context.read_to_image(rect) {
+            let (w, h) = img.dimensions();
+            let id = cce_ui::vk::upload_rgba(img.into_raw(), w, h);
+            let tab = &mut self.tabs[self.active];
+            if let Some((old, ..)) = tab.image.replace((id, w, h)) {
+                cce_ui::vk::free_image(old);
             }
         }
-        (new_frame, dirty)
+    }
+
+    /// Spin Servo, sync delegate signals into tabs, and repaint the active
+    /// tab if it produced a frame. Returns (new frame, any state change).
+    pub fn pump(&mut self) -> (bool, bool) {
+        self.servo.spin_event_loop();
+        let dirty = self.shared.dirty.take();
+        let mut active_frame = false;
+        if dirty {
+            let mut per = self.shared.per.borrow_mut();
+            for (i, tab) in self.tabs.iter_mut().enumerate() {
+                if let Some(sig) = per.get_mut(&tab.webview.id()) {
+                    tab.title = sig.title.clone();
+                    tab.url = sig.url.clone();
+                    tab.loading = sig.loading;
+                    if std::mem::take(&mut sig.frame_ready) && i == self.active {
+                        active_frame = true;
+                    }
+                }
+            }
+        }
+        if active_frame {
+            self.paint_active();
+        }
+        (active_frame, dirty)
     }
 
     pub fn image(&self) -> Option<(u32, u32, u32)> {
-        self.image
+        self.active_tab().image
     }
 
     pub fn title(&self) -> Option<String> {
-        self.state.title.borrow().clone()
+        self.active_tab().title.clone()
     }
 
     pub fn url(&self) -> Option<Url> {
-        self.state.url.borrow().clone()
+        self.active_tab().url.clone()
     }
 
     pub fn loading(&self) -> bool {
-        self.state.loading.get()
+        self.active_tab().loading
     }
 
     pub fn can_go_back(&self) -> bool {
-        self.webview.can_go_back()
+        self.active_tab().webview.can_go_back()
     }
 
     pub fn can_go_forward(&self) -> bool {
-        self.webview.can_go_forward()
+        self.active_tab().webview.can_go_forward()
     }
 
     pub fn load(&self, url: Url) {
-        self.webview.load(url);
+        self.active_tab().webview.load(url);
     }
 
     pub fn reload(&self) {
-        self.webview.reload();
+        self.active_tab().webview.reload();
     }
 
     pub fn back(&self) {
-        if self.webview.can_go_back() {
-            let _ = self.webview.go_back(1);
+        let webview = &self.active_tab().webview;
+        if webview.can_go_back() {
+            let _ = webview.go_back(1);
         }
     }
 
     pub fn forward(&self) {
-        if self.webview.can_go_forward() {
-            let _ = self.webview.go_forward(1);
+        let webview = &self.active_tab().webview;
+        if webview.can_go_forward() {
+            let _ = webview.go_forward(1);
         }
     }
 
-    /// Resize the webview (and its rendering context) to a physical size.
-    pub fn resize(&self, width_px: u32, height_px: u32, scale: f32) {
-        self.webview.set_hidpi_scale_factor(Scale::new(scale));
-        self.webview
-            .resize(PhysicalSize::new(width_px.max(1), height_px.max(1)));
+    /// Resize the active webview (and the shared rendering context) to a
+    /// physical size. Inactive tabs are brought up to size on activation.
+    pub fn resize(&mut self, width_px: u32, height_px: u32, scale: f32) {
+        self.size_px = (width_px, height_px);
+        self.scale = scale;
+        let webview = &self.active_tab().webview;
+        webview.set_hidpi_scale_factor(Scale::new(scale));
+        webview.resize(PhysicalSize::new(width_px.max(1), height_px.max(1)));
     }
 
     /// Pointer position in device pixels relative to the webview origin.
     pub fn mouse_move(&self, x_px: f32, y_px: f32) {
-        let _ = self.webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
-            DevicePoint::new(x_px, y_px).into(),
-        )));
+        let _ = self.active_tab().webview.notify_input_event(InputEvent::MouseMove(
+            MouseMoveEvent::new(DevicePoint::new(x_px, y_px).into()),
+        ));
     }
 
     pub fn mouse_button(&self, button: DomMouseButton, pressed: bool, x_px: f32, y_px: f32) {
         let action = if pressed { MouseButtonAction::Down } else { MouseButtonAction::Up };
-        let _ = self.webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
-            action,
-            button,
-            DevicePoint::new(x_px, y_px).into(),
-        )));
+        let _ = self.active_tab().webview.notify_input_event(InputEvent::MouseButton(
+            MouseButtonEvent::new(action, button, DevicePoint::new(x_px, y_px).into()),
+        ));
     }
 
     /// Wheel in device pixels, winit sign convention (positive y = scroll
@@ -211,7 +347,7 @@ impl ServoHost {
     /// and applies the inverted delta as the scroll itself — no separate
     /// scroll event wanted.
     pub fn wheel(&self, dx_px: f64, dy_px: f64, x_px: f32, y_px: f32) {
-        let _ = self.webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
+        let _ = self.active_tab().webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
             WheelDelta { x: dx_px, y: dy_px, z: 0.0, mode: WheelMode::DeltaPixel },
             DevicePoint::new(x_px, y_px).into(),
         )));
@@ -220,6 +356,7 @@ impl ServoHost {
     pub fn key(&self, key: DomKey, pressed: bool) {
         let state = if pressed { KeyState::Down } else { KeyState::Up };
         let _ = self
+            .active_tab()
             .webview
             .notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(state, key)));
     }

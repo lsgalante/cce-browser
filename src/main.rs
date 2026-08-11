@@ -20,9 +20,19 @@ use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta,
 use webview::ServoHost;
 
 const BAR_MARGIN: f32 = 10.0;
-const BAR_H: f32 = 38.0;
+/// Two rows: tab strip on top, nav controls + URL field below.
+const BAR_H: f32 = BAR_PAD + TAB_H + ROW_GAP + BTN_H + BAR_PAD;
 const BAR_RADIUS: f32 = 10.0;
 const BAR_PAD: f32 = 7.0;
+const TAB_H: f32 = 24.0;
+const TAB_GAP: f32 = 4.0;
+const TAB_MIN_W: f32 = 56.0;
+const TAB_MAX_W: f32 = 200.0;
+/// Tabs at least this wide get a close "x" region on their right edge.
+const TAB_CLOSE_MIN_W: f32 = 72.0;
+const TAB_CLOSE_W: f32 = 18.0;
+const PLUS_W: f32 = 26.0;
+const ROW_GAP: f32 = 6.0;
 /// Utility-bar fill; the negative alpha marks the plate as blur-behind.
 /// The blurred page is the base and this color tints it at |alpha|
 /// opacity — keep |alpha| low so the frosted content shows through.
@@ -40,6 +50,8 @@ const HOME_URL: &str = "https://servo.org";
 const PAGE_BG: [f32; 4] = [0.10, 0.10, 0.11, 1.0];
 const FIELD_BG: [f32; 4] = [0.09, 0.09, 0.10, 0.40];
 const BTN_BG: [f32; 4] = [0.20, 0.21, 0.23, 0.40];
+const TAB_BG: [f32; 4] = [0.15, 0.16, 0.18, 0.30];
+const TAB_ACTIVE_BG: [f32; 4] = [0.32, 0.34, 0.38, 0.55];
 const RIM: [f32; 4] = [0.22, 0.23, 0.25, 1.0];
 const RIM_FOCUS: [f32; 4] = [0.33, 0.48, 0.72, 1.0];
 const ACCENT: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
@@ -50,6 +62,8 @@ const TEXT_DIM: [u8; 3] = [120, 122, 128];
 pub enum Message {
     /// Servo requested an event-loop spin (waker or delegate signal).
     Spin,
+    /// Last tab closed: exit the app.
+    Quit,
 }
 
 struct BrowserApp {
@@ -82,10 +96,52 @@ fn bar_rect(win_w: f32) -> Rect {
     }
 }
 
+/// Y of the tab-strip row.
+fn tabs_y() -> f32 {
+    BAR_MARGIN + BAR_PAD
+}
+
+/// Y of the nav-controls row.
+fn controls_y() -> f32 {
+    BAR_MARGIN + BAR_PAD + TAB_H + ROW_GAP
+}
+
+fn plus_rect(win_w: f32) -> Rect {
+    let bar = bar_rect(win_w);
+    Rect {
+        x: bar.x + bar.width - BAR_PAD - PLUS_W,
+        y: tabs_y(),
+        width: PLUS_W,
+        height: TAB_H,
+    }
+}
+
+fn tab_rect(win_w: f32, count: usize, i: usize) -> Rect {
+    let bar = bar_rect(win_w);
+    let avail = bar.width - 2.0 * BAR_PAD - PLUS_W - TAB_GAP - (count.max(1) - 1) as f32 * TAB_GAP;
+    let w = (avail / count.max(1) as f32).clamp(TAB_MIN_W, TAB_MAX_W);
+    Rect {
+        x: bar.x + BAR_PAD + i as f32 * (w + TAB_GAP),
+        y: tabs_y(),
+        width: w,
+        height: TAB_H,
+    }
+}
+
+/// The close "x" hit region on a tab pill, when the pill is wide enough.
+fn tab_close_rect(pill: &Rect) -> Option<Rect> {
+    (pill.width >= TAB_CLOSE_MIN_W).then(|| Rect {
+        x: pill.x + pill.width - TAB_CLOSE_W,
+        y: pill.y,
+        width: TAB_CLOSE_W,
+        height: pill.height,
+    })
+}
+
 fn btn_rect(i: usize) -> Rect {
     Rect {
         x: BAR_MARGIN + BAR_PAD + i as f32 * (BTN_W + BTN_GAP),
-        y: BAR_MARGIN + (BAR_H - BTN_H) / 2.0,
+        y: controls_y(),
         width: BTN_W,
         height: BTN_H,
     }
@@ -96,7 +152,7 @@ fn url_rect(win_w: f32) -> Rect {
     let x = BAR_MARGIN + BAR_PAD + 3.0 * (BTN_W + BTN_GAP) + 4.0;
     Rect {
         x,
-        y: BAR_MARGIN + (BAR_H - BTN_H) / 2.0,
+        y: controls_y(),
         width: (bar.x + bar.width - BAR_PAD - x).max(60.0),
         height: BTN_H,
     }
@@ -197,7 +253,8 @@ impl BrowserApp {
         self.title = self.host.title().filter(|t| !t.is_empty());
         if !self.url_focused {
             if let Some(u) = self.host.url() {
-                self.url_input = u.to_string();
+                let s = u.to_string();
+                self.url_input = if s == "about:blank" { String::new() } else { s };
                 self.cursor = self.url_input.len();
             }
         }
@@ -209,6 +266,48 @@ impl BrowserApp {
             self.url_focused = false;
             self.loading = true;
         }
+    }
+
+    /// New blank tab with the URL bar focused for typing.
+    fn new_tab(&mut self) {
+        let url = Url::parse("about:blank").expect("about:blank");
+        self.host.open_tab(url);
+        self.url_input.clear();
+        self.cursor = 0;
+        self.url_focused = true;
+        self.sync_page_state();
+    }
+
+    /// Close a tab; returns `Message::Quit` when it was the last one.
+    fn close_tab(&mut self, index: usize) -> Option<Message> {
+        if !self.host.close_tab(index) {
+            return Some(Message::Quit);
+        }
+        self.url_focused = false;
+        self.sync_page_state();
+        None
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        self.host.activate(index);
+        self.url_focused = false;
+        self.sync_page_state();
+    }
+
+    /// Widest prefix of `text` fitting `avail`, with a "…"-style tail cut.
+    fn fit_text(text: &str, sans: &str, size: f32, avail: f32) -> String {
+        if measure_text_width(text, sans, size) <= avail {
+            return text.to_string();
+        }
+        let mut end = text.len();
+        while end > 0 {
+            end = prev_boundary(text, end);
+            let cut = format!("{}...", &text[..end]);
+            if measure_text_width(&cut, sans, size) <= avail {
+                return cut;
+            }
+        }
+        String::new()
     }
 
     fn cursor_from_click(&self, click_x: f32, field: &Rect) -> usize {
@@ -301,7 +400,7 @@ impl Application for BrowserApp {
         }
     }
 
-    fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, _exit: &mut bool) {
+    fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
         match msg {
             Message::Spin => {
                 let (new_frame, dirty) = self.host.pump();
@@ -312,6 +411,7 @@ impl Application for BrowserApp {
                     *needs_rebuild = true;
                 }
             }
+            Message::Quit => *exit = true,
         }
     }
 
@@ -342,11 +442,31 @@ impl Application for BrowserApp {
         let pressed = state == ElementState::Pressed;
 
         if hit(&bar_rect(self.win.0), pos.x, pos.y) {
-            if !pressed || button != MouseButton::Left {
+            if !pressed || !matches!(button, MouseButton::Left | MouseButton::Middle) {
                 return None;
             }
             *needs_rebuild = true;
-            if hit(&btn_rect(0), pos.x, pos.y) {
+            // Tab strip: activate / close (x region or middle click) / new tab.
+            let count = self.host.tab_count();
+            for i in 0..count {
+                let pill = tab_rect(self.win.0, count, i);
+                if !hit(&pill, pos.x, pos.y) {
+                    continue;
+                }
+                let on_close =
+                    tab_close_rect(&pill).is_some_and(|r| hit(&r, pos.x, pos.y));
+                if button == MouseButton::Middle || on_close {
+                    return self.close_tab(i);
+                }
+                self.switch_tab(i);
+                return None;
+            }
+            if button != MouseButton::Left {
+                return None;
+            }
+            if hit(&plus_rect(self.win.0), pos.x, pos.y) {
+                self.new_tab();
+            } else if hit(&btn_rect(0), pos.x, pos.y) {
                 self.host.back();
             } else if hit(&btn_rect(1), pos.x, pos.y) {
                 self.host.forward();
@@ -399,6 +519,30 @@ impl Application for BrowserApp {
     }
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
+        // Tab shortcuts work regardless of URL-bar focus.
+        if event.state == ElementState::Pressed && event.ctrl {
+            let count = self.host.tab_count();
+            match &event.logical_key {
+                Key::Character(c) if c == "t" => {
+                    self.new_tab();
+                    *needs_rebuild = true;
+                    return None;
+                }
+                Key::Character(c) if c == "w" => {
+                    *needs_rebuild = true;
+                    return self.close_tab(self.host.active_index());
+                }
+                Key::Named(NamedKey::Tab) if count > 1 => {
+                    let cur = self.host.active_index();
+                    let next = if event.shift { (cur + count - 1) % count } else { (cur + 1) % count };
+                    self.switch_tab(next);
+                    *needs_rebuild = true;
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         if self.url_focused {
             if event.state == ElementState::Pressed {
                 self.edit_url(event);
@@ -463,6 +607,64 @@ impl Application for BrowserApp {
                 );
             });
         }
+
+        // Tab strip.
+        let (sans, ..) = cce_ui::layout::read_preferred_fonts();
+        let count = self.host.tab_count();
+        let active = self.host.active_index();
+        for i in 0..count {
+            let pill = tab_rect(w, count, i);
+            let is_active = i == active;
+            pc.rounded_rect(
+                pill,
+                7.0,
+                (true, true, true, true),
+                if is_active { TAB_ACTIVE_BG } else { TAB_BG },
+            );
+            let tab = self.host.tab(i);
+            let title = tab
+                .and_then(|t| t.title.clone().filter(|s| !s.is_empty()))
+                .or_else(|| tab.and_then(|t| t.url.clone()).map(|u| u.to_string()))
+                .filter(|s| s != "about:blank")
+                .unwrap_or_else(|| "New Tab".to_string());
+            let close = tab_close_rect(&pill);
+            let text_avail = pill.width - 16.0 - close.map_or(0.0, |_| TAB_CLOSE_W - 4.0);
+            let label = Self::fit_text(&title, &sans, 12.0, text_avail);
+            let color = if is_active { TEXT } else { TEXT_DIM };
+            pc.text(
+                label,
+                pill.x + 8.0,
+                cce_ui::layout::align_text_y(pill.y, pill.height, 12.0, 0.0),
+                12.0,
+                color,
+            );
+            if tab.is_some_and(|t| t.loading) {
+                pc.quad(
+                    Rect { x: pill.x, y: pill.y + pill.height - 2.0, width: pill.width, height: 2.0 },
+                    ACCENT,
+                );
+            }
+            if let Some(cr) = close {
+                let xw = measure_text_width("x", &sans, 11.0);
+                pc.text(
+                    "x",
+                    cr.x + (cr.width - xw) / 2.0 - 2.0,
+                    cce_ui::layout::align_text_y(cr.y, cr.height, 11.0, 0.0),
+                    11.0,
+                    TEXT_DIM,
+                );
+            }
+        }
+        let plus = plus_rect(w);
+        pc.rounded_rect(plus, 7.0, (true, true, true, true), BTN_BG);
+        let pw = measure_text_width("+", &sans, 14.0);
+        pc.text(
+            "+",
+            plus.x + (plus.width - pw) / 2.0,
+            cce_ui::layout::align_text_y(plus.y, plus.height, 14.0, 0.0),
+            14.0,
+            TEXT,
+        );
 
         let labels = ["<", ">", "R"];
         let enabled = [self.host.can_go_back(), self.host.can_go_forward(), true];
