@@ -23,8 +23,10 @@ use servo::{
     SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta,
     WheelEvent, WheelMode,
 };
+use servo::protocol_handler::ProtocolRegistry;
 use url::Url;
 
+use crate::history::{CceProtocol, History};
 use crate::Message;
 
 /// Delegate-observed signals for one webview, polled by the app after each
@@ -34,7 +36,10 @@ struct TabSignals {
     frame_ready: bool,
     title: Option<String>,
     url: Option<Url>,
-    loading: bool,
+    /// None until Servo reports a load status — the sync must not mistake
+    /// the default for "finished loading" (that swallows the completion
+    /// transition history recording depends on).
+    loading: Option<bool>,
 }
 
 #[derive(Default)]
@@ -77,7 +82,7 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
-        self.with_tab(&webview, |t| t.loading = status != LoadStatus::Complete);
+        self.with_tab(&webview, |t| t.loading = Some(status != LoadStatus::Complete));
     }
 
     fn request_create_new(&self, _parent_webview: WebView, request: CreateNewWebViewRequest) {
@@ -123,6 +128,7 @@ pub struct ServoHost {
     context: Rc<SoftwareRenderingContext>,
     shared: Rc<HostShared>,
     delegate: Rc<Delegate>,
+    history: std::sync::Arc<History>,
     tabs: Vec<Tab>,
     active: usize,
     size_px: (u32, u32),
@@ -142,8 +148,15 @@ impl ServoHost {
             .make_current()
             .expect("make software rendering context current");
 
+        let history = std::sync::Arc::new(History::load());
+        let mut protocols = ProtocolRegistry::default();
+        if let Err(e) = protocols.register("cce", CceProtocol { history: history.clone() }) {
+            log::error!("failed to register cce: protocol: {e:?}");
+        }
+
         let servo = ServoBuilder::default()
             .event_loop_waker(Box::new(Waker(wake.clone())))
+            .protocol_registry(protocols)
             .build();
 
         let shared = Rc::new(HostShared::default());
@@ -160,6 +173,7 @@ impl ServoHost {
             context,
             shared,
             delegate,
+            history,
             tabs: Vec::new(),
             // Sentinel so the first open_tab's activate() does the full
             // show/focus/resize dance instead of early-returning on 0 == 0.
@@ -299,7 +313,17 @@ impl ServoHost {
                 if let Some(sig) = per.get_mut(&tab.webview.id()) {
                     tab.title = sig.title.clone();
                     tab.url = sig.url.clone();
-                    tab.loading = sig.loading;
+                    if let Some(loading) = sig.loading.take() {
+                        let was_loading = tab.loading;
+                        tab.loading = loading;
+                        // Load-complete transition: log the visit.
+                        if was_loading && !loading {
+                            if let Some(url) = &tab.url {
+                                self.history
+                                    .record(url.as_str(), tab.title.as_deref().unwrap_or(""));
+                            }
+                        }
+                    }
                     if std::mem::take(&mut sig.frame_ready) && i == self.active {
                         active_frame = true;
                     }

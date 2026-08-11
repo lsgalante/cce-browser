@@ -6,6 +6,7 @@
 //! reload / URL field). Input over the page area is translated into Servo
 //! input events; the URL bar is a small hand-rolled line editor.
 
+mod history;
 mod webview;
 
 use url::Url;
@@ -165,8 +166,11 @@ fn parse_url_input(input: &str) -> Option<Url> {
     if s.is_empty() {
         return None;
     }
+    if s.eq_ignore_ascii_case("about:history") {
+        return Url::parse("cce://history").ok();
+    }
     if let Ok(u) = Url::parse(s) {
-        if matches!(u.scheme(), "http" | "https" | "file" | "data" | "about") {
+        if matches!(u.scheme(), "http" | "https" | "file" | "data" | "about" | "cce") {
             return Some(u);
         }
     }
@@ -537,6 +541,15 @@ impl Application for BrowserApp {
                 Key::Character(c) if c == "w" => {
                     *needs_rebuild = true;
                     return self.close_tab(self.host.active_index());
+                }
+                Key::Character(c) if c == "h" => {
+                    if let Ok(url) = Url::parse("cce://history") {
+                        self.host.open_tab(url);
+                        self.url_focused = false;
+                        self.sync_page_state();
+                        *needs_rebuild = true;
+                    }
+                    return None;
                 }
                 Key::Named(NamedKey::Tab) if count > 1 => {
                     let cur = self.host.active_index();
