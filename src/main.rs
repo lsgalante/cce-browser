@@ -19,11 +19,16 @@ use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta,
 
 use webview::ServoHost;
 
-const CHROME_H: f32 = 42.0;
+const BAR_MARGIN: f32 = 10.0;
+const BAR_H: f32 = 38.0;
+const BAR_RADIUS: f32 = 10.0;
+const BAR_PAD: f32 = 7.0;
+/// Utility-bar fill; the negative alpha marks the plate as blur-behind, so
+/// it frosts the page content drawn beneath it (|alpha| = blur strength).
+const BAR_FILL: [f32; 4] = [0.11, 0.12, 0.13, -0.58];
 const BTN_W: f32 = 30.0;
 const BTN_H: f32 = 26.0;
 const BTN_GAP: f32 = 6.0;
-const PAD: f32 = 8.0;
 const URL_FONT: f32 = 14.0;
 const URL_PAD_X: f32 = 9.0;
 /// Pixels per wheel notch when the DE reports discrete line deltas.
@@ -31,10 +36,9 @@ const LINE_PX: f64 = 76.0;
 
 const HOME_URL: &str = "https://servo.org";
 
-const CHROME_BG: [f32; 4] = [0.13, 0.14, 0.15, 1.0];
 const PAGE_BG: [f32; 4] = [0.10, 0.10, 0.11, 1.0];
-const FIELD_BG: [f32; 4] = [0.09, 0.09, 0.10, 1.0];
-const BTN_BG: [f32; 4] = [0.18, 0.19, 0.21, 1.0];
+const FIELD_BG: [f32; 4] = [0.09, 0.09, 0.10, 0.85];
+const BTN_BG: [f32; 4] = [0.20, 0.21, 0.23, 0.85];
 const RIM: [f32; 4] = [0.22, 0.23, 0.25, 1.0];
 const RIM_FOCUS: [f32; 4] = [0.33, 0.48, 0.72, 1.0];
 const ACCENT: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
@@ -67,21 +71,32 @@ fn hit(r: &Rect, x: f32, y: f32) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
+/// The floating utility bar, overlaid on the page content.
+fn bar_rect(win_w: f32) -> Rect {
+    Rect {
+        x: BAR_MARGIN,
+        y: BAR_MARGIN,
+        width: (win_w - 2.0 * BAR_MARGIN).max(120.0),
+        height: BAR_H,
+    }
+}
+
 fn btn_rect(i: usize) -> Rect {
     Rect {
-        x: PAD + i as f32 * (BTN_W + BTN_GAP),
-        y: (CHROME_H - BTN_H) / 2.0,
+        x: BAR_MARGIN + BAR_PAD + i as f32 * (BTN_W + BTN_GAP),
+        y: BAR_MARGIN + (BAR_H - BTN_H) / 2.0,
         width: BTN_W,
         height: BTN_H,
     }
 }
 
 fn url_rect(win_w: f32) -> Rect {
-    let x = PAD + 3.0 * (BTN_W + BTN_GAP) + 4.0;
+    let bar = bar_rect(win_w);
+    let x = BAR_MARGIN + BAR_PAD + 3.0 * (BTN_W + BTN_GAP) + 4.0;
     Rect {
         x,
-        y: (CHROME_H - BTN_H) / 2.0,
-        width: (win_w - x - PAD).max(60.0),
+        y: BAR_MARGIN + (BAR_H - BTN_H) / 2.0,
+        width: (bar.x + bar.width - BAR_PAD - x).max(60.0),
         height: BTN_H,
     }
 }
@@ -167,20 +182,11 @@ fn next_boundary(s: &str, i: usize) -> usize {
 }
 
 impl BrowserApp {
-    fn content_rect(&self) -> Rect {
-        Rect {
-            x: 0.0,
-            y: CHROME_H,
-            width: self.win.0,
-            height: (self.win.1 - CHROME_H).max(1.0),
-        }
-    }
-
+    /// The page fills the whole window; the utility bar floats above it.
     fn content_px(&self) -> (u32, u32) {
-        let r = self.content_rect();
         (
-            (r.width as f64 * self.scale) as u32,
-            (r.height as f64 * self.scale) as u32,
+            (self.win.0 as f64 * self.scale) as u32,
+            (self.win.1 as f64 * self.scale) as u32,
         )
     }
 
@@ -269,7 +275,7 @@ impl Application for BrowserApp {
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
         let url = Url::parse(HOME_URL).expect("home url");
-        let host = ServoHost::new(sender, url, (1200, (800.0 - CHROME_H) as u32));
+        let host = ServoHost::new(sender, url, (1200, 800));
         Self {
             host,
             win: (1200.0, 800.0),
@@ -319,9 +325,9 @@ impl Application for BrowserApp {
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, _needs_rebuild: &mut bool) {
         self.pointer = (pos.x, pos.y);
-        if pos.y >= CHROME_H {
+        if !hit(&bar_rect(self.win.0), pos.x, pos.y) {
             let s = self.scale as f32;
-            self.host.mouse_move(pos.x * s, (pos.y - CHROME_H) * s);
+            self.host.mouse_move(pos.x * s, pos.y * s);
         }
     }
 
@@ -334,7 +340,7 @@ impl Application for BrowserApp {
     ) -> Option<Self::Message> {
         let pressed = state == ElementState::Pressed;
 
-        if pos.y < CHROME_H {
+        if hit(&bar_rect(self.win.0), pos.x, pos.y) {
             if !pressed || button != MouseButton::Left {
                 return None;
             }
@@ -369,7 +375,7 @@ impl Application for BrowserApp {
             _ => {
                 if let Some(b) = dom_button(button) {
                     let s = self.scale as f32;
-                    self.host.mouse_button(b, pressed, pos.x * s, (pos.y - CHROME_H) * s);
+                    self.host.mouse_button(b, pressed, pos.x * s, pos.y * s);
                 }
             }
         }
@@ -377,7 +383,7 @@ impl Application for BrowserApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, _needs_rebuild: &mut bool) {
-        if pos.y < CHROME_H {
+        if hit(&bar_rect(self.win.0), pos.x, pos.y) {
             return;
         }
         // WheelDelta keeps cce-ui's winit sign convention (positive = scroll
@@ -388,12 +394,7 @@ impl Application for BrowserApp {
             MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
         };
         let s = self.scale;
-        self.host.wheel(
-            dx * s,
-            dy * s,
-            pos.x * s as f32,
-            (pos.y - CHROME_H) * s as f32,
-        );
+        self.host.wheel(dx * s, dy * s, pos.x * s as f32, pos.y * s as f32);
     }
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
@@ -440,19 +441,26 @@ impl Application for BrowserApp {
         let mut pc = PaintCtx::new();
         let w = size.width;
 
-        // Page.
-        let content = self.content_rect();
+        // Page: full-bleed under the floating bar.
+        let content = Rect { x: 0.0, y: 0.0, width: w, height: size.height };
         pc.quad(content, PAGE_BG);
         if let Some((id, ..)) = self.host.image() {
             pc.image(id, content, 1.0);
         } else {
-            pc.text("Loading...", content.x + 16.0, content.y + 18.0, 13.0, TEXT_DIM);
+            pc.text("Loading...", BAR_MARGIN + 6.0, BAR_MARGIN + BAR_H + 22.0, 13.0, TEXT_DIM);
         }
 
-        // Chrome bar.
-        pc.quad(Rect { x: 0.0, y: 0.0, width: w, height: CHROME_H }, CHROME_BG);
+        // Floating utility bar: a blur-behind plate frosting the page under it.
+        let bar = bar_rect(w);
+        let radii = (BAR_RADIUS, BAR_RADIUS, BAR_RADIUS, BAR_RADIUS);
+        pc.plate(bar, radii, BAR_FILL, cce_ui::layout::bevel_width().min(4.0));
         if self.loading {
-            pc.quad(Rect { x: 0.0, y: CHROME_H - 2.0, width: w, height: 2.0 }, ACCENT);
+            pc.clip_rounded(bar, BAR_RADIUS, |pc| {
+                pc.quad(
+                    Rect { x: bar.x, y: bar.y + bar.height - 2.0, width: bar.width, height: 2.0 },
+                    ACCENT,
+                );
+            });
         }
 
         let labels = ["<", ">", "R"];
@@ -503,7 +511,7 @@ impl Application for BrowserApp {
     }
 
     fn clear_color(&self) -> [f32; 4] {
-        CHROME_BG
+        PAGE_BG
     }
 }
 
