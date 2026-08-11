@@ -14,11 +14,10 @@ use std::rc::Rc;
 use dpi::PhysicalSize;
 use euclid::Scale;
 use servo::{
-    DeviceIntRect, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key as DomKey,
-    KeyState, KeyboardEvent, LoadStatus, MouseButton as DomMouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseMoveEvent, RenderingContext, Scroll, Servo, ServoBuilder,
-    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent,
-    WheelMode,
+    DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent, Key as DomKey, KeyState,
+    KeyboardEvent, LoadStatus, MouseButton as DomMouseButton, MouseButtonAction, MouseButtonEvent,
+    MouseMoveEvent, RenderingContext, Servo, ServoBuilder, SoftwareRenderingContext, WebView,
+    WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 
@@ -207,19 +206,15 @@ impl ServoHost {
         )));
     }
 
-    /// Wheel/scroll in device pixels, DOM sign convention (positive y
-    /// reveals content below). Sends both the DOM wheel event and the
-    /// compositor scroll.
+    /// Wheel in device pixels, winit sign convention (positive y = scroll
+    /// up). Servo hit-tests the wheel event, lets the page preventDefault,
+    /// and applies the inverted delta as the scroll itself — no separate
+    /// scroll event wanted.
     pub fn wheel(&self, dx_px: f64, dy_px: f64, x_px: f32, y_px: f32) {
-        let point = DevicePoint::new(x_px, y_px);
         let _ = self.webview.notify_input_event(InputEvent::Wheel(WheelEvent::new(
             WheelDelta { x: dx_px, y: dy_px, z: 0.0, mode: WheelMode::DeltaPixel },
-            point.into(),
+            DevicePoint::new(x_px, y_px).into(),
         )));
-        self.webview.notify_scroll_event(
-            Scroll::Delta(DeviceVector2D::new(dx_px as f32, dy_px as f32).into()),
-            point.into(),
-        );
     }
 
     pub fn key(&self, key: DomKey, pressed: bool) {

@@ -380,11 +380,12 @@ impl Application for BrowserApp {
         if pos.y < CHROME_H {
             return;
         }
-        // cce-ui deltas are winit-signed (positive = scroll up); the DOM and
-        // Servo's Scroll::Delta want positive = reveal content below.
+        // WheelDelta keeps cce-ui's winit sign convention (positive = scroll
+        // up); Servo inverts it into the scroll offset internally, after the
+        // page has had its preventDefault chance.
         let (dx, dy) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (-(*x as f64) * LINE_PX, -(*y as f64) * LINE_PX),
-            MouseScrollDelta::PixelDelta(p) => (-p.x, -p.y),
+            MouseScrollDelta::LineDelta(x, y) => (*x as f64 * LINE_PX, *y as f64 * LINE_PX),
+            MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
         };
         let s = self.scale;
         self.host.wheel(
