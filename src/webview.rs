@@ -154,6 +154,14 @@ pub struct ServoHost {
     active: usize,
     size_px: (u32, u32),
     scale: f32,
+    /// Settings gate for cce://history recording.
+    history_enabled: bool,
+}
+
+impl ServoHost {
+    pub fn set_history_enabled(&mut self, on: bool) {
+        self.history_enabled = on;
+    }
 }
 
 impl ServoHost {
@@ -210,6 +218,7 @@ impl ServoHost {
             active: usize::MAX,
             size_px,
             scale: 1.0,
+            history_enabled: true,
         };
         host.open_tab(url);
         host
@@ -347,7 +356,7 @@ impl ServoHost {
                         let was_loading = tab.loading;
                         tab.loading = loading;
                         // Load-complete transition: log the visit.
-                        if was_loading && !loading {
+                        if was_loading && !loading && self.history_enabled {
                             if let Some(url) = &tab.url {
                                 self.history
                                     .record(url.as_str(), tab.title.as_deref().unwrap_or(""));

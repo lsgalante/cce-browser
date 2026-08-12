@@ -57,9 +57,20 @@ pub struct Downloads {
     next_id: std::sync::atomic::AtomicU64,
 }
 
-/// The user's download directory: XDG_DOWNLOAD_DIR from user-dirs.dirs
-/// when configured, else ~/Downloads.
+/// Settings override for the download directory (None = XDG default).
+/// A global because downloads run on worker threads.
+static DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+pub fn set_download_dir(dir: Option<PathBuf>) {
+    *DIR_OVERRIDE.lock().unwrap() = dir;
+}
+
+/// The user's download directory: the settings override when set, else
+/// XDG_DOWNLOAD_DIR from user-dirs.dirs, else ~/Downloads.
 fn download_dir() -> PathBuf {
+    if let Some(dir) = DIR_OVERRIDE.lock().unwrap().clone() {
+        return dir;
+    }
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let conf = home.join(".config/user-dirs.dirs");
     if let Ok(text) = std::fs::read_to_string(conf) {

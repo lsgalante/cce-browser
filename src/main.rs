@@ -8,6 +8,7 @@
 
 mod downloads;
 mod pages;
+mod settings;
 mod webview;
 
 use url::Url;
@@ -47,7 +48,6 @@ const URL_PAD_X: f32 = 9.0;
 /// Pixels per wheel notch when the DE reports discrete line deltas.
 const LINE_PX: f64 = 76.0;
 
-const HOME_URL: &str = "https://servo.org";
 
 const PAGE_BG: [f32; 4] = [0.10, 0.10, 0.11, 1.0];
 const FIELD_BG: [f32; 4] = [0.09, 0.09, 0.10, 0.40];
@@ -70,6 +70,8 @@ pub enum Message {
 
 struct BrowserApp {
     host: ServoHost,
+    /// Loaded from the app config; re-read when the window regains focus.
+    settings: settings::Settings,
     win: (f32, f32),
     scale: f64,
     pointer: (f32, f32),
@@ -173,7 +175,7 @@ fn url_rect(win_w: f32) -> Rect {
 
 /// Turn URL-bar input into something loadable: a real URL as-is, a bare
 /// host gets https://, anything else becomes a search.
-fn parse_url_input(input: &str) -> Option<Url> {
+fn parse_url_input(input: &str, search_prefix: &str) -> Option<Url> {
     let s = input.trim();
     if s.is_empty() {
         return None;
@@ -198,7 +200,7 @@ fn parse_url_input(input: &str) -> Option<Url> {
         }
     }
     let q: String = url::form_urlencoded::byte_serialize(s.as_bytes()).collect();
-    Url::parse(&format!("https://duckduckgo.com/html/?q={q}")).ok()
+    Url::parse(&format!("{search_prefix}{q}")).ok()
 }
 
 fn dom_button(button: MouseButton) -> Option<servo::MouseButton> {
@@ -283,7 +285,7 @@ impl BrowserApp {
     }
 
     fn navigate(&mut self) {
-        if let Some(url) = parse_url_input(&self.url_input) {
+        if let Some(url) = parse_url_input(&self.url_input, &self.settings.search_prefix) {
             self.host.load(url);
             self.url_focused = false;
             self.loading = true;
@@ -291,6 +293,18 @@ impl BrowserApp {
     }
 
     /// New blank tab with the URL bar focused for typing.
+    /// Pick up settings edits (system-interface, cce-data-editor) when the
+    /// window regains focus.
+    fn reload_settings(&mut self) {
+        let new = settings::load();
+        if new == self.settings {
+            return;
+        }
+        downloads::set_download_dir(new.download_dir.clone());
+        self.host.set_history_enabled(new.history);
+        self.settings = new;
+    }
+
     fn new_tab(&mut self) {
         let url = Url::parse("about:blank").expect("about:blank");
         self.host.open_tab(url);
@@ -417,16 +431,22 @@ impl Application for BrowserApp {
     type Message = Message;
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
-        // Optional CLI arg: the start URL (same parsing as the URL bar).
+        let settings = settings::load();
+        downloads::set_download_dir(settings.download_dir.clone());
+        // Optional CLI arg: the start URL (same parsing as the URL bar);
+        // otherwise the configured homepage.
         let url = std::env::args()
             .nth(1)
-            .and_then(|arg| parse_url_input(&arg))
-            .unwrap_or_else(|| Url::parse(HOME_URL).expect("home url"));
+            .and_then(|arg| parse_url_input(&arg, &settings.search_prefix))
+            .or_else(|| parse_url_input(&settings.homepage, &settings.search_prefix))
+            .unwrap_or_else(|| Url::parse(settings::DEFAULT_HOMEPAGE).expect("home url"));
         let url_input = url.to_string();
         let cursor = url_input.len();
-        let host = ServoHost::new(sender, url, (1200, 800));
+        let mut host = ServoHost::new(sender, url, (1200, 800));
+        host.set_history_enabled(settings.history);
         Self {
             host,
+            settings,
             win: (1200.0, 800.0),
             scale: 1.0,
             pointer: (0.0, 0.0),
@@ -468,6 +488,12 @@ impl Application for BrowserApp {
     }
 
     fn tick(&mut self, _dt: f32, _needs_rebuild: &mut bool) {}
+
+    fn handle_focus_change(&mut self, focused: bool, _needs_rebuild: &mut bool) {
+        if focused {
+            self.reload_settings();
+        }
+    }
 
     fn handle_resize(&mut self, width: f32, height: f32, scale: f64) {
         self.win = (width, height);
