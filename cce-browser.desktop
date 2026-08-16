@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Browser
+GenericName=Web Browser
+Comment=Browse the web
+Exec=cce-browser %u
+Icon=cce-browser
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;
+StartupNotify=true
+StartupWMClass=cce-browser

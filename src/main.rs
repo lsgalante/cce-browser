@@ -203,6 +203,28 @@ fn parse_url_input(input: &str, search_prefix: &str) -> Option<Url> {
     Url::parse(&format!("{search_prefix}{q}")).ok()
 }
 
+/// Turn the startup argument into something loadable.
+///
+/// This is deliberately not [`parse_url_input`]: that one is the URL *bar*,
+/// where a dotted word is meant to become a domain guess. Argv is different —
+/// the desktop entry claims `text/html`, and the XDG spec lets a launcher pass
+/// a local file for `%u` "either as a file: URL or as a file path". A plain
+/// path takes the domain-guess branch and turns `/home/me/page.html` into
+/// `https:///home/me/page.html`, so an existing path is resolved to a file:
+/// URL first and only a non-path falls through to the bar's parsing.
+fn parse_startup_arg(arg: &str, search_prefix: &str) -> Option<Url> {
+    let path = std::path::Path::new(arg);
+    if path.exists() {
+        // Relative paths need the cwd joined on before file: URL conversion.
+        if let Ok(abs) = std::fs::canonicalize(path) {
+            if let Ok(u) = Url::from_file_path(&abs) {
+                return Some(u);
+            }
+        }
+    }
+    parse_url_input(arg, search_prefix)
+}
+
 fn dom_button(button: MouseButton) -> Option<servo::MouseButton> {
     match button {
         MouseButton::Left => Some(servo::MouseButton::Left),
@@ -437,7 +459,7 @@ impl Application for BrowserApp {
         // otherwise the configured homepage.
         let url = std::env::args()
             .nth(1)
-            .and_then(|arg| parse_url_input(&arg, &settings.search_prefix))
+            .and_then(|arg| parse_startup_arg(&arg, &settings.search_prefix))
             .or_else(|| parse_url_input(&settings.homepage, &settings.search_prefix))
             .unwrap_or_else(|| Url::parse(settings::DEFAULT_HOMEPAGE).expect("home url"));
         let url_input = url.to_string();
@@ -830,4 +852,43 @@ impl Application for BrowserApp {
 fn main() {
     env_logger::init();
     cce_ui::engine::run::<BrowserApp>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEARCH: &str = "https://duckduckgo.com/?q=";
+
+    #[test]
+    fn startup_arg_resolves_an_existing_path_to_a_file_url() {
+        let dir = std::env::temp_dir().join("cce-browser-argv-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("page.html");
+        std::fs::write(&page, "<html></html>").unwrap();
+
+        let u = parse_startup_arg(page.to_str().unwrap(), SEARCH).unwrap();
+        assert_eq!(u.scheme(), "file");
+        assert!(u.path().ends_with("page.html"), "got {u}");
+
+        // The bar parser is what this guards against: a dotted, space-free
+        // path takes its bare-host branch and becomes a bogus https URL.
+        let bar = parse_url_input(page.to_str().unwrap(), SEARCH).unwrap();
+        assert_eq!(bar.scheme(), "https");
+
+        std::fs::remove_file(&page).unwrap();
+    }
+
+    #[test]
+    fn startup_arg_still_takes_urls_and_searches() {
+        let u = parse_startup_arg("https://example.com/x", SEARCH).unwrap();
+        assert_eq!(u.as_str(), "https://example.com/x");
+
+        // A bare host that is not a path still guesses https.
+        assert_eq!(parse_startup_arg("example.com", SEARCH).unwrap().scheme(), "https");
+
+        // A non-existent path is not a file: it falls through to the bar rules.
+        let missing = parse_startup_arg("/nonexistent/nope.html", SEARCH).unwrap();
+        assert_ne!(missing.scheme(), "file");
+    }
 }
