@@ -84,6 +84,10 @@ struct BrowserApp {
     /// Page title; drives the toplevel title (the engine re-applies
     /// `settings().title` whenever it changes).
     title: Option<String>,
+    /// App-side bundled-fonts `FontSystem` (the same set the toolkit renders
+    /// with) for URL-bar caret/click metrics via `shaped_cluster_offsets` —
+    /// `measure_text_width`'s inked-extent numbers drift off the drawn glyphs.
+    font_system: cce_ui::cosmic_text::FontSystem,
 }
 
 fn hit(r: &Rect, x: f32, y: f32) -> bool {
@@ -389,18 +393,29 @@ impl BrowserApp {
         String::new()
     }
 
-    fn cursor_from_click(&self, click_x: f32, field: &Rect) -> usize {
+    fn cursor_from_click(&mut self, click_x: f32, field: &Rect) -> usize {
         let rel = click_x - field.x - URL_PAD_X;
-        let (sans, ..) = cce_ui::layout::read_preferred_fonts();
-        let mut i = 0;
-        while i < self.url_input.len() {
-            let next = next_boundary(&self.url_input, i);
-            if measure_text_width(&self.url_input[..next], &sans, URL_FONT) > rel {
-                return i;
-            }
-            i = next;
-        }
-        self.url_input.len()
+        // Boundary x offsets from the same shaped buffer the bar draws (font=None,
+        // matching `pc.text`), then the closest boundary to the click.
+        let offsets = cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, &self.url_input, URL_FONT, None);
+        offsets
+            .iter()
+            .min_by(|a, b| (a.1 - rel).abs().total_cmp(&(b.1 - rel).abs()))
+            .map(|&(b, _)| b)
+            .unwrap_or(self.url_input.len())
+    }
+
+    /// Caret x offset (text-origin relative) for the current byte cursor, off
+    /// the same shaped buffer as `cursor_from_click`.
+    fn caret_offset(&mut self) -> f32 {
+        let offsets = cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, &self.url_input, URL_FONT, None);
+        let cursor = self.cursor;
+        offsets
+            .iter()
+            .rev()
+            .find(|&&(b, _)| b <= cursor)
+            .map(|&(_, x)| x)
+            .unwrap_or(0.0)
     }
 
     fn edit_url(&mut self, event: &KeyEvent) {
@@ -477,6 +492,7 @@ impl Application for BrowserApp {
             cursor,
             loading: true,
             title: None,
+            font_system: cce_ui::create_font_system(),
         }
     }
 
@@ -825,13 +841,12 @@ impl Application for BrowserApp {
         );
         pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
         let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
+        let caret_x = if self.url_focused { Some(self.caret_offset()) } else { None };
         pc.clip(f, |pc| {
             pc.text(self.url_input.clone(), f.x + URL_PAD_X, ty, URL_FONT, TEXT);
-            if self.url_focused {
-                let (sans, ..) = cce_ui::layout::read_preferred_fonts();
-                let cx = f.x + URL_PAD_X + measure_text_width(&self.url_input[..self.cursor], &sans, URL_FONT);
+            if let Some(offset) = caret_x {
                 pc.quad(
-                    Rect { x: cx, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
+                    Rect { x: f.x + URL_PAD_X + offset, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
                     [0.85, 0.87, 0.92, 1.0],
                 );
             }
