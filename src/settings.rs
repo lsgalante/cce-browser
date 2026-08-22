@@ -8,6 +8,25 @@ use std::path::PathBuf;
 
 pub const DEFAULT_HOMEPAGE: &str = "https://servo.org";
 
+/// Which edge the floating utility bar is anchored to. The page is
+/// full-bleed under the bar either way, so this is chrome geometry only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BarPosition {
+    #[default]
+    Top,
+    Bottom,
+}
+
+impl BarPosition {
+    /// Config keys as written by the system-interface Browser page.
+    fn from_key(key: &str) -> Self {
+        match key {
+            "bottom" => Self::Bottom,
+            _ => Self::Top,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub homepage: String,
@@ -17,6 +36,8 @@ pub struct Settings {
     pub download_dir: Option<PathBuf>,
     /// Record page visits to cce://history.
     pub history: bool,
+    /// Window edge the utility bar floats against.
+    pub bar_position: BarPosition,
 }
 
 impl Default for Settings {
@@ -26,6 +47,7 @@ impl Default for Settings {
             search_prefix: search_prefix("duckduckgo").to_string(),
             download_dir: None,
             history: true,
+            bar_position: BarPosition::Top,
         }
     }
 }
@@ -65,5 +87,6 @@ pub fn load() -> Settings {
         search_prefix: search_prefix(b["search"].as_str().unwrap_or("duckduckgo")).to_string(),
         download_dir,
         history: b["history"].as_bool().unwrap_or(true),
+        bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
     }
 }

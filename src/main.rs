@@ -94,43 +94,49 @@ fn hit(r: &Rect, x: f32, y: f32) -> bool {
     x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
 }
 
-/// The floating utility bar, overlaid on the page content.
-fn bar_rect(win_w: f32) -> Rect {
+/// The floating utility bar, overlaid on the page content. Anchored to the
+/// top or bottom window edge per the config; the page is full-bleed either
+/// way, so nothing but the chrome geometry depends on this. Every other
+/// bar-relative rect below is derived from this one — never from
+/// `BAR_MARGIN` directly, or it would stay pinned to the top.
+fn bar_rect(win: (f32, f32), position: settings::BarPosition) -> Rect {
+    let y = match position {
+        settings::BarPosition::Top => BAR_MARGIN,
+        settings::BarPosition::Bottom => (win.1 - BAR_MARGIN - BAR_H).max(BAR_MARGIN),
+    };
     Rect {
         x: BAR_MARGIN,
-        y: BAR_MARGIN,
-        width: (win_w - 2.0 * BAR_MARGIN).max(120.0),
+        y,
+        width: (win.0 - 2.0 * BAR_MARGIN).max(120.0),
         height: BAR_H,
     }
 }
 
 /// Y of the tab-strip row.
-fn tabs_y() -> f32 {
-    BAR_MARGIN + BAR_PAD
+fn tabs_y(bar: &Rect) -> f32 {
+    bar.y + BAR_PAD
 }
 
 /// Y of the nav-controls row.
-fn controls_y() -> f32 {
-    BAR_MARGIN + BAR_PAD + TAB_H + ROW_GAP
+fn controls_y(bar: &Rect) -> f32 {
+    bar.y + BAR_PAD + TAB_H + ROW_GAP
 }
 
-fn plus_rect(win_w: f32) -> Rect {
-    let bar = bar_rect(win_w);
+fn plus_rect(bar: &Rect) -> Rect {
     Rect {
         x: bar.x + bar.width - BAR_PAD - PLUS_W,
-        y: tabs_y(),
+        y: tabs_y(bar),
         width: PLUS_W,
         height: TAB_H,
     }
 }
 
-fn tab_rect(win_w: f32, count: usize, i: usize) -> Rect {
-    let bar = bar_rect(win_w);
+fn tab_rect(bar: &Rect, count: usize, i: usize) -> Rect {
     let avail = bar.width - 2.0 * BAR_PAD - PLUS_W - TAB_GAP - (count.max(1) - 1) as f32 * TAB_GAP;
     let w = (avail / count.max(1) as f32).clamp(TAB_MIN_W, TAB_MAX_W);
     Rect {
         x: bar.x + BAR_PAD + i as f32 * (w + TAB_GAP),
-        y: tabs_y(),
+        y: tabs_y(bar),
         width: w,
         height: TAB_H,
     }
@@ -146,32 +152,30 @@ fn tab_close_rect(pill: &Rect) -> Option<Rect> {
     })
 }
 
-fn btn_rect(i: usize) -> Rect {
+fn btn_rect(bar: &Rect, i: usize) -> Rect {
     Rect {
-        x: BAR_MARGIN + BAR_PAD + i as f32 * (BTN_W + BTN_GAP),
-        y: controls_y(),
+        x: bar.x + BAR_PAD + i as f32 * (BTN_W + BTN_GAP),
+        y: controls_y(bar),
         width: BTN_W,
         height: BTN_H,
     }
 }
 
 /// The bookmark star, at the right end of the controls row.
-fn star_rect(win_w: f32) -> Rect {
-    let bar = bar_rect(win_w);
+fn star_rect(bar: &Rect) -> Rect {
     Rect {
         x: bar.x + bar.width - BAR_PAD - BTN_W,
-        y: controls_y(),
+        y: controls_y(bar),
         width: BTN_W,
         height: BTN_H,
     }
 }
 
-fn url_rect(win_w: f32) -> Rect {
-    let bar = bar_rect(win_w);
-    let x = BAR_MARGIN + BAR_PAD + 3.0 * (BTN_W + BTN_GAP) + 4.0;
+fn url_rect(bar: &Rect) -> Rect {
+    let x = bar.x + BAR_PAD + 3.0 * (BTN_W + BTN_GAP) + 4.0;
     Rect {
         x,
-        y: controls_y(),
+        y: controls_y(bar),
         width: (bar.x + bar.width - BAR_PAD - BTN_W - BTN_GAP - x).max(60.0),
         height: BTN_H,
     }
@@ -289,6 +293,12 @@ fn next_boundary(s: &str, i: usize) -> usize {
 }
 
 impl BrowserApp {
+    /// The utility bar's rect for the current window size and configured
+    /// edge — the single source every chrome hit-test and draw reads.
+    fn bar(&self) -> Rect {
+        bar_rect(self.win, self.settings.bar_position)
+    }
+
     /// The page fills the whole window; the utility bar floats above it.
     fn content_px(&self) -> (u32, u32) {
         (
@@ -318,19 +328,20 @@ impl BrowserApp {
         }
     }
 
-    /// New blank tab with the URL bar focused for typing.
     /// Pick up settings edits (system-interface, cce-data-editor) when the
-    /// window regains focus.
-    fn reload_settings(&mut self) {
+    /// window regains focus. Returns whether anything changed.
+    fn reload_settings(&mut self) -> bool {
         let new = settings::load();
         if new == self.settings {
-            return;
+            return false;
         }
         downloads::set_download_dir(new.download_dir.clone());
         self.host.set_history_enabled(new.history);
         self.settings = new;
+        true
     }
 
+    /// New blank tab with the URL bar focused for typing.
     fn new_tab(&mut self) {
         let url = Url::parse("about:blank").expect("about:blank");
         self.host.open_tab(url);
@@ -527,9 +538,11 @@ impl Application for BrowserApp {
 
     fn tick(&mut self, _dt: f32, _needs_rebuild: &mut bool) {}
 
-    fn handle_focus_change(&mut self, focused: bool, _needs_rebuild: &mut bool) {
-        if focused {
-            self.reload_settings();
+    fn handle_focus_change(&mut self, focused: bool, needs_rebuild: &mut bool) {
+        // A settings change can move the bar to the other edge, so a reload
+        // that changed anything has to redraw the chrome.
+        if focused && self.reload_settings() {
+            *needs_rebuild = true;
         }
     }
 
@@ -542,7 +555,7 @@ impl Application for BrowserApp {
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, _needs_rebuild: &mut bool) {
         self.pointer = (pos.x, pos.y);
-        if !hit(&bar_rect(self.win.0), pos.x, pos.y) {
+        if !hit(&self.bar(), pos.x, pos.y) {
             let s = self.scale as f32;
             self.host.mouse_move(pos.x * s, pos.y * s);
         }
@@ -557,7 +570,8 @@ impl Application for BrowserApp {
     ) -> Option<Self::Message> {
         let pressed = state == ElementState::Pressed;
 
-        if hit(&bar_rect(self.win.0), pos.x, pos.y) {
+        let bar = self.bar();
+        if hit(&bar, pos.x, pos.y) {
             if !pressed || !matches!(button, MouseButton::Left | MouseButton::Middle) {
                 return None;
             }
@@ -565,7 +579,7 @@ impl Application for BrowserApp {
             // Tab strip: activate / close (x region or middle click) / new tab.
             let count = self.host.tab_count();
             for i in 0..count {
-                let pill = tab_rect(self.win.0, count, i);
+                let pill = tab_rect(&bar, count, i);
                 if !hit(&pill, pos.x, pos.y) {
                     continue;
                 }
@@ -580,18 +594,18 @@ impl Application for BrowserApp {
             if button != MouseButton::Left {
                 return None;
             }
-            if hit(&plus_rect(self.win.0), pos.x, pos.y) {
+            if hit(&plus_rect(&bar), pos.x, pos.y) {
                 self.new_tab();
-            } else if hit(&btn_rect(0), pos.x, pos.y) {
+            } else if hit(&btn_rect(&bar, 0), pos.x, pos.y) {
                 self.host.back();
-            } else if hit(&btn_rect(1), pos.x, pos.y) {
+            } else if hit(&btn_rect(&bar, 1), pos.x, pos.y) {
                 self.host.forward();
-            } else if hit(&btn_rect(2), pos.x, pos.y) {
+            } else if hit(&btn_rect(&bar, 2), pos.x, pos.y) {
                 self.host.reload();
-            } else if hit(&star_rect(self.win.0), pos.x, pos.y) {
+            } else if hit(&star_rect(&bar), pos.x, pos.y) {
                 self.host.toggle_bookmark();
             } else {
-                let field = url_rect(self.win.0);
+                let field = url_rect(&bar);
                 if hit(&field, pos.x, pos.y) {
                     self.cursor = self.cursor_from_click(pos.x, &field);
                     self.url_focused = true;
@@ -622,7 +636,7 @@ impl Application for BrowserApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, _needs_rebuild: &mut bool) {
-        if hit(&bar_rect(self.win.0), pos.x, pos.y) {
+        if hit(&self.bar(), pos.x, pos.y) {
             return;
         }
         // WheelDelta keeps cce-ui's winit sign convention (positive = scroll
@@ -719,17 +733,23 @@ impl Application for BrowserApp {
         let mut pc = PaintCtx::new();
         let w = size.width;
 
+        let bar = self.bar();
+
         // Page: full-bleed under the floating bar.
         let content = Rect { x: 0.0, y: 0.0, width: w, height: size.height };
         pc.quad(content, PAGE_BG);
         if let Some((id, ..)) = self.host.image() {
             pc.image(id, content, 1.0);
         } else {
-            pc.text("Loading...", BAR_MARGIN + 6.0, BAR_MARGIN + BAR_H + 22.0, 13.0, TEXT_DIM);
+            // Just clear of the bar, whichever edge it is on.
+            let y = match self.settings.bar_position {
+                settings::BarPosition::Top => bar.y + bar.height + 22.0,
+                settings::BarPosition::Bottom => BAR_MARGIN + 22.0,
+            };
+            pc.text("Loading...", BAR_MARGIN + 6.0, y, 13.0, TEXT_DIM);
         }
 
         // Floating utility bar: a blur-behind plate frosting the page under it.
-        let bar = bar_rect(w);
         let radii = (BAR_RADIUS, BAR_RADIUS, BAR_RADIUS, BAR_RADIUS);
         pc.plate(bar, radii, BAR_FILL, cce_ui::layout::bevel_width().min(4.0));
         if self.loading {
@@ -746,7 +766,7 @@ impl Application for BrowserApp {
         let count = self.host.tab_count();
         let active = self.host.active_index();
         for i in 0..count {
-            let pill = tab_rect(w, count, i);
+            let pill = tab_rect(&bar, count, i);
             let is_active = i == active;
             pc.rounded_rect(
                 pill,
@@ -788,7 +808,7 @@ impl Application for BrowserApp {
                 );
             }
         }
-        let plus = plus_rect(w);
+        let plus = plus_rect(&bar);
         pc.rounded_rect(plus, 7.0, (true, true, true, true), BTN_BG);
         let pw = measure_text_width("+", &sans, 14.0);
         pc.text(
@@ -802,7 +822,7 @@ impl Application for BrowserApp {
         let labels = ["<", ">", "R"];
         let enabled = [self.host.can_go_back(), self.host.can_go_forward(), true];
         for (i, label) in labels.iter().enumerate() {
-            let r = btn_rect(i);
+            let r = btn_rect(&bar, i);
             pc.rounded_rect(r, 6.0, (true, true, true, true), BTN_BG);
             let color = if enabled[i] { TEXT } else { TEXT_DIM };
             let (sans, ..) = cce_ui::layout::read_preferred_fonts();
@@ -817,7 +837,7 @@ impl Application for BrowserApp {
         }
 
         // Bookmark star: accent-lit when the page is bookmarked.
-        let star = star_rect(w);
+        let star = star_rect(&bar);
         pc.rounded_rect(star, 6.0, (true, true, true, true), BTN_BG);
         let starred = self.host.active_bookmarked();
         let star_color: [u8; 3] = if starred { [150, 190, 240] } else { TEXT_DIM };
@@ -831,7 +851,7 @@ impl Application for BrowserApp {
         );
 
         // URL field: rim + recess, brighter rim when focused.
-        let f = url_rect(w);
+        let f = url_rect(&bar);
         let rim = if self.url_focused { RIM_FOCUS } else { RIM };
         pc.rounded_rect(
             Rect { x: f.x - 1.0, y: f.y - 1.0, width: f.width + 2.0, height: f.height + 2.0 },
