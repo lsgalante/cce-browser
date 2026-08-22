@@ -56,6 +56,8 @@ const TAB_BG: [f32; 4] = [0.15, 0.16, 0.18, 0.30];
 const TAB_ACTIVE_BG: [f32; 4] = [0.32, 0.34, 0.38, 0.55];
 const RIM: [f32; 4] = [0.22, 0.23, 0.25, 1.0];
 const RIM_FOCUS: [f32; 4] = [0.33, 0.48, 0.72, 1.0];
+/// URL-bar selection highlight; the text is drawn over it.
+const SEL_BG: [f32; 4] = [0.24, 0.38, 0.60, 0.95];
 const ACCENT: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
 const TEXT: [u8; 3] = [220, 220, 225];
 const TEXT_DIM: [u8; 3] = [120, 122, 128];
@@ -80,6 +82,9 @@ struct BrowserApp {
     url_focused: bool,
     /// Byte index of the URL-bar cursor.
     cursor: usize,
+    /// Selected byte range in the URL bar, normalized (start < end). Set by
+    /// clicking into an unfocused bar; any edit replaces or drops it.
+    selection: Option<(usize, usize)>,
     loading: bool,
     /// Page title; drives the toplevel title (the engine re-applies
     /// `settings().title` whenever it changes).
@@ -316,6 +321,7 @@ impl BrowserApp {
                 let s = u.to_string();
                 self.url_input = if s == "about:blank" { String::new() } else { s };
                 self.cursor = self.url_input.len();
+                self.selection = None;
             }
         }
     }
@@ -324,6 +330,7 @@ impl BrowserApp {
         if let Some(url) = parse_url_input(&self.url_input, &self.settings.search_prefix) {
             self.host.load(url);
             self.url_focused = false;
+            self.selection = None;
             self.loading = true;
         }
     }
@@ -347,6 +354,7 @@ impl BrowserApp {
         self.host.open_tab(url);
         self.url_input.clear();
         self.cursor = 0;
+        self.selection = None;
         self.url_focused = true;
         self.sync_page_state();
     }
@@ -416,17 +424,35 @@ impl BrowserApp {
             .unwrap_or(self.url_input.len())
     }
 
-    /// Caret x offset (text-origin relative) for the current byte cursor, off
-    /// the same shaped buffer as `cursor_from_click`.
-    fn caret_offset(&mut self) -> f32 {
+    /// X offset (text-origin relative) of a byte index, off the same shaped
+    /// buffer as `cursor_from_click`.
+    fn x_offset(&mut self, byte: usize) -> f32 {
         let offsets = cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, &self.url_input, URL_FONT, None);
-        let cursor = self.cursor;
         offsets
             .iter()
             .rev()
-            .find(|&&(b, _)| b <= cursor)
+            .find(|&&(b, _)| b <= byte)
             .map(|&(_, x)| x)
             .unwrap_or(0.0)
+    }
+
+    /// Caret x offset for the current byte cursor.
+    fn caret_offset(&mut self) -> f32 {
+        self.x_offset(self.cursor)
+    }
+
+    /// Drop a selection, deleting its text first if it covers any. Returns
+    /// whether text was removed, so edits can treat "replace the selection"
+    /// and "act at the cursor" as one path.
+    fn take_selection(&mut self) -> bool {
+        match self.selection.take() {
+            Some((a, b)) if a < b && b <= self.url_input.len() => {
+                self.url_input.replace_range(a..b, "");
+                self.cursor = a;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn edit_url(&mut self, event: &KeyEvent) {
@@ -434,29 +460,49 @@ impl BrowserApp {
             Key::Named(NamedKey::Enter) => self.navigate(),
             Key::Named(NamedKey::Escape) => {
                 self.url_focused = false;
+                self.selection = None;
                 self.sync_page_state();
             }
             Key::Named(NamedKey::Backspace) => {
-                if self.cursor > 0 {
+                if !self.take_selection() && self.cursor > 0 {
                     let prev = prev_boundary(&self.url_input, self.cursor);
                     self.url_input.replace_range(prev..self.cursor, "");
                     self.cursor = prev;
                 }
             }
             Key::Named(NamedKey::Delete) => {
-                if self.cursor < self.url_input.len() {
+                if !self.take_selection() && self.cursor < self.url_input.len() {
                     let next = next_boundary(&self.url_input, self.cursor);
                     self.url_input.replace_range(self.cursor..next, "");
                 }
             }
-            Key::Named(NamedKey::ArrowLeft) => self.cursor = prev_boundary(&self.url_input, self.cursor),
-            Key::Named(NamedKey::ArrowRight) => self.cursor = next_boundary(&self.url_input, self.cursor),
-            Key::Named(NamedKey::Home) => self.cursor = 0,
-            Key::Named(NamedKey::End) => self.cursor = self.url_input.len(),
+            // Arrows collapse a selection to the edge they move toward,
+            // rather than stepping from the cursor.
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.cursor = match self.selection.take() {
+                    Some((a, _)) => a,
+                    None => prev_boundary(&self.url_input, self.cursor),
+                };
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                self.cursor = match self.selection.take() {
+                    Some((_, b)) => b,
+                    None => next_boundary(&self.url_input, self.cursor),
+                };
+            }
+            Key::Named(NamedKey::Home) => {
+                self.selection = None;
+                self.cursor = 0;
+            }
+            Key::Named(NamedKey::End) => {
+                self.selection = None;
+                self.cursor = self.url_input.len();
+            }
             Key::Character(c) if event.ctrl => {
                 if c == "u" {
                     self.url_input.clear();
                     self.cursor = 0;
+                    self.selection = None;
                 }
             }
             _ => {
@@ -467,6 +513,7 @@ impl BrowserApp {
                     _ => None,
                 };
                 if let Some(t) = insert {
+                    self.take_selection();
                     self.url_input.insert_str(self.cursor, &t);
                     self.cursor += t.len();
                 }
@@ -501,6 +548,7 @@ impl Application for BrowserApp {
             url_input,
             url_focused: false,
             cursor,
+            selection: None,
             loading: true,
             title: None,
             font_system: cce_ui::create_font_system(),
@@ -607,10 +655,19 @@ impl Application for BrowserApp {
             } else {
                 let field = url_rect(&bar);
                 if hit(&field, pos.x, pos.y) {
-                    self.cursor = self.cursor_from_click(pos.x, &field);
-                    self.url_focused = true;
+                    if self.url_focused {
+                        self.cursor = self.cursor_from_click(pos.x, &field);
+                        self.selection = None;
+                    } else {
+                        // Entering the bar selects the whole URL, so typing
+                        // replaces it instead of appending to it.
+                        self.url_focused = true;
+                        self.cursor = self.url_input.len();
+                        self.selection = (!self.url_input.is_empty()).then_some((0, self.cursor));
+                    }
                 } else {
                     self.url_focused = false;
+                    self.selection = None;
                 }
             }
             return None;
@@ -619,6 +676,7 @@ impl Application for BrowserApp {
         // Page area: a click dismisses URL-bar focus, then goes to the page.
         if self.url_focused && pressed {
             self.url_focused = false;
+            self.selection = None;
             self.sync_page_state();
             *needs_rebuild = true;
         }
@@ -862,7 +920,22 @@ impl Application for BrowserApp {
         pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
         let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
         let caret_x = if self.url_focused { Some(self.caret_offset()) } else { None };
+        let sel_x = self
+            .selection
+            .filter(|&(a, b)| a < b)
+            .map(|(a, b)| (self.x_offset(a), self.x_offset(b)));
         pc.clip(f, |pc| {
+            if let Some((x0, x1)) = sel_x {
+                pc.quad(
+                    Rect {
+                        x: f.x + URL_PAD_X + x0,
+                        y: f.y + 4.0,
+                        width: x1 - x0,
+                        height: f.height - 8.0,
+                    },
+                    SEL_BG,
+                );
+            }
             pc.text(self.url_input.clone(), f.x + URL_PAD_X, ty, URL_FONT, TEXT);
             if let Some(offset) = caret_x {
                 pc.quad(
