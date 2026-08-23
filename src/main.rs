@@ -441,6 +441,13 @@ impl BrowserApp {
         self.x_offset(self.cursor)
     }
 
+    /// Select the whole URL, caret at the end — what entering the bar does,
+    /// whether from a click, Ctrl+L or Ctrl+A. No-op on an empty field.
+    fn select_all_url(&mut self) {
+        self.cursor = self.url_input.len();
+        self.selection = (self.cursor > 0).then_some((0, self.cursor));
+    }
+
     /// Drop a selection, deleting its text first if it covers any. Returns
     /// whether text was removed, so edits can treat "replace the selection"
     /// and "act at the cursor" as one path.
@@ -498,13 +505,15 @@ impl BrowserApp {
                 self.selection = None;
                 self.cursor = self.url_input.len();
             }
-            Key::Character(c) if event.ctrl => {
-                if c == "u" {
+            Key::Character(c) if event.ctrl => match c.as_str() {
+                "u" => {
                     self.url_input.clear();
                     self.cursor = 0;
                     self.selection = None;
                 }
-            }
+                "a" => self.select_all_url(),
+                _ => {}
+            },
             _ => {
                 let insert = match (&event.text, &event.logical_key) {
                     (Some(t), _) if !event.ctrl && !t.chars().any(char::is_control) => Some(t.clone()),
@@ -662,8 +671,7 @@ impl Application for BrowserApp {
                         // Entering the bar selects the whole URL, so typing
                         // replaces it instead of appending to it.
                         self.url_focused = true;
-                        self.cursor = self.url_input.len();
-                        self.selection = (!self.url_input.is_empty()).then_some((0, self.cursor));
+                        self.select_all_url();
                     }
                 } else {
                     self.url_focused = false;
@@ -762,7 +770,7 @@ impl Application for BrowserApp {
                     match c.as_str() {
                         "l" => {
                             self.url_focused = true;
-                            self.cursor = self.url_input.len();
+                            self.select_all_url();
                             *needs_rebuild = true;
                             return None;
                         }
