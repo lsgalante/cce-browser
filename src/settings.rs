@@ -35,6 +35,9 @@ pub enum ColorScheme {
     #[default]
     Dark,
     Light,
+    /// Dark by force: a user stylesheet inverts the page, for sites that
+    /// ship no dark theme at all (google.com serves a hardcoded white).
+    ForceDark,
 }
 
 impl ColorScheme {
@@ -42,8 +45,14 @@ impl ColorScheme {
     fn from_key(key: &str) -> Self {
         match key {
             "light" => Self::Light,
+            "force-dark" => Self::ForceDark,
             _ => Self::Dark,
         }
+    }
+
+    /// Whether the inverting user stylesheet is installed.
+    pub fn forces_dark(self) -> bool {
+        matches!(self, Self::ForceDark)
     }
 }
 
@@ -51,7 +60,11 @@ impl From<ColorScheme> for servo::Theme {
     fn from(scheme: ColorScheme) -> Self {
         match scheme {
             ColorScheme::Dark => servo::Theme::Dark,
-            ColorScheme::Light => servo::Theme::Light,
+            // Force-dark inverts unconditionally, so pages have to render
+            // their LIGHT theme underneath: reporting dark to a site that
+            // has one would hand the filter an already-dark page and invert
+            // it back into a light one.
+            ColorScheme::Light | ColorScheme::ForceDark => servo::Theme::Light,
         }
     }
 }

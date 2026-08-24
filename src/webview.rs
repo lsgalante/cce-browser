@@ -20,9 +20,10 @@ use servo::{
     CreateNewWebViewRequest, DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent,
     Key as DomKey, KeyState, KeyboardEvent, LoadStatus, MouseButton as DomMouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, RenderingContext,
-    Servo, ServoBuilder, SoftwareRenderingContext, Theme, WebView, WebViewBuilder, WebViewDelegate,
-    WebViewId, WheelDelta, WheelEvent, WheelMode,
+    Servo, ServoBuilder, SoftwareRenderingContext, Theme, UserContentManager, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta, WheelEvent, WheelMode,
 };
+use servo::user_contents::UserStyleSheet;
 use servo::protocol_handler::ProtocolRegistry;
 use url::Url;
 
@@ -60,6 +61,9 @@ struct Delegate {
     wake: calloop::channel::Sender<Message>,
     context: Rc<SoftwareRenderingContext>,
     downloads: std::sync::Arc<Downloads>,
+    /// Shared with `ServoHost` so page-opened webviews carry the same user
+    /// content (the force-dark stylesheet) as the tabs the host builds.
+    ucm: Rc<UserContentManager>,
     /// Handle to this same Rc'd delegate, so page-opened webviews can be
     /// delegated back here; filled right after construction.
     self_rc: RefCell<std::rc::Weak<Delegate>>,
@@ -112,12 +116,54 @@ impl WebViewDelegate for Delegate {
         let webview = request
             .builder(self.context.clone())
             .delegate(delegate)
+            .user_content_manager(self.ucm.clone())
             .build();
         self.shared.pending_new.borrow_mut().push(webview);
         self.shared.dirty.set(true);
         let _ = self.wake.send(Message::Spin);
     }
 }
+
+/// Force-dark user stylesheet: invert the whole page, then rotate hues back
+/// so blues stay blue rather than turning orange, and invert media a second
+/// time so photos and video keep their own colors. This is the crude tier —
+/// it fights the site's palette rather than asking for its dark theme — but
+/// it is the only thing that darkens a page like google.com, which serves a
+/// hardcoded white with no `prefers-color-scheme` rule to honor.
+///
+/// Servo parses user stylesheets with `Origin::User`, where `!important`
+/// outranks the page's own `!important`, which is what lets these win.
+const FORCE_DARK_CSS: &str = "\
+html {
+  background-color: #ffffff !important;
+  filter: invert(1) hue-rotate(180deg) !important;
+}
+img, video, picture, canvas, svg, iframe, embed, object,
+[style*=\"background-image\"], [style*=\"background:url\"] {
+  filter: invert(1) hue-rotate(180deg) !important;
+}
+";
+
+/// When to reload pages after the color-scheme setting changes.
+///
+/// TWO reloads, both needed, for two different in-flight changes:
+///
+/// * The constellation hands a new user stylesheet to the script thread as a
+///   separate `SetUserContents` message, so a reload issued in the same
+///   breath as `add_stylesheet` can rebuild the document before the sheet
+///   lands. The first deadline covers that.
+/// * Force-dark also flips the reported scheme (it reports light, so pages
+///   render the light theme the filter then inverts). That notification is
+///   likewise asynchronous, and a page reloaded too soon comes back rendered
+///   for the OLD scheme — under the filter that means a dark page inverted
+///   into a light one, and it stays that way because nothing reloads it
+///   again. Measured on google.com: dark -> force-dark reproduces it every
+///   time even with a 5s single reload, while the same transition from
+///   light -> force-dark (no scheme flip) is correct, and one more reload
+///   always settles it. Hence the second deadline.
+const USER_CONTENT_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+/// Second reload, after any accompanying scheme flip has certainly landed.
+const SCHEME_SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
 
 /// Wakes the calloop event loop from Servo's internal threads.
 #[derive(Clone)]
@@ -159,11 +205,49 @@ pub struct ServoHost {
     /// What every webview reports as `prefers-color-scheme`. Held here
     /// because the theme is per-webview: tabs opened later have to be told.
     theme: Theme,
+    /// User content shared by every webview; owns the force-dark stylesheet's
+    /// registration and must outlive the webviews (dropping it tells the
+    /// constellation to destroy the manager).
+    ucm: Rc<UserContentManager>,
+    force_dark_sheet: Rc<UserStyleSheet>,
+    force_dark: bool,
+    /// Deadlines for pending reloads, earliest last (popped off the back).
+    reload_at: Vec<std::time::Instant>,
 }
 
 impl ServoHost {
     pub fn set_history_enabled(&mut self, on: bool) {
         self.history_enabled = on;
+    }
+
+    /// Install or remove the inverting user stylesheet. Servo applies user
+    /// content at page load, so open tabs are reloaded to pick up the change.
+    pub fn set_force_dark(&mut self, on: bool) {
+        if on == self.force_dark {
+            return;
+        }
+        self.force_dark = on;
+        if on {
+            self.ucm.add_stylesheet(self.force_dark_sheet.clone());
+        } else {
+            self.ucm.remove_stylesheet(self.force_dark_sheet.clone());
+        }
+        // Let the change reach the script thread before rebuilding the
+        // documents that have to pick it up. The wake is what guarantees a
+        // pump once the deadline passes: an idle page produces no frames of
+        // its own, so nothing else would turn the loop.
+        let now = std::time::Instant::now();
+        self.reload_at = vec![now + SCHEME_SETTLE, now + USER_CONTENT_SETTLE];
+        // The wakes are what guarantee a pump once each deadline passes: an
+        // idle page produces no frames of its own, so nothing else would turn
+        // the loop.
+        for delay in [USER_CONTENT_SETTLE, SCHEME_SETTLE] {
+            let wake = self.delegate.wake.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(delay + std::time::Duration::from_millis(20));
+                let _ = wake.send(Message::Spin);
+            });
+        }
     }
 
     /// Set the color scheme pages see, now and for tabs opened later.
@@ -176,7 +260,15 @@ impl ServoHost {
 }
 
 impl ServoHost {
-    pub fn new(wake: calloop::channel::Sender<Message>, url: Url, size_px: (u32, u32)) -> Self {
+    /// `force_dark` is taken up front rather than set afterwards: user content
+    /// only applies at page load, so flipping it later would mean reloading
+    /// the tab that was just opened.
+    pub fn new(
+        wake: calloop::channel::Sender<Message>,
+        url: Url,
+        size_px: (u32, u32),
+        force_dark: bool,
+    ) -> Self {
         // Servo's TLS stack looks up the process-wide rustls crypto provider.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -206,12 +298,22 @@ impl ServoHost {
             .protocol_registry(protocols)
             .build();
 
+        let ucm = Rc::new(UserContentManager::new(&servo));
+        let force_dark_sheet = Rc::new(UserStyleSheet::new(
+            FORCE_DARK_CSS.to_string(),
+            Url::parse("cce://force-dark.css").expect("force-dark url"),
+        ));
+        if force_dark {
+            ucm.add_stylesheet(force_dark_sheet.clone());
+        }
+
         let shared = Rc::new(HostShared::default());
         let delegate = Rc::new(Delegate {
             shared: shared.clone(),
             wake,
             context: context.clone(),
             downloads: downloads.clone(),
+            ucm: ucm.clone(),
             self_rc: RefCell::new(std::rc::Weak::new()),
         });
         *delegate.self_rc.borrow_mut() = Rc::downgrade(&delegate);
@@ -231,6 +333,10 @@ impl ServoHost {
             scale: 1.0,
             history_enabled: true,
             theme: Theme::Light,
+            ucm,
+            force_dark_sheet,
+            force_dark,
+            reload_at: Vec::new(),
         };
         host.open_tab(url);
         host
@@ -240,6 +346,7 @@ impl ServoHost {
         let webview = WebViewBuilder::new(&self.servo, self.context.clone())
             .url(url)
             .delegate(self.delegate.clone())
+            .user_content_manager(self.ucm.clone())
             .build();
         webview.notify_theme_change(self.theme);
         webview
@@ -345,6 +452,12 @@ impl ServoHost {
     /// tab if it produced a frame. Returns (new frame, any state change).
     pub fn pump(&mut self) -> (bool, bool) {
         self.servo.spin_event_loop();
+        if self.reload_at.last().is_some_and(|at| std::time::Instant::now() >= *at) {
+            self.reload_at.pop();
+            for tab in &self.tabs {
+                tab.webview.reload();
+            }
+        }
         // Adopt page-opened webviews as tabs; like a browser popup, the
         // newest one takes focus.
         let opened: Vec<WebView> = self.shared.pending_new.borrow_mut().drain(..).collect();

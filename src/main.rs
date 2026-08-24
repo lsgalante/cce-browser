@@ -345,6 +345,7 @@ impl BrowserApp {
         downloads::set_download_dir(new.download_dir.clone());
         self.host.set_history_enabled(new.history);
         self.host.set_color_scheme(new.color_scheme.into());
+        self.host.set_force_dark(new.color_scheme.forces_dark());
         self.settings = new;
         true
     }
@@ -547,7 +548,7 @@ impl Application for BrowserApp {
             .unwrap_or_else(|| Url::parse(settings::DEFAULT_HOMEPAGE).expect("home url"));
         let url_input = url.to_string();
         let cursor = url_input.len();
-        let mut host = ServoHost::new(sender, url, (1200, 800));
+        let mut host = ServoHost::new(sender, url, (1200, 800), settings.color_scheme.forces_dark());
         host.set_history_enabled(settings.history);
         host.set_color_scheme(settings.color_scheme.into());
         Self {
