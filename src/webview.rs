@@ -20,7 +20,7 @@ use servo::{
     CreateNewWebViewRequest, DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent,
     Key as DomKey, KeyState, KeyboardEvent, LoadStatus, MouseButton as DomMouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, RenderingContext,
-    Servo, ServoBuilder, SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
+    Servo, ServoBuilder, SoftwareRenderingContext, Theme, WebView, WebViewBuilder, WebViewDelegate,
     WebViewId, WheelDelta, WheelEvent, WheelMode,
 };
 use servo::protocol_handler::ProtocolRegistry;
@@ -156,11 +156,22 @@ pub struct ServoHost {
     scale: f32,
     /// Settings gate for cce://history recording.
     history_enabled: bool,
+    /// What every webview reports as `prefers-color-scheme`. Held here
+    /// because the theme is per-webview: tabs opened later have to be told.
+    theme: Theme,
 }
 
 impl ServoHost {
     pub fn set_history_enabled(&mut self, on: bool) {
         self.history_enabled = on;
+    }
+
+    /// Set the color scheme pages see, now and for tabs opened later.
+    pub fn set_color_scheme(&mut self, theme: Theme) {
+        self.theme = theme;
+        for tab in &self.tabs {
+            tab.webview.notify_theme_change(theme);
+        }
     }
 }
 
@@ -219,16 +230,19 @@ impl ServoHost {
             size_px,
             scale: 1.0,
             history_enabled: true,
+            theme: Theme::Light,
         };
         host.open_tab(url);
         host
     }
 
     fn build_webview(&self, url: Url) -> WebView {
-        WebViewBuilder::new(&self.servo, self.context.clone())
+        let webview = WebViewBuilder::new(&self.servo, self.context.clone())
             .url(url)
             .delegate(self.delegate.clone())
-            .build()
+            .build();
+        webview.notify_theme_change(self.theme);
+        webview
     }
 
     /// Open a new tab and make it active.
@@ -335,6 +349,8 @@ impl ServoHost {
         // newest one takes focus.
         let opened: Vec<WebView> = self.shared.pending_new.borrow_mut().drain(..).collect();
         for webview in opened {
+            // Built by the delegate, so it has not been told the theme yet.
+            webview.notify_theme_change(self.theme);
             self.tabs.push(Tab {
                 webview,
                 title: None,

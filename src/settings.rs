@@ -27,6 +27,35 @@ impl BarPosition {
     }
 }
 
+/// The color scheme reported to pages as `prefers-color-scheme`. Sites that
+/// ship a dark stylesheet honor it; sites that don't are unaffected — this is
+/// a signal, not a filter over their colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorScheme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl ColorScheme {
+    /// Config keys as written by the system-interface Browser page.
+    fn from_key(key: &str) -> Self {
+        match key {
+            "light" => Self::Light,
+            _ => Self::Dark,
+        }
+    }
+}
+
+impl From<ColorScheme> for servo::Theme {
+    fn from(scheme: ColorScheme) -> Self {
+        match scheme {
+            ColorScheme::Dark => servo::Theme::Dark,
+            ColorScheme::Light => servo::Theme::Light,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub homepage: String,
@@ -38,6 +67,8 @@ pub struct Settings {
     pub history: bool,
     /// Window edge the utility bar floats against.
     pub bar_position: BarPosition,
+    /// What pages are told to prefer.
+    pub color_scheme: ColorScheme,
 }
 
 impl Default for Settings {
@@ -48,6 +79,7 @@ impl Default for Settings {
             download_dir: None,
             history: true,
             bar_position: BarPosition::Top,
+            color_scheme: ColorScheme::Dark,
         }
     }
 }
@@ -88,5 +120,6 @@ pub fn load() -> Settings {
         download_dir,
         history: b["history"].as_bool().unwrap_or(true),
         bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
+        color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("dark")),
     }
 }
