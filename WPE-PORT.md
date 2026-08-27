@@ -114,11 +114,51 @@ with `wpe_buffer_get_width/height` and `wpe_buffer_shm_get_stride/get_format`.
 - **`damage_rects`.** Partial updates are available whenever we want them; today every
   frame is a full-window repaint.
 
-**The fiddly bit, and the real FFI risk:** `render_buffer` is a GObject vfunc, so the
-embedder has to **subclass `WPEView` from Rust** — register a GType, set the vfunc
-pointer in `class_init`. Tractable over bindgen, and `cogcore-sys` is worth reading for
-exactly this, but it is the one piece that is genuinely awkward rather than mechanical.
-Prove it in the spike before anything else.
+**The embedder subclasses two types, not one.** `WebKitWebView`'s `display` property
+is construct-only and takes a **`WPEDisplay`**, not a view — WebKit makes its own view
+by calling `WPEDisplayClass.create_view`. So we implement a `WPEDisplay` that vends our
+`WPEView`, and the view overrides `render_buffer`. (`WPEDisplayHeadless` is
+`G_DECLARE_FINAL_TYPE`, so it cannot be subclassed to shortcut this.)
+
+## Spike results (C, 2026-08-27)
+
+A throwaway C spike — `scratchpad/spike.c`, not in the repo — got most of the way and
+then stuck. **Proven working:**
+
+- `pkg-config` → compile → link against `wpe-webkit-2.0` + `wpe-platform-2.0`.
+- Subclassing `WPEDisplay` *and* `WPEView`, overriding `connect`, `create_view` and
+  `render_buffer`. This was flagged as the main FFI risk; in C it is mechanical and
+  worked first try. It is ordinary GObject, not a hack.
+- `g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", display, NULL)` — the WPEPlatform
+  construction path. WebKit calls our `create_view`, and
+  `webkit_web_view_get_wpe_view()` returns the instance we handed it.
+- **The sandbox is a non-issue.** The full engine starts: `WPENetworkProcess` plus
+  `WPEWebProcess` under `bwrap`, with no special setup. Retire that risk.
+- View sizing/mapping: `wpe_view_resized` / `set_visible` / `map` all take.
+
+**Not working: no buffers.** `render_buffer` never fires. The page loads into a live
+web process, but nothing is handed back. Advertising formats from
+`get_preferred_buffer_formats` (tried both `MAPPING` and `RENDERING` usage, `AR24`/
+`AB24`, linear) did not change it.
+
+**Leading hypothesis, untested:** the view has no **`WPEToplevel`**. `WPEView` has a
+`toplevel` property and `WPEDisplayClass` has a `create_toplevel` vfunc that the spike
+leaves NULL; WebKit may decline to render into a view with no toplevel. Implement that
+next, before anything else.
+
+### This puts the SHM/DMABuf staging in doubt
+
+`wpe_display_headless_new()` — the reference display — advertises **54 DRM fourcc
+formats** and infers a DRM device (`/dev/dri/card0`). It is GPU/DMABuf-backed. So
+"Phase 1 = SHM into `upload_rgba`, no `cce-ui` change" may not be an available path at
+all in 2.52: `WPEBufferSHM` exists as a type, but nothing yet shows WebKit *producing*
+one for this configuration.
+
+If that holds, the phasing inverts — dmabuf is not the optimization, it is the only
+route, and the **`cce-ui` change (Vulkan `VK_EXT_external_memory_dma_buf` import) moves
+from Phase 2 to a prerequisite**. That is a materially different port: it touches a
+shared crate on day one rather than at the end. Settle this before committing to a
+plan; it is the single most schedule-relevant unknown left.
 
 ## Impact map
 
