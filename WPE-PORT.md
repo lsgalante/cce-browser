@@ -85,6 +85,41 @@ cce-ui draws them — exactly the current model. (`WPEDisplayWayland` exists but
 make WPE a Wayland client in its own right, which fights cce-ui compositing.) Headless
 also means the throwaway spike and the shadow-session tests need no display at all.
 
+### The frame contract, read off the installed headers
+
+```
+WPEDisplayHeadless  wpe_display_headless_new()
+  └─ WPEView        wpe_view_new(display)      ← we subclass this
+       └─ WebKitWebView   webkit_web_view_new(backend)
+          webkit_web_view_get_wpe_view() / _get_display() tie the layers together
+```
+
+Frames arrive through the **`WPEViewClass.render_buffer` vfunc**:
+
+```c
+gboolean (*render_buffer)(WPEView *, WPEBuffer *, const WPERectangle *damage_rects,
+                          guint n_damage_rects, GError **);
+```
+
+Cast to `WPEBufferSHM`, then `wpe_buffer_shm_get_data()` → `GBytes` → the pixels,
+with `wpe_buffer_get_width/height` and `wpe_buffer_shm_get_stride/get_format`.
+
+**Two things this buys us that the Servo path never had:**
+
+- **Backpressure is built in.** You call `wpe_view_buffer_rendered(view, buffer)` when
+  you are done with a buffer. The engine cannot outrun the compositor, because buffer
+  lifetime is explicit and ours. That is structurally the opposite of the unbounded
+  `PENDING` queue the Servo path pushes into (see `CLAUDE.md`) — the class of bug
+  simply cannot arise.
+- **`damage_rects`.** Partial updates are available whenever we want them; today every
+  frame is a full-window repaint.
+
+**The fiddly bit, and the real FFI risk:** `render_buffer` is a GObject vfunc, so the
+embedder has to **subclass `WPEView` from Rust** — register a GType, set the vfunc
+pointer in `class_init`. Tractable over bindgen, and `cogcore-sys` is worth reading for
+exactly this, but it is the one piece that is genuinely awkward rather than mechanical.
+Prove it in the spike before anything else.
+
 ## Impact map
 
 | file | fate |
