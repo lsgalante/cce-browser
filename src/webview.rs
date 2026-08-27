@@ -339,7 +339,14 @@ impl ServoHost {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&profile_dir, std::fs::Permissions::from_mode(0o700));
         }
+        // CSS Grid ships disabled in Servo (`layout.grid.enabled` defaults to
+        // false), so every `display: grid` declaration is refused and the
+        // element falls back to block flow — 31 refusals on one mainstream
+        // login page, which is a lot of modern layout quietly dropped.
+        let mut preferences = servo::Preferences::default();
+        preferences.layout_grid_enabled = true;
         let servo = ServoBuilder::default()
+            .preferences(preferences)
             .opts(servo::Opts {
                 config_dir: Some(profile_dir),
                 ..Default::default()
