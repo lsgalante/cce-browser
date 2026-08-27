@@ -450,6 +450,13 @@ impl BrowserApp {
         self.selection = (self.cursor > 0).then_some((0, self.cursor));
     }
 
+    /// The selected substring, if a selection covers any text.
+    fn selected_text(&self) -> Option<String> {
+        self.selection
+            .filter(|&(a, b)| a < b && b <= self.url_input.len())
+            .map(|(a, b)| self.url_input[a..b].to_string())
+    }
+
     /// Drop a selection, deleting its text first if it covers any. Returns
     /// whether text was removed, so edits can treat "replace the selection"
     /// and "act at the cursor" as one path.
@@ -514,6 +521,30 @@ impl BrowserApp {
                     self.selection = None;
                 }
                 "a" => self.select_all_url(),
+                "c" => {
+                    if let Some(text) = self.selected_text() {
+                        cce_ui::widget::clipboard::copy_to_clipboard(&text);
+                    }
+                }
+                "x" => {
+                    if let Some(text) = self.selected_text() {
+                        cce_ui::widget::clipboard::copy_to_clipboard(&text);
+                        self.take_selection();
+                    }
+                }
+                "v" => {
+                    if let Some(text) = cce_ui::widget::clipboard::read_from_clipboard() {
+                        // The bar is one line: a multi-line paste would put
+                        // text where the caret math cannot reach it.
+                        let flat: String =
+                            text.chars().filter(|c| !c.is_control()).collect();
+                        if !flat.is_empty() {
+                            self.take_selection();
+                            self.url_input.insert_str(self.cursor, &flat);
+                            self.cursor += flat.len();
+                        }
+                    }
+                }
                 _ => {}
             },
             _ => {
@@ -771,6 +802,16 @@ impl Application for BrowserApp {
             if event.ctrl {
                 if let Key::Character(c) = &event.logical_key {
                     match c.as_str() {
+                        // Page clipboard: Servo needs the chord as an
+                        // editing action, not as the raw keystroke.
+                        "c" | "x" | "v" => {
+                            self.host.editing_action(match c.as_str() {
+                                "c" => servo::EditingActionEvent::Copy,
+                                "x" => servo::EditingActionEvent::Cut,
+                                _ => servo::EditingActionEvent::Paste,
+                            });
+                            return None;
+                        }
                         "l" => {
                             self.url_focused = true;
                             self.select_all_url();
@@ -792,7 +833,11 @@ impl Application for BrowserApp {
         }
 
         if let Some(k) = dom_key(&event.logical_key) {
-            self.host.key(k, event.state == ElementState::Pressed);
+            let mut modifiers = servo::Modifiers::empty();
+            modifiers.set(servo::Modifiers::CONTROL, event.ctrl);
+            modifiers.set(servo::Modifiers::SHIFT, event.shift);
+            modifiers.set(servo::Modifiers::ALT, event.alt);
+            self.host.key(k, event.state == ElementState::Pressed, modifiers);
         }
         None
     }

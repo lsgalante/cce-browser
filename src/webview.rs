@@ -20,8 +20,10 @@ use servo::{
     CreateNewWebViewRequest, DeviceIntRect, DevicePoint, EventLoopWaker, InputEvent,
     Key as DomKey, KeyState, KeyboardEvent, LoadStatus, MouseButton as DomMouseButton,
     MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, RenderingContext,
-    Servo, ServoBuilder, SoftwareRenderingContext, Theme, UserContentManager, WebView,
-    WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta, WheelEvent, WheelMode,
+    ClipboardDelegate, Code, EditingActionEvent, Location, Modifiers, Servo, ServoBuilder,
+    SoftwareRenderingContext, StringRequest, Theme,
+    UserContentManager, WebView, WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta,
+    WheelEvent, WheelMode,
 };
 use servo::user_contents::UserStyleSheet;
 use servo::protocol_handler::ProtocolRegistry;
@@ -117,6 +119,7 @@ impl WebViewDelegate for Delegate {
             .builder(self.context.clone())
             .delegate(delegate)
             .user_content_manager(self.ucm.clone())
+            .clipboard_delegate(Rc::new(CceClipboard))
             .build();
         self.shared.pending_new.borrow_mut().push(webview);
         self.shared.dirty.set(true);
@@ -164,6 +167,32 @@ img, video, picture, canvas, svg, iframe, embed, object,
 const USER_CONTENT_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
 /// Second reload, after any accompanying scheme flip has certainly landed.
 const SCHEME_SETTLE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Page clipboard, routed through the toolkit's wl-copy/wl-paste helpers.
+///
+/// Servo ships an arboard-backed delegate behind its default `clipboard`
+/// feature, but it lands nothing on the clipboard in this embedding —
+/// verified by copying in a page and reading the seat's clipboard back,
+/// which came up empty. Going through `cce_ui`'s helpers also keeps the
+/// browser on the same clipboard path as the rest of the DE.
+struct CceClipboard;
+
+impl ClipboardDelegate for CceClipboard {
+    fn get_text(&self, _webview: WebView, request: StringRequest) {
+        match cce_ui::widget::clipboard::read_from_clipboard() {
+            Some(text) => request.success(text),
+            None => request.failure("clipboard is empty".into()),
+        }
+    }
+
+    fn set_text(&self, _webview: WebView, new_contents: String) {
+        cce_ui::widget::clipboard::copy_to_clipboard(&new_contents);
+    }
+
+    fn clear(&self, _webview: WebView) {
+        cce_ui::widget::clipboard::copy_to_clipboard("");
+    }
+}
 
 /// Wakes the calloop event loop from Servo's internal threads.
 #[derive(Clone)]
@@ -368,6 +397,7 @@ impl ServoHost {
             .url(url)
             .delegate(self.delegate.clone())
             .user_content_manager(self.ucm.clone())
+            .clipboard_delegate(Rc::new(CceClipboard))
             .build();
         webview.notify_theme_change(self.theme);
         webview
@@ -628,11 +658,35 @@ impl ServoHost {
         )));
     }
 
-    pub fn key(&self, key: DomKey, pressed: bool) {
+    /// Forward a key to the page, modifiers included.
+    ///
+    /// `from_state_and_key` defaults the modifiers to empty, which delivers
+    /// every chord to the page as a bare character — Ctrl+A typed a literal
+    /// "a" into a focused textarea rather than selecting its contents.
+    pub fn key(&self, key: DomKey, pressed: bool, modifiers: Modifiers) {
         let state = if pressed { KeyState::Down } else { KeyState::Up };
+        let event = KeyboardEvent::new_without_event(
+            state,
+            key,
+            Code::Unidentified,
+            Location::Standard,
+            modifiers,
+            false,
+            false,
+        );
         let _ = self
             .active_tab()
             .webview
-            .notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(state, key)));
+            .notify_input_event(InputEvent::Keyboard(event));
+    }
+
+    /// Clipboard action on the page. Servo has no built-in binding for the
+    /// chords — the embedder translates them and the engine then goes
+    /// through the clipboard delegate.
+    pub fn editing_action(&self, action: EditingActionEvent) {
+        let _ = self
+            .active_tab()
+            .webview
+            .notify_input_event(InputEvent::EditingAction(action));
     }
 }
