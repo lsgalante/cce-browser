@@ -242,6 +242,8 @@ pub struct ServoHost {
     force_dark: bool,
     /// Deadlines for pending reloads, earliest last (popped off the back).
     reload_at: Vec<std::time::Instant>,
+    /// Raised by the cce://cookies/clear page; acted on here in `pump`.
+    clear_cookies: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ServoHost {
@@ -312,11 +314,13 @@ impl ServoHost {
         let history = std::sync::Arc::new(History::load());
         let bookmarks = std::sync::Arc::new(Bookmarks::load());
         let downloads = std::sync::Arc::new(Downloads::default());
+        let clear_cookies = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut protocols = ProtocolRegistry::default();
         let handler = CceProtocol {
             history: history.clone(),
             bookmarks: bookmarks.clone(),
             downloads: downloads.clone(),
+            clear_cookies: clear_cookies.clone(),
         };
         if let Err(e) = protocols.register("cce", handler) {
             log::error!("failed to register cce: protocol: {e:?}");
@@ -394,6 +398,7 @@ impl ServoHost {
             force_dark_sheet,
             force_dark,
             reload_at: Vec::new(),
+            clear_cookies,
         };
         host.open_tab(url);
         host
@@ -510,6 +515,10 @@ impl ServoHost {
     /// tab if it produced a frame. Returns (new frame, any state change).
     pub fn pump(&mut self) -> (bool, bool) {
         self.servo.spin_event_loop();
+        if self.clear_cookies.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.servo.site_data_manager().clear_cookies(None);
+            log::info!("cleared all cookies");
+        }
         if self.reload_at.last().is_some_and(|at| std::time::Instant::now() >= *at) {
             self.reload_at.pop();
             for tab in &self.tabs {

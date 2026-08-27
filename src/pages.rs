@@ -257,6 +257,31 @@ pub struct CceProtocol {
     pub history: Arc<History>,
     pub bookmarks: Arc<Bookmarks>,
     pub downloads: Arc<crate::downloads::Downloads>,
+    /// Raised by cce://cookies/clear. The handler runs on fetch threads and
+    /// cannot reach Servo, so it flags the request and the app's next pump
+    /// performs the clear through the SiteDataManager.
+    pub clear_cookies: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Confirmation page for clearing cookies. Deliberately a page with a link
+/// rather than a chord that acts immediately: logins persist now, so an
+/// accidental keystroke would sign the user out of everything.
+fn cookies_page() -> String {
+    page(
+        "Cookies",
+        "Signed-in sessions live here",
+        "<div class=e><span class=w></span><span class=u>Clearing cookies signs you out of          every site and cannot be undone. Bookmarks and history are untouched.</span></div>         <div class=e><span class=w></span>         <a class=rm href=\"cce://cookies/clear\">Clear all cookies</a></div>",
+        "",
+    )
+}
+
+fn cookies_cleared_page() -> String {
+    page(
+        "Cookies",
+        "Cleared",
+        "<div class=e><span class=w></span><span class=u>All cookies were cleared.          Sites you were signed in to will ask you to sign in again.</span></div>",
+        "",
+    )
 }
 
 impl ProtocolHandler for CceProtocol {
@@ -288,6 +313,11 @@ impl ProtocolHandler for CceProtocol {
             "downloads/clear" => {
                 self.downloads.clear_finished();
                 Some(self.downloads.html())
+            }
+            "cookies" => Some(cookies_page()),
+            "cookies/clear" => {
+                self.clear_cookies.store(true, std::sync::atomic::Ordering::SeqCst);
+                Some(cookies_cleared_page())
             }
             _ => None,
         };

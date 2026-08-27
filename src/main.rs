@@ -202,6 +202,9 @@ fn parse_url_input(input: &str, search_prefix: &str) -> Option<Url> {
     if s.eq_ignore_ascii_case("about:downloads") {
         return Url::parse("cce://downloads").ok();
     }
+    if s.eq_ignore_ascii_case("about:cookies") {
+        return Url::parse("cce://cookies").ok();
+    }
     if let Ok(u) = Url::parse(s) {
         if matches!(u.scheme(), "http" | "https" | "file" | "data" | "about" | "cce") {
             return Some(u);
@@ -809,6 +812,13 @@ impl Application for BrowserApp {
                 Key::Character(c) if c == "w" => {
                     *needs_rebuild = true;
                     return self.close_tab(self.host.active_index());
+                }
+                // Ctrl+Shift+Delete opens the cookie page rather than
+                // clearing outright; the page asks first.
+                Key::Named(NamedKey::Delete) if event.shift => {
+                    self.open_internal_page("cce://cookies");
+                    *needs_rebuild = true;
+                    return None;
                 }
                 Key::Character(c) if c == "h" || c == "b" || c == "j" => {
                     let page = match c.as_str() {
