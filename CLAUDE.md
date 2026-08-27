@@ -137,8 +137,29 @@ applies the inverted delta itself.
 `cce://history`, `cce://bookmarks`, `cce://downloads` and `cce://cookies` are **real
 pages fetched through Servo's network stack** and rendered like any other. That is why
 every mutating action is an ordinary link (`cce://history/clear`,
-`cce://bookmarks/remove?url=…`) — no chrome plumbing needed, and the live downloads
-page just sets a 1 s `<meta refresh>` while transfers run.
+`cce://bookmarks/remove?url=…`) — no chrome plumbing needed.
+
+### Servo leaks a document per load — the biggest live hazard
+
+Measured 2026-08-27: a page on a 1 s reload loop grows RSS ~0.9 GB per 90 s, linear,
+never reclaimed. Isolated cleanly — the same page's JS churn *without* the reload is
+flat, and an animation-heavy real page (cloudflare.com fully loaded) is flat. It is
+navigation that leaks, not script. This is upstream in Servo and not fixable here.
+
+In the wild it took the whole machine down: a **Cloudflare interstitial**
+(`"Just a moment..."`) re-runs itself waiting on a browser-integrity check Servo can
+never pass, and reached **54 GB RSS in ~6 minutes** — 83% of a 62 GB box, everything
+stalling on reclaim. Ctrl+Shift+O (hand the page to another browser) is the escape
+hatch, and the reason it exists.
+
+**`cce://downloads` is the same hazard in our own code**: it carries
+`<meta http-equiv="refresh" content="1">` while any transfer is active, so watching a
+long download leaks at the rate above. Fixing it means live progress without a
+navigation, and the obvious route is closed — **`fetch()` cannot reach a `cce:` URL**
+(tried, including with `Access-Control-Allow-Origin: *`; the protocol registry appears
+to serve top-level navigations only, and the fetch just rejects). A fix needs either a
+real localhost HTTP endpoint the page can fetch, or progress moved into the chrome.
+Until then, don't add a self-refreshing `cce:` page, and know this one is live.
 
 The handler runs on **Servo's fetch threads**, hence the `Arc<Mutex<_>>` stores. It
 therefore *cannot reach Servo itself*: `cce://cookies/clear` sets an `AtomicBool` that
