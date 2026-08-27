@@ -33,7 +33,9 @@ struct Entry {
     title: String,
 }
 
-fn state_dir() -> PathBuf {
+/// `~/.local/state/cce/browser` — history and bookmarks live here directly,
+/// Servo's own persisted state in a `profile` subdirectory under it.
+pub(crate) fn state_dir() -> PathBuf {
     let base = match std::env::var("XDG_STATE_HOME") {
         Ok(x) if !x.is_empty() => PathBuf::from(x),
         _ => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state"),

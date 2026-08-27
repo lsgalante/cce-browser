@@ -293,7 +293,28 @@ impl ServoHost {
             log::error!("failed to register cce: protocol: {e:?}");
         }
 
+        // Give Servo somewhere to persist per-profile state. Without a
+        // `config_dir` it keeps the cookie jar in memory only, so every
+        // launch starts logged out of every site; with one it reads and
+        // writes cookie_jar.json (plus the auth cache and HSTS list) there.
+        // Note the jar is plaintext JSON — live sessions for signed-in
+        // accounts sit in it, so it is deliberately under the state dir
+        // rather than anywhere shared or synced.
+        let profile_dir = crate::pages::state_dir().join("profile");
+        if let Err(e) = std::fs::create_dir_all(&profile_dir) {
+            log::warn!("no browser profile dir ({e}); sessions will not persist");
+        } else {
+            // Servo writes the jar 0644. $HOME is 0700 here so that is not
+            // exposed today, but the sessions inside are worth an owner-only
+            // directory of their own rather than relying on that.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&profile_dir, std::fs::Permissions::from_mode(0o700));
+        }
         let servo = ServoBuilder::default()
+            .opts(servo::Opts {
+                config_dir: Some(profile_dir),
+                ..Default::default()
+            })
             .event_loop_waker(Box::new(Waker(wake.clone())))
             .protocol_registry(protocols)
             .build();
