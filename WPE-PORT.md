@@ -48,22 +48,42 @@ files and a helper binary, at 282 MB. `webkitgtk-6.0` ships **zero** such files.
 ## Packages
 
 ```sh
-pacman -S wpewebkit libwpe wpebackend-fdo    # extra; ~137 MB + ~440 KB
+pacman -S wpewebkit          # extra, ~137 MB; pulls libwpe + wpebackend-fdo itself
 ```
 
 Declared like `cce-compositor` declares wlroots: a system prerequisite, `pkg-config`
 in `build.rs`, bindgen over the headers. This **deletes the Servo build** — the crate
 stops being a 5-minute, 175 MB outlier and becomes a normal small crate.
 
-## First thing to verify
+## API generation: WPEPlatform — resolved
 
-**Which API generation `2.52.6` exposes.** WPE has two: the older
-`libwpe` + `wpebackend-fdo` pairing where the embedder supplies a backend, and the
-newer **WPEPlatform** API which ships its own Wayland/DRM/**headless** backends. 2.52
-is recent enough that WPEPlatform should be present, and it is very likely the right
-target — but confirm against the installed headers before designing anything, because
-the two have materially different embedder contracts. Everything below assumes
-whichever one hands us buffers directly.
+`wpewebkit 2.52.6-1` ships the **new WPEPlatform API**, confirmed from the package
+file list. Its `pkg-config` modules:
+
+```
+wpe-webkit-2.0            wpe-platform-2.0            wpe-web-process-extension-2.0
+wpe-platform-wayland-2.0  wpe-platform-drm-2.0        wpe-platform-headless-2.0
+```
+
+One library — `libWPEWebKit-2.0.so.1` — with the backends as separate modules. The
+package still *depends* on `libwpe` / `wpebackend-fdo` (the legacy path is built too),
+but the port targets `wpe-platform-2.0` and never touches them directly: no
+embedder-supplied backend, which was the fiddliest part of the old generation.
+
+The 46 WPEPlatform headers map onto `ServoHost` almost object for object:
+
+| WPE | replaces |
+| --- | --- |
+| `WPEDisplayHeadless` | `SoftwareRenderingContext` — we own the display, no windowing assumptions |
+| `WPEView` | Servo's `WebView`; one per tab |
+| `WPEBufferSHM` / `WPEBufferDMABuf` | `read_to_image` — **both phases exist as first-class types** |
+| `WPEEvent`, `WPEInputMethodContext` | `notify_input_event`; IME is a bonus we do not have today |
+| `WPEToplevel`, `WPEScreen` | resize / scale plumbing |
+
+`WPEDisplayHeadless` is the one to use: WPE composites nothing, hands us buffers, and
+cce-ui draws them — exactly the current model. (`WPEDisplayWayland` exists but would
+make WPE a Wayland client in its own right, which fights cce-ui compositing.) Headless
+also means the throwaway spike and the shadow-session tests need no display at all.
 
 ## Impact map
 
@@ -116,9 +136,10 @@ uses against wlroots. This is the single largest chunk of work and the main risk
    `ServoHost`'s public surface needs — look at its 30 methods, not at all of WebKit.
 2. **ABI churn.** WebKit majors move and Arch is rolling; expect periodic build
    breaks. Pin the `pkg-config` name, accept the maintenance.
-3. **Multi-process.** WebKit spawns `WebKitWebProcess` / `WebKitNetworkProcess`, but
-   they are **binaries shipped by the package**, so `main()` is untouched — unlike
-   CEF. Verify sandbox behavior inside the cce session.
+3. **Multi-process and the sandbox.** WebKit spawns its own helper binaries, shipped
+   by the package, so `main()` is untouched — unlike CEF. But `wpewebkit` depends on
+   **`bubblewrap`**: the sandbox wants user namespaces, which is worth verifying early
+   inside the cce session rather than discovering late.
 4. **GLib main loop vs `calloop`.** WebKit needs a `GMainContext` turning. Either
    integrate its fd into `calloop` or run it stepped from `pump`. Solvable, needs
    design.
@@ -138,9 +159,11 @@ The port's case does **not** rest on this. Coverage alone justifies it.
 
 ## Suggested order
 
-1. Confirm the WPE API generation; install the packages; get `build.rs` + bindgen
+1. ~~Confirm the WPE API generation~~ — done, WPEPlatform (above). Install
+   `wpewebkit`; get `build.rs` + bindgen over `wpe-webkit-2.0` and `wpe-platform-2.0`
    producing symbols.
-2. A throwaway binary: boot WPE headless, load a URL, get one buffer out. No cce-ui.
+2. A throwaway binary: `WPEDisplayHeadless` + one `WPEView`, load a URL, pull one
+   `WPEBufferSHM` out and write it to a PNG. No cce-ui, no Wayland, no chrome.
 3. `ServoHost` → `WebKitHost` behind the same method surface, Phase-1 SHM buffers,
    single tab, no chrome changes.
 4. Tabs, then `cce:` schemes, then downloads-via-real-API.
