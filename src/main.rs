@@ -350,6 +350,52 @@ impl BrowserApp {
         true
     }
 
+    /// Hand the current page to another browser — the escape hatch for the
+    /// places Servo cannot follow, like a Cloudflare challenge that never
+    /// completes.
+    ///
+    /// Prefers the configured command; otherwise asks XDG. The guard matters:
+    /// cce-browser's own desktop entry claims http/https, so once it is the
+    /// default handler, `xdg-open` would hand the page straight back to us.
+    fn open_external(&mut self) {
+        let Some(url) = self
+            .host
+            .url()
+            .map(|u| u.to_string())
+            .or_else(|| parse_url_input(&self.url_input, &self.settings.search_prefix).map(|u| u.to_string()))
+        else {
+            return;
+        };
+        let configured = self.settings.external_browser.clone();
+        std::thread::spawn(move || {
+            let command = match configured {
+                Some(c) => c,
+                None => {
+                    let default = std::process::Command::new("xdg-mime")
+                        .args(["query", "default", "x-scheme-handler/https"])
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .unwrap_or_default();
+                    if default.trim_start().starts_with("cce-browser") {
+                        log::warn!(
+                            "cce-browser is the default https handler; set browser.external-browser                              to another command or this would just reopen here"
+                        );
+                        return;
+                    }
+                    "xdg-open".to_string()
+                }
+            };
+            let mut parts = command.split_whitespace();
+            let Some(program) = parts.next() else { return };
+            let args: Vec<&str> = parts.collect();
+            match std::process::Command::new(program).args(args).arg(&url).spawn() {
+                Ok(_) => log::info!("handed {url} to {program}"),
+                Err(e) => log::warn!("could not run {program}: {e}"),
+            }
+        });
+    }
+
     /// New blank tab with the URL bar focused for typing.
     fn new_tab(&mut self) {
         let url = Url::parse("about:blank").expect("about:blank");
@@ -777,6 +823,11 @@ impl Application for BrowserApp {
                 Key::Character(c) if c == "d" => {
                     self.host.toggle_bookmark();
                     *needs_rebuild = true;
+                    return None;
+                }
+                // Ctrl+Shift+O: open the current page in another browser.
+                Key::Character(c) if event.shift && c.eq_ignore_ascii_case("o") => {
+                    self.open_external();
                     return None;
                 }
                 Key::Named(NamedKey::Tab) if count > 1 => {

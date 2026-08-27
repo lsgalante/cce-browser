@@ -82,6 +82,9 @@ pub struct Settings {
     pub bar_position: BarPosition,
     /// What pages are told to prefer.
     pub color_scheme: ColorScheme,
+    /// Command used to hand the current page to another browser. Empty means
+    /// "ask XDG", which is right until cce-browser is itself the default.
+    pub external_browser: Option<String>,
 }
 
 impl Default for Settings {
@@ -93,6 +96,7 @@ impl Default for Settings {
             history: true,
             bar_position: BarPosition::Top,
             color_scheme: ColorScheme::Dark,
+            external_browser: None,
         }
     }
 }
@@ -134,5 +138,10 @@ pub fn load() -> Settings {
         history: b["history"].as_bool().unwrap_or(true),
         bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
         color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("dark")),
+        external_browser: b["external-browser"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     }
 }
