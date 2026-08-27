@@ -136,29 +136,47 @@ then stuck. **Proven working:**
   `WPEWebProcess` under `bwrap`, with no special setup. Retire that risk.
 - View sizing/mapping: `wpe_view_resized` / `set_visible` / `map` all take.
 
-**Not working: no buffers.** `render_buffer` never fires. The page loads into a live
-web process, but nothing is handed back. Advertising formats from
-`get_preferred_buffer_formats` (tried both `MAPPING` and `RENDERING` usage, `AR24`/
-`AB24`, linear) did not change it.
+**The spike renders.** `example.com` came out pixel-correct — right fonts, right link
+colour, right layout. Two things were needed beyond the above, and both are
+non-obvious:
 
-**Leading hypothesis, untested:** the view has no **`WPEToplevel`**. `WPEView` has a
-`toplevel` property and `WPEDisplayClass` has a `create_toplevel` vfunc that the spike
-leaves NULL; WebKit may decline to render into a view with no toplevel. Implement that
-next, before anything else.
+- **A `WPEToplevel`.** WebKit asks the **toplevel** for buffer formats
+  (`WPEToplevelClass.get_preferred_buffer_formats`), not the display. With
+  `WPEDisplayClass.create_toplevel` left NULL, no formats are ever negotiated and
+  `render_buffer` simply never fires — with no error. Subclass `WPEToplevel`
+  (derivable; construct properties are `display` and `max-views`) and implement
+  `get_preferred_buffer_formats` plus `resize`.
+- **Both halves of the buffer handshake.** `wpe_view_buffer_rendered` means
+  *displayed*; `wpe_view_buffer_released` means *the memory is yours again*. Calling
+  only the first yields exactly one frame and then a permanent stall. Call both.
 
-### This puts the SHM/DMABuf staging in doubt
+That second point is the backpressure mechanism, working as advertised: the engine
+will not produce another buffer until the embedder hands one back. The unbounded-queue
+failure mode is impossible here by construction.
 
-`wpe_display_headless_new()` — the reference display — advertises **54 DRM fourcc
-formats** and infers a DRM device (`/dev/dri/card0`). It is GPU/DMABuf-backed. So
-"Phase 1 = SHM into `upload_rgba`, no `cce-ui` change" may not be an available path at
-all in 2.52: `WPEBufferSHM` exists as a type, but nothing yet shows WebKit *producing*
-one for this configuration.
+### The staging holds: SHM is real
 
-If that holds, the phasing inverts — dmabuf is not the optimization, it is the only
-route, and the **`cce-ui` change (Vulkan `VK_EXT_external_memory_dma_buf` import) moves
-from Phase 2 to a prerequisite**. That is a materially different port: it touches a
-shared crate on day one rather than at the end. Settle this before committing to a
-plan; it is the single most schedule-relevant unknown left.
+Buffers arrive as **`WPEBufferSHM`**, despite `wpe_display_headless_new()` advertising
+54 DRM fourcc formats and inferring a DRM device — the reference display being
+GPU-backed does not force the embedder to be:
+
+```
+render_buffer #2: 1200x800  type=SHM  bytes=3840000  stride=4800  format=0
+```
+
+`format=0` is `WPE_PIXEL_FORMAT_ARGB8888`; stride is `width * 4`; byte order in memory
+is B,G,R,A. That is precisely the shape `cce_ui::vk::upload_rgba` already accepts.
+
+**So Phase 1 needs no `cce-ui` change**, and the Vulkan `VK_EXT_external_memory_dma_buf`
+import stays a Phase 2 optimisation rather than a day-one prerequisite in a shared
+crate. (An earlier revision of this doc recorded the opposite as a live risk; the spike
+settled it.)
+
+### Still open
+
+A static page yields two frames and then quiets, which is correct — no animation, no
+new frames. Frame *cadence* under a live page, input plumbing (`wpe_view_event`), and
+multiple views on one display are all unproven. None of them are architectural.
 
 ## Impact map
 
