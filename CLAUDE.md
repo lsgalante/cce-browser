@@ -176,11 +176,20 @@ user out of everything.
 
 ## Downloads
 
-Servo has no download pipeline at all. `request_navigation` sniffs the URL against
-`DOWNLOAD_EXTENSIONS`, `deny()`s the navigation, and hands the URL to a `reqwest`
-blocking worker that streams into the download dir. Note the sniff is **extension-only**
-— there is no `Content-Disposition` or content-type handling, so a download URL with no
-recognizable extension navigates instead.
+Servo has no download pipeline at all, so a URL that looks downloadable is diverted to
+a `reqwest` blocking worker that streams it into the download dir. The sniff is
+**extension-only** (`DOWNLOAD_EXTENSIONS`) — no `Content-Disposition` or content-type
+handling — so a download URL with no recognizable extension navigates instead.
+
+It has to happen in **two places**, and that is not redundancy.
+`WebViewDelegate::request_navigation` fires only for navigations the *content* starts
+(a link, `location.href`). A URL the **embedder** supplies never reaches it — neither
+the first tab's, which Servo loads straight from `WebViewBuilder::url`, nor one from
+the URL bar — so those are sniffed in `ServoHost::take_as_download` instead. Until that
+existed, `cce-browser https://…/thing.tar.gz` rendered Servo's "Unknown content type
+(application/octet-stream)" page rather than downloading. A caller that takes a URL as
+a download must return *without* navigating, which is what stops the two paths from
+starting the same transfer twice.
 
 `Download::id` exists because `clear_finished` shifts Vec positions; worker updates
 must never carry an index across a lock boundary.

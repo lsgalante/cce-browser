@@ -244,6 +244,10 @@ pub struct ServoHost {
     reload_at: Vec<std::time::Instant>,
     /// Raised by the cce://cookies/clear page; acted on here in `pump`.
     clear_cookies: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the delegate and the `cce:` handler. The host needs it
+    /// directly because the delegate's sniff cannot see every navigation —
+    /// see [`ServoHost::take_as_download`].
+    downloads: std::sync::Arc<Downloads>,
 }
 
 impl ServoHost {
@@ -399,9 +403,43 @@ impl ServoHost {
             force_dark,
             reload_at: Vec::new(),
             clear_cookies,
+            downloads,
         };
-        host.open_tab(url);
+        // argv can name a download, and the first tab's URL is one of the
+        // navigations the delegate never sees, so it has to be sniffed here.
+        let start = if host.take_as_download(&url) {
+            Url::parse("cce://downloads").expect("downloads url")
+        } else {
+            url
+        };
+        host.open_tab(start);
         host
+    }
+
+    /// Take `url` as a download instead of a navigation, if it looks like
+    /// one. Returns whether it was taken.
+    ///
+    /// `WebViewDelegate::request_navigation` — where the sniff normally
+    /// happens — only fires for navigations the *content* starts. A URL the
+    /// embedder supplies never reaches it: not the first tab's (Servo loads
+    /// it straight from `WebViewBuilder::url`), and not one typed in the URL
+    /// bar. Passing an archive URL as argv therefore rendered Servo's
+    /// "Unknown content type (application/octet-stream)" page instead of
+    /// downloading it.
+    ///
+    /// Callers must return without navigating when this returns true, which
+    /// is also what keeps the delegate from starting the same download twice.
+    /// Raising `download_started` (so the app surfaces the downloads page) is
+    /// left to the caller: at startup the first tab opens on that page
+    /// already, and the flag would add a second one — `open_internal_page`
+    /// cannot dedupe against a tab whose URL the delegate has not reported
+    /// yet.
+    fn take_as_download(&self, url: &Url) -> bool {
+        if !is_download_url(url) {
+            return false;
+        }
+        self.downloads.start(url.clone());
+        true
     }
 
     fn build_webview(&self, url: Url) -> WebView {
@@ -618,6 +656,10 @@ impl ServoHost {
     }
 
     pub fn load(&self, url: Url) {
+        if self.take_as_download(&url) {
+            self.shared.download_started.set(true);
+            return;
+        }
         self.active_tab().webview.load(url);
     }
 

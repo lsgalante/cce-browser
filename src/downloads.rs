@@ -264,3 +264,37 @@ impl Downloads {
         page("Downloads", &meta, &body, head)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The argv case: a release-artifact URL must be recognized before it is
+    /// ever handed to Servo. `request_navigation` does not fire for a URL the
+    /// embedder supplies, so `ServoHost::take_as_download` is the only thing
+    /// standing between this and Servo's "Unknown content type" page.
+    #[test]
+    fn download_urls_are_recognized_by_extension() {
+        for u in [
+            "https://example.com/rel/app-1.2.3.tar.gz",
+            "http://127.0.0.1:8740/big.bin",
+            "https://example.com/Installer.EXE",
+            "https://example.com/x.zip?token=abc",
+        ] {
+            assert!(is_download_url(&Url::parse(u).unwrap()), "should download: {u}");
+        }
+    }
+
+    #[test]
+    fn ordinary_pages_and_non_http_schemes_are_not_downloads() {
+        for u in [
+            "https://www.cloudflare.com/",
+            "https://example.com/page.html",
+            "https://example.com/binary",       // no extension: navigates
+            "cce://downloads",
+            "file:///home/me/x.zip",            // only http(s) is fetched here
+        ] {
+            assert!(!is_download_url(&Url::parse(u).unwrap()), "should not download: {u}");
+        }
+    }
+}
