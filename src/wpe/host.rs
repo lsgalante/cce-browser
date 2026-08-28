@@ -243,6 +243,8 @@ impl WebKitHost {
             }));
 
             let toplevel = wpe_display_create_toplevel(display, 1);
+            // Scale is 1 until the first `resize` from a real window; the
+            // constructor's size is already logical.
             wpe_toplevel_resized(toplevel, size_px.0 as i32, size_px.1 as i32);
 
             let mut host = Self {
@@ -313,7 +315,8 @@ impl WebKitHost {
                 on_authenticate as *const () as usize,
                 &self.prompts,
             );
-            wpe_view_resized(view, self.size_px.0 as i32, self.size_px.1 as i32);
+            let (lw, lh) = self.logical_size();
+            wpe_view_resized(view, lw, lh);
             wpe_view_set_visible(view, 1);
             wpe_view_map(view);
             let curl = cstr(url.as_str());
@@ -381,7 +384,8 @@ impl WebKitHost {
             wpe_view_set_toplevel(tab.view, self.toplevel);
             wpe_view_set_visible(tab.view, 1);
             wpe_view_map(tab.view);
-            wpe_view_resized(tab.view, self.size_px.0 as i32, self.size_px.1 as i32);
+            let (lw, lh) = self.logical_size();
+            wpe_view_resized(tab.view, lw, lh);
         }
     }
 
@@ -681,14 +685,15 @@ impl WebKitHost {
     pub fn mouse_move(&self, x_px: f32, y_px: f32) {
         unsafe {
             let view = self.active_tab().view;
+            let (x, y) = self.to_logical(x_px, y_px);
             let e = wpe_event_pointer_move_new(
                 WPEEventType::WPE_EVENT_POINTER_MOVE,
                 view,
                 WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
                 input::now_ms(),
                 0,
-                x_px as f64,
-                y_px as f64,
+                x,
+                y,
                 0.0,
                 0.0,
             );
@@ -705,8 +710,9 @@ impl WebKitHost {
             let time = input::now_ms();
             // WPE tracks double/triple clicks for us; a frozen clock here
             // would make every click read as a repeat.
+            let (x, y) = self.to_logical(x_px, y_px);
             let press_count = if pressed {
-                wpe_view_compute_press_count(view, x_px as f64, y_px as f64, n, time)
+                wpe_view_compute_press_count(view, x, y, n, time)
             } else {
                 0
             };
@@ -721,8 +727,8 @@ impl WebKitHost {
                 time,
                 0,
                 n,
-                x_px as f64,
-                y_px as f64,
+                x,
+                y,
                 press_count,
             );
             self.send(view, e);
@@ -739,17 +745,18 @@ impl WebKitHost {
     pub fn wheel(&self, dx_px: f64, dy_px: f64, x_px: f32, y_px: f32) {
         unsafe {
             let view = self.active_tab().view;
+            let (x, y) = self.to_logical(x_px, y_px);
             let e = wpe_event_scroll_new(
                 view,
                 WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
                 input::now_ms(),
                 0,
-                dx_px,
-                dy_px,
+                dx_px / self.scale as f64,
+                dy_px / self.scale as f64,
                 1, // precise deltas: these are pixels, not notches
                 0, // not a scroll-stop event
-                x_px as f64,
-                y_px as f64,
+                x,
+                y,
             );
             self.send(view, e);
         }
@@ -802,14 +809,39 @@ impl WebKitHost {
         wpe_event_unref(event);
     }
 
+    /// Resize, in **physical** pixels — `ServoHost`'s convention, so
+    /// `main.rs` passes `content_px()` to either backend unchanged.
+    ///
+    /// WPE wants the opposite split: a **logical** size plus a scale, and it
+    /// produces a buffer of `size * scale`. Handing it physical pixels while
+    /// leaving the scale at 1 makes it lay out 2400x1600 *CSS* pixels on a 2x
+    /// display — the viewport reads as twice as wide as it is and the whole
+    /// page renders at half size. That is the bug this converts away.
     pub fn resize(&mut self, width_px: u32, height_px: u32, scale: f32) {
         self.size_px = (width_px.max(1), height_px.max(1));
-        self.scale = scale;
+        self.scale = scale.max(0.01);
+        let (lw, lh) = self.logical_size();
         unsafe {
-            wpe_toplevel_resized(self.toplevel, self.size_px.0 as i32, self.size_px.1 as i32);
+            wpe_toplevel_scale_changed(self.toplevel, self.scale as f64);
+            wpe_toplevel_resized(self.toplevel, lw, lh);
             let view = self.active_tab().view;
-            wpe_view_resized(view, self.size_px.0 as i32, self.size_px.1 as i32);
+            wpe_view_resized(view, lw, lh);
         }
+    }
+
+    /// The view size WPE works in: physical divided back out by the scale.
+    fn logical_size(&self) -> (i32, i32) {
+        (
+            ((self.size_px.0 as f32 / self.scale).round() as i32).max(1),
+            ((self.size_px.1 as f32 / self.scale).round() as i32).max(1),
+        )
+    }
+
+    /// Physical pointer coordinates into the view's logical space, for the
+    /// same reason as `resize` — a click at the bottom of a 2x window would
+    /// otherwise land twice as far down the page as the cursor.
+    fn to_logical(&self, x_px: f32, y_px: f32) -> (f64, f64) {
+        ((x_px / self.scale) as f64, (y_px / self.scale) as f64)
     }
 }
 
