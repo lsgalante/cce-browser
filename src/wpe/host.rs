@@ -14,6 +14,7 @@
 //! so the app wakes only when GLib has work — see WPE-PORT.md; doing it by
 //! polling first keeps this milestone about the engine, not the event loop.
 
+use std::cell::{Cell, RefCell};
 use std::ffi::{c_char, CString};
 use std::rc::Rc;
 
@@ -26,16 +27,84 @@ use super::glib_source::GlibPoll;
 use super::input;
 use super::subclass::{types, FRAME_SINK};
 
+/// Page state a tab's WebKit signals write into.
+///
+/// Held behind an `Rc` because each connected signal owns a reference: the
+/// closure outlives any borrow we could hand it, and the webview may emit
+/// after the `Tab` has moved within `tabs` (a `Vec` reallocates).
+#[derive(Default)]
+struct TabState {
+    title: RefCell<Option<String>>,
+    url: RefCell<Option<Url>>,
+    loading: Cell<bool>,
+    /// Set by any signal, cleared by `pump`. This is what lets a *background*
+    /// tab report a title change — the old polling only ever looked at the
+    /// active webview.
+    dirty: Cell<bool>,
+}
+
 /// One tab: its webview plus the app-visible page state and the last frame
 /// uploaded to the image registry (id, w px, h px). Same shape as
 /// `webview::Tab` so the chrome reads it identically.
 pub struct Tab {
     webview: *mut WebKitWebView,
     view: *mut WPEView,
+    state: Rc<TabState>,
     pub title: Option<String>,
     pub url: Option<Url>,
     pub loading: bool,
     image: Option<(u32, u32, u32)>,
+}
+
+impl Drop for Tab {
+    fn drop(&mut self) {
+        // Unref the webview *first*: destroying it runs the closures'
+        // destroy-notify, which releases their `Rc<TabState>` refs. Dropping
+        // the state before the object that can still emit into it would be a
+        // use-after-free.
+        unsafe { g_object_unref(self.webview as *mut _) };
+        if let Some((id, ..)) = self.image {
+            cce_ui::vk::free_image(id);
+        }
+    }
+}
+
+/// `notify::` handler shared by title / uri / is-loading: read the property
+/// straight back off the emitting webview and stash it.
+unsafe extern "C" fn on_notify(
+    obj: *mut GObject,
+    _pspec: *mut GParamSpec,
+    data: gpointer,
+) {
+    let st = &*(data as *const TabState);
+    let wv = obj as *mut WebKitWebView;
+    *st.title.borrow_mut() = from_cstr(webkit_web_view_get_title(wv));
+    if let Some(u) = from_cstr(webkit_web_view_get_uri(wv)).and_then(|u| Url::parse(&u).ok()) {
+        *st.url.borrow_mut() = Some(u);
+    }
+    st.loading.set(webkit_web_view_is_loading(wv) != 0);
+    st.dirty.set(true);
+}
+
+/// Releases the `Rc` ref a connection owned, when the closure is destroyed.
+unsafe extern "C" fn drop_state_ref(data: gpointer, _closure: *mut GClosure) {
+    drop(Rc::from_raw(data as *const TabState));
+}
+
+unsafe fn connect_notify(wv: *mut WebKitWebView, signal: &str, state: &Rc<TabState>) {
+    let name = cstr(signal);
+    // Each connection owns its own ref, handed back by `drop_state_ref`.
+    let raw = Rc::into_raw(state.clone()) as gpointer;
+    g_signal_connect_data(
+        wv as *mut _,
+        name.as_ptr(),
+        Some(std::mem::transmute::<_, unsafe extern "C" fn()>(
+            on_notify as unsafe extern "C" fn(*mut GObject, *mut GParamSpec, gpointer),
+        )),
+        raw,
+        Some(drop_state_ref),
+        0,
+    );
 }
 
 /// Frames handed over by `render_buffer`, drained by `pump`. A slot, not a
@@ -107,7 +176,7 @@ impl WebKitHost {
         }
     }
 
-    fn build_webview(&self, url: &Url) -> (*mut WebKitWebView, *mut WPEView) {
+    fn build_webview(&self, url: &Url, state: &Rc<TabState>) -> (*mut WebKitWebView, *mut WPEView) {
         unsafe {
             let prop = cstr("display");
             let wv = g_object_new(
@@ -118,6 +187,11 @@ impl WebKitHost {
             ) as *mut WebKitWebView;
             let view = webkit_web_view_get_wpe_view(wv);
             wpe_view_set_toplevel(view, self.toplevel);
+            // Signals, not polling: a background tab has to be able to report
+            // its title without anyone asking the active webview.
+            for sig in ["notify::title", "notify::uri", "notify::is-loading"] {
+                connect_notify(wv, sig, state);
+            }
             wpe_view_resized(view, self.size_px.0 as i32, self.size_px.1 as i32);
             wpe_view_set_visible(view, 1);
             wpe_view_map(view);
@@ -128,16 +202,46 @@ impl WebKitHost {
     }
 
     pub fn open_tab(&mut self, url: Url) {
-        let (webview, view) = self.build_webview(&url);
+        let state = Rc::new(TabState::default());
+        state.loading.set(true);
+        *state.url.borrow_mut() = Some(url.clone());
+        let (webview, view) = self.build_webview(&url, &state);
         self.tabs.push(Tab {
             webview,
             view,
+            state,
             title: None,
             url: Some(url),
             loading: true,
             image: None,
         });
         self.activate(self.tabs.len() - 1);
+    }
+
+    /// Close a tab. Returns false when that was the last one (the app should
+    /// exit; the tab is gone either way). Mirrors `ServoHost::close_tab`,
+    /// including how the next active index is chosen.
+    pub fn close_tab(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return true;
+        }
+        let was_active = index == self.active;
+        let old_active = self.active;
+        // Dropping the Tab unrefs the webview and frees its registry image.
+        drop(self.tabs.remove(index));
+        if self.tabs.is_empty() {
+            return false;
+        }
+        let next = if was_active {
+            index.min(self.tabs.len() - 1)
+        } else if old_active > index {
+            old_active - 1
+        } else {
+            old_active
+        };
+        self.active = usize::MAX; // force activate() to do the work
+        self.activate(next);
+        true
     }
 
     /// Make tab `index` visible and focused. Mirrors `ServoHost::activate`,
@@ -218,25 +322,25 @@ impl WebKitHost {
         (true, true)
     }
 
-    /// Pull title/url/loading off the active webview. WebKit exposes these as
-    /// properties; polling them here keeps the delegate-free shape of this
-    /// first cut. Signals (`notify::title`, `load-changed`) are the better
-    /// answer once tabs land, so background tabs update too.
+    /// Fold each tab's signal-written state into the fields the chrome reads.
+    ///
+    /// Every tab, not just the active one — that is the whole point of moving
+    /// off polling. The tab strip shows a title per tab, so a background tab
+    /// finishing a load has to be visible without switching to it.
     fn sync_page_state(&mut self) -> bool {
-        unsafe {
-            let tab = &mut self.tabs[self.active];
-            let title = from_cstr(webkit_web_view_get_title(tab.webview));
-            let uri = from_cstr(webkit_web_view_get_uri(tab.webview));
-            let loading = webkit_web_view_is_loading(tab.webview) != 0;
-            let url = uri.and_then(|u| Url::parse(&u).ok());
-            let changed = title != tab.title || url != tab.url || loading != tab.loading;
-            tab.title = title;
-            if url.is_some() {
-                tab.url = url;
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            if !tab.state.dirty.replace(false) {
+                continue;
             }
-            tab.loading = loading;
-            changed
+            tab.title = tab.state.title.borrow().clone();
+            if let Some(u) = tab.state.url.borrow().clone() {
+                tab.url = Some(u);
+            }
+            tab.loading = tab.state.loading.get();
+            changed = true;
         }
+        changed
     }
 
     pub fn image(&self) -> Option<(u32, u32, u32)> {
