@@ -262,20 +262,41 @@ and that the buffer handshake has two halves. Every one of those fails *silently
 no error, healthy web process, simply no frames. Better bindings would not have helped
 with any of them.
 
+## Real-world use — started 2026-08-28
+
+The WPE build is installed and in daily use. What that has established, and what it
+has cost, in the first hours:
+
+**Cloudflare: signed in successfully**, dashboard and all. Servo could not get past the
+interstitial at all — it re-ran the challenge until the machine died. This is not quite
+proof that WebKit passes a *Managed Challenge* specifically (the session may never have
+been served one), but it is a far higher bar than the marketing page that earlier test
+used: a heavy JS application behind Cloudflare's own protection, reached through a
+login. The engine-identity worry that motivated half this document has not materialised.
+
+**Cookies persist.** The login survives in WebKit's own origin-keyed store under
+`~/.local/state/cce/browser/profile/storage`. (`cookie_jar.json` beside it is Servo's
+format, now dead weight.)
+
+**Three bugs found by use, none by testing:**
+
+| symptom | cause |
+| --- | --- |
+| pages rendered half size | `resize` took physical pixels and never told WPE the scale, so a 2x display laid out 2400x1600 *CSS* pixels |
+| Ctrl+V did nothing in a page | `WPEDisplayClass.get_clipboard` left NULL — WebKit had no clipboard at all |
+| …and still did nothing once added | the `WPEClipboard` subclass overrode `changed` without chaining up, so `set_content` stored nothing and WebKit never called `read` |
+
+The scale bug is the instructive one: **every test up to that point ran at scale 1**,
+where the physical/logical conversion is the identity, so nothing scale-dependent was
+ever exercised. A whole class of bug was invisible to the entire test suite. The same
+was true of input coordinates, which had the identical latent bug and were fixed in the
+same pass before anyone hit them.
+
 ## Still unproven
 
-**Cloudflare.** WebKit rendered `cloudflare.com` correctly in a shadow session — but so
-did Servo, minutes later, because **neither was served a challenge**. That comparison
-establishes nothing. The decisive test is to catch a live `"Just a moment..."` and
-point both at that exact URL at that moment. Cheaper now than when this was written:
-the WPE build is a real browser, so it can be aimed at the challenge directly rather
-than through a Python harness.
-
-The port's case does **not** rest on this. Coverage alone justifies it.
-
-**Real-world use.** Everything verified so far is `example.com`, local servers and
-shadow sessions. Nobody has browsed actual sites on this. That is the largest gap
-between "the port runs" and "the port replaces Servo".
+- A live `"Just a moment..."` interstitial, specifically. Cheap to settle now that the
+  WPE build is a real browser rather than a Python harness.
+- Everything past the first hours of use.
 
 ## What remains
 
