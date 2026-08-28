@@ -29,7 +29,9 @@ fn main() {
         // The engine, the embedding layer, and just enough GObject to
         // register subclasses and turn a main loop.
         .allowlist_item("(wpe|WPE|webkit|WebKit)_?.*")
-        .allowlist_item("g_(object|type|signal|main_loop|bytes|timeout|free|error)_.*")
+        .allowlist_item("g_(object|type|signal|bytes|timeout|free|error)_.*")
+        // The main loop AND the context: `pump` drains the context directly.
+        .allowlist_item("g_main_(loop|context)_.*")
         .allowlist_item("G(Object|Type|Value|Bytes|Error|MainLoop|ParamSpec|Closure).*")
         .allowlist_item("g_(type|object)_.*")
         // GObject's generated enums are plain C enums; keep them as consts so

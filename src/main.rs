@@ -10,6 +10,10 @@ mod downloads;
 mod pages;
 mod settings;
 mod webview;
+/// The in-progress WPE WebKit backend (see WPE-PORT.md). Compiled only under
+/// `--features wpe`; the shipping browser is still Servo.
+#[cfg(feature = "wpe")]
+mod wpe;
 
 use url::Url;
 use wayland_client::QueueHandle;
