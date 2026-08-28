@@ -22,6 +22,7 @@ use url::Url;
 use cce_ui::widget::{KeyEvent, MouseButton};
 
 use super::ffi::*;
+use super::glib_source::GlibPoll;
 use super::input;
 use super::subclass::{types, FRAME_SINK};
 
@@ -53,6 +54,8 @@ pub struct WebKitHost {
     size_px: (u32, u32),
     scale: f32,
     pending: Rc<std::cell::RefCell<Pending>>,
+    /// GLib's pollfd set, mirrored into one epoll fd for calloop.
+    poll: Option<GlibPoll>,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -95,6 +98,9 @@ impl WebKitHost {
                 size_px,
                 scale: 1.0,
                 pending,
+                poll: GlibPoll::new()
+                    .map_err(|e| log::warn!("no GLib epoll bridge ({e}); pump will poll"))
+                    .ok(),
             };
             host.open_tab(url);
             host
@@ -167,11 +173,37 @@ impl WebKitHost {
         &self.tabs[self.active]
     }
 
+    /// The epoll fd carrying GLib's pollfd set, for `register_sources`.
+    /// `None` if the bridge could not be created, in which case the app must
+    /// fall back to calling [`Self::pump`] on a timer.
+    pub fn poll_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.poll.as_ref().map(|p| p.fd())
+    }
+
+    /// How long calloop may sleep before pumping anyway, per GLib.
+    pub fn poll_timeout(&self) -> Option<std::time::Duration> {
+        self.poll
+            .as_ref()
+            .and_then(|p| p.timeout)
+            .map(|ms| std::time::Duration::from_millis(ms as u64))
+    }
+
     /// Drain GLib's pending work, then upload any frame it produced.
     /// Returns (new frame, any state change) like `ServoHost::pump`.
     pub fn pump(&mut self) -> (bool, bool) {
+        // Clear the inner epoll first: calloop is level-triggered on that fd,
+        // so leaving it readable across a pump that does not consume the
+        // underlying socket would spin the loop.
+        if let Some(p) = &self.poll {
+            p.drain();
+        }
         unsafe {
             while g_main_context_iteration(std::ptr::null_mut(), 0) != 0 {}
+        }
+        // WebKit opens and drops sockets as it loads, so the set that matters
+        // is the one *after* dispatch, not before.
+        if let Some(p) = &mut self.poll {
+            p.sync();
         }
         let frame = self.pending.borrow_mut().frame.take();
         let dirty = self.sync_page_state();

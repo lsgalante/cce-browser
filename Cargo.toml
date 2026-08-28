@@ -9,7 +9,7 @@ build = "build.rs"
 [features]
 # The in-progress WPE WebKit port (see WPE-PORT.md). Off by default: the
 # shipping browser is still Servo. Needs `pacman -S wpewebkit`.
-wpe = []
+wpe = ["dep:rustix"]
 
 [dependencies]
 cce-ui = { path = "../cce-ui" }
@@ -24,6 +24,9 @@ euclid = "0.22"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 log = "0.4"
 env_logger = "0.11"
+# Only used by the `wpe` backend, to hold GLib's changing pollfd set in one
+# epoll fd that calloop can watch. Optional so a default build skips it.
+rustix = { version = "0.38", features = ["event"], optional = true }
 
 [build-dependencies]
 bindgen = "0.72"

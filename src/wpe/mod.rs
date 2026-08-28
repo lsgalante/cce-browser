@@ -11,6 +11,7 @@ pub mod ffi {
 
 mod subclass;
 mod input;
+mod glib_source;
 mod host;
 
 // Not consumed yet — main.rs still drives ServoHost.

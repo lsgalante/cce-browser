@@ -33,6 +33,8 @@ fn main() {
         // The main loop AND the context: `pump` drains the context directly.
         .allowlist_item("g_main_(loop|context)_.*")
         .allowlist_item("G(Object|Type|Value|Bytes|Error|MainLoop|ParamSpec|Closure).*")
+        // The main-context poll protocol: GPollFD is what `query` fills in.
+        .allowlist_item("G(MainContext|PollFD|Source).*")
         .allowlist_item("g_(type|object)_.*")
         // GObject's generated enums are plain C enums; keep them as consts so
         // vfunc tables and property flags stay comparable without casts.
