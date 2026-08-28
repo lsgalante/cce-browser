@@ -184,6 +184,65 @@ impl Downloads {
         });
     }
 
+    /// Register a download the *engine* is performing, rather than one of
+    /// our own reqwest workers.
+    ///
+    /// WebKit does its own fetching, and does it better: it decides by
+    /// content type and honours `Content-Disposition`, where
+    /// [`is_download_url`] can only guess from the extension. The store and
+    /// the `cce://downloads` page are unchanged — only who moves the bytes.
+    /// Returns the id to report progress against.
+    pub fn adopt(&self, url: String, path: PathBuf, total: Option<u64>) -> u64 {
+        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.items.lock().unwrap().push(Download {
+            id,
+            ts,
+            url,
+            filename: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "download".into()),
+            path,
+            received: 0,
+            total,
+            state: State::Active,
+        });
+        id
+    }
+
+    pub fn set_progress(&self, id: u64, received: u64, total: Option<u64>) {
+        self.with_item(id, |d| {
+            d.received = received;
+            if total.is_some() {
+                d.total = total;
+            }
+        });
+    }
+
+    pub fn set_finished(&self, id: u64, result: Result<(), String>) {
+        self.with_item(id, |d| {
+            d.state = match result {
+                Ok(()) => State::Done,
+                Err(e) => State::Failed(e),
+            };
+        });
+    }
+
+    /// Where a download should land, given the name the server suggested.
+    /// Shared with the engine-driven path so both honour the configured
+    /// directory and the `name.1.ext` de-duplication.
+    pub fn destination_for(suggested: &str) -> PathBuf {
+        let dir = download_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let name = suggested.replace(['/', '\0'], "_");
+        let name = if name.trim().is_empty() { "download" } else { name.trim() };
+        unique_path(&dir, name)
+    }
+
     fn with_item(&self, id: u64, f: impl FnOnce(&mut Download)) {
         let mut items = self.items.lock().unwrap();
         if let Some(item) = items.iter_mut().find(|d| d.id == id) {

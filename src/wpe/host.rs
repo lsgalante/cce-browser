@@ -209,6 +209,27 @@ impl WebKitHost {
 
             let download_started = Rc::new(Cell::new(false));
 
+            // WebKit fetches downloads itself, and decides what *is* one by
+            // content type — so the extension sniff `is_download_url` exists
+            // for is simply not needed here, and neither is the argv/URL-bar
+            // blind spot it created.
+            let ctxs = Rc::new(DownloadCtx {
+                downloads: downloads.clone(),
+                started: download_started.clone(),
+            });
+            let sig = cstr("download-started");
+            g_signal_connect_data(
+                session as *mut _,
+                sig.as_ptr(),
+                Some(std::mem::transmute::<_, unsafe extern "C" fn()>(
+                    on_download_started
+                        as unsafe extern "C" fn(*mut GObject, *mut WebKitDownload, gpointer),
+                )),
+                Rc::into_raw(ctxs) as gpointer,
+                None,
+                0,
+            );
+
             let pending = Rc::new(std::cell::RefCell::new(Pending::default()));
             let sink = pending.clone();
             FRAME_SINK = Some(Box::new(move |buffer: *mut WPEBuffer| {
@@ -790,4 +811,116 @@ unsafe extern "C" fn on_cce_request(request: *mut WebKitURISchemeRequest, data: 
 
 unsafe extern "C" fn free_boxed(p: gpointer) {
     drop(Box::from_raw(p as *mut u8));
+}
+
+/// Shared with WebKit's download signals for the life of the process.
+struct DownloadCtx {
+    downloads: std::sync::Arc<crate::downloads::Downloads>,
+    started: Rc<Cell<bool>>,
+}
+
+/// Per-download state, owned by that download's own signal closures.
+struct OneDownload {
+    ctx: Rc<DownloadCtx>,
+    id: Cell<u64>,
+}
+
+unsafe extern "C" fn on_download_started(
+    _session: *mut GObject,
+    download: *mut WebKitDownload,
+    data: gpointer,
+) {
+    let ctx = &*(data as *const DownloadCtx);
+    let one = Rc::new(OneDownload {
+        ctx: Rc::new(DownloadCtx {
+            downloads: ctx.downloads.clone(),
+            started: ctx.started.clone(),
+        }),
+        id: Cell::new(u64::MAX),
+    });
+    ctx.started.set(true);
+
+    for (sig, cb) in [
+        (
+            "decide-destination",
+            on_decide_destination as *const () as usize,
+        ),
+        ("received-data", on_received_data as *const () as usize),
+        ("finished", on_finished as *const () as usize),
+        ("failed", on_failed as *const () as usize),
+    ] {
+        let name = cstr(sig);
+        g_signal_connect_data(
+            download as *mut _,
+            name.as_ptr(),
+            Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(cb)),
+            Rc::into_raw(one.clone()) as gpointer,
+            Some(drop_one_download),
+            0,
+        );
+    }
+}
+
+unsafe extern "C" fn drop_one_download(data: gpointer, _c: *mut GClosure) {
+    drop(Rc::from_raw(data as *const OneDownload));
+}
+
+/// WebKit asks where to put it, passing the name the *server* suggested —
+/// `Content-Disposition` when present, which the extension sniff could never
+/// see. Returning TRUE means we handled it.
+unsafe extern "C" fn on_decide_destination(
+    download: *mut WebKitDownload,
+    suggested: *const c_char,
+    data: gpointer,
+) -> gboolean {
+    let one = &*(data as *const OneDownload);
+    let name = from_cstr(suggested).unwrap_or_else(|| "download".into());
+    let path = crate::downloads::Downloads::destination_for(&name);
+
+    let total = {
+        let response = webkit_download_get_response(download);
+        (!response.is_null())
+            .then(|| webkit_uri_response_get_content_length(response))
+            .filter(|n| *n > 0)
+    };
+    let uri = from_cstr(webkit_download_get_destination(download)).unwrap_or_default();
+    one.id
+        .set(one.ctx.downloads.adopt(uri, path.clone(), total));
+
+    let dest = cstr(&path.to_string_lossy());
+    webkit_download_set_destination(download, dest.as_ptr());
+    1
+}
+
+unsafe extern "C" fn on_received_data(
+    download: *mut WebKitDownload,
+    _len: u64,
+    data: gpointer,
+) {
+    let one = &*(data as *const OneDownload);
+    if one.id.get() != u64::MAX {
+        one.ctx.downloads.set_progress(
+            one.id.get(),
+            webkit_download_get_received_data_length(download),
+            None,
+        );
+    }
+}
+
+unsafe extern "C" fn on_finished(_d: *mut WebKitDownload, data: gpointer) {
+    let one = &*(data as *const OneDownload);
+    if one.id.get() != u64::MAX {
+        one.ctx.downloads.set_finished(one.id.get(), Ok(()));
+    }
+}
+
+unsafe extern "C" fn on_failed(_d: *mut WebKitDownload, error: *mut GError, data: gpointer) {
+    let one = &*(data as *const OneDownload);
+    let msg = (!error.is_null())
+        .then(|| from_cstr((*error).message))
+        .flatten()
+        .unwrap_or_else(|| "download failed".into());
+    if one.id.get() != u64::MAX {
+        one.ctx.downloads.set_finished(one.id.get(), Err(msg));
+    }
 }
