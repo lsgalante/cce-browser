@@ -1,6 +1,17 @@
-# Scoping: porting cce-browser from Servo to WPE WebKit
+# Porting cce-browser from Servo to WPE WebKit
 
-Status: **scoping only.** Nothing here is implemented. Written 2026-08-27.
+Status as of 2026-08-28: **the port runs.** `cargo build --release -p cce-browser
+--features wpe` produces a working WebKit browser — chrome, rendering, input,
+navigation, tabs, `cce:` pages, persistent cookies, downloads. It is **not the
+default**: the shipping browser is still Servo, and every step was verified to leave
+that build and its tests untouched.
+
+```sh
+cargo build --release -p cce-browser --features wpe
+```
+
+Written 2026-08-27 as a scoping document; kept as the record of what the port
+involved, what it cost, and what is left.
 
 ## Why
 
@@ -120,15 +131,18 @@ by calling `WPEDisplayClass.create_view`. So we implement a `WPEDisplay` that ve
 `WPEView`, and the view overrides `render_buffer`. (`WPEDisplayHeadless` is
 `G_DECLARE_FINAL_TYPE`, so it cannot be subclassed to shortcut this.)
 
-## Spike results (C, 2026-08-27)
+## The embedding contract, learned the hard way
 
-A throwaway C spike — `scratchpad/spike.c`, not in the repo — got most of the way and
-then stuck. **Proven working:**
+Established by a C spike (now `spike/wpe-spike.c`) and unchanged by everything built
+on top of it. **The two traps below cost hours and neither produces an error message**,
+so they are the part of this document most worth keeping.
+
+Working from the start:
 
 - `pkg-config` → compile → link against `wpe-webkit-2.0` + `wpe-platform-2.0`.
 - Subclassing `WPEDisplay` *and* `WPEView`, overriding `connect`, `create_view` and
-  `render_buffer`. This was flagged as the main FFI risk; in C it is mechanical and
-  worked first try. It is ordinary GObject, not a hack.
+  `render_buffer`. Flagged as the main FFI risk; mechanical in both C and Rust, and
+  ordinary GObject rather than a hack.
 - `g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", display, NULL)` — the WPEPlatform
   construction path. WebKit calls our `create_view`, and
   `webkit_web_view_get_wpe_view()` returns the instance we handed it.
@@ -172,44 +186,39 @@ import stays a Phase 2 optimisation rather than a day-one prerequisite in a shar
 crate. (An earlier revision of this doc recorded the opposite as a live risk; the spike
 settled it.)
 
-### Still open
-
 A static page yields two frames and then quiets, which is correct — no animation, no
-new frames. Frame *cadence* under a live page, input plumbing (`wpe_view_event`), and
-multiple views on one display are all unproven. None of them are architectural.
+new frames.
 
 ## Impact map
 
-| file | fate |
+| file | what happened |
 | --- | --- |
-| `src/webview.rs` (708 lines) | **full rewrite.** It *is* the engine boundary. |
-| `src/main.rs` (1119) | **mostly survives.** Chrome, hit-testing, URL editor, key routing are engine-agnostic. The input translation (`dom_key`, `dom_button`, wheel) is retargeted; `display_list` keeps drawing one quad. |
-| `src/pages.rs` (342) | **survives**, minus the protocol plumbing — WebKit has a URI-scheme registration API (`webkit_web_context_register_uri_scheme`) that maps cleanly onto `CceProtocol`. |
-| `src/downloads.rs` (266) | **shrinks a lot.** WebKit has a real download API, so the extension sniff, `is_download_url`, the `request_navigation` divert, *and* the argv blind spot (`5a85c97`) all disappear as a category. Progress arrives as signals, killing the `<meta refresh>` leak too. |
-| `src/settings.rs` (147) | **survives** unchanged; keys are ours. |
+| `src/wpe/` (new, ~900 lines) | `WebKitHost` plus the three GObject subclasses, the input mapping, and the GLib↔calloop bridge. |
+| `src/webview.rs` | **kept.** `ServoHost` is still the default backend. It grew `key_ui` / `mouse_button_ui` / `editing_action_cmd` / `set_color_scheme_dark` taking cce-ui types, so both hosts present one surface. |
+| `src/main.rs` | **kept**, with `Host` a compile-time alias for one backend or the other. `dom_key` and `dom_button` moved out; the chrome now names neither engine. `register_sources` is the only place they visibly differ. |
+| `src/pages.rs` | **kept.** `CceProtocol::route` was extracted so both backends share one routing table — Servo through `ProtocolHandler`, WebKit through its URI-scheme callback. |
+| `src/downloads.rs` | **kept**, plus `adopt` / `set_progress` / `set_finished` for engine-driven transfers. Under WPE the extension sniff is never reached. |
+| `src/settings.rs` | **kept**, plus `is_dark()` replacing the `servo::Theme` conversion. |
 
-Things currently listed under "Not implemented yet" that WebKit simply provides:
-JS dialogs (`script-dialog`), HTTP auth (`authenticate`), permission requests
-(`permission-request`), find-in-page (`WebKitFindController`), and zoom
-(`webkit_web_view_set_zoom_level`). Force-dark stops needing an inverting user
-stylesheet and its two-reload settling dance.
+Nothing was deleted. Both backends compile from the same source, which is why the
+Servo path could stay green throughout.
 
-## The frame path — where the real design work is
+Still available and **not yet taken**: JS dialogs (`script-dialog`), HTTP auth
+(`authenticate`), permission requests (`permission-request`), find-in-page
+(`WebKitFindController`), zoom (`webkit_web_view_set_zoom_level`). Each is a signal
+away now that the host exists.
 
-Servo today: CPU render → `read_to_image` → `cce_ui::vk::upload_rgba` (a full-window
-RGBA `Vec<u8>` per frame, through a global queue). WPE can do better, but staging
-matters:
+## The frame path
 
-- **Phase 1 — SHM/CPU buffers.** Match the existing pipeline exactly: take WPE's
-  buffer, hand the bytes to `upload_rgba`. **No `cce-ui` change at all.** Lowest risk,
-  proves the port end to end.
-- **Phase 2 — dmabuf, zero copy.** WPE exports dmabuf; import it as a Vulkan image via
-  `VK_EXT_external_memory_dma_buf` and skip the CPU roundtrip entirely. This is
-  strictly better than anything the Servo path could do — but it needs a **new
-  `cce-ui` API** (the registry only accepts `Vec<u8>` today), and `cce-ui` is a
-  **shared crate**: check `git status` there and coordinate before touching it.
+**Phase 1 shipped: SHM buffers straight into `upload_rgba`, no `cce-ui` change.**
+Frames arrive as `WPEBufferSHM`, ARGB8888, stride `width * 4`, B,G,R,A in memory —
+precisely what the registry already accepts.
 
-Do not attempt Phase 2 first. Phase 1 is the thing that tells us the port works.
+Phase 2 — dmabuf imported as a Vulkan image via `VK_EXT_external_memory_dma_buf`,
+skipping the CPU roundtrip — remains available and unstarted. It needs a **new
+`cce-ui` API** (the registry only accepts `Vec<u8>`), and `cce-ui` is a **shared
+crate**: check `git status` there and coordinate before touching it. It is an
+optimisation, not a correctness fix; the port works without it.
 
 ## Bindings: hand-rolled, like wlroots
 
@@ -221,44 +230,79 @@ There are no usable Rust bindings.
 - The `webkit` crate is macOS `WKWebView`. Irrelevant.
 
 So: bindgen over the C headers, exactly the idiom `cce-compositor/build.rs` already
-uses against wlroots. This is the single largest chunk of work and the main risk.
+uses against wlroots. `build.rs` does this, gated on `CARGO_FEATURE_WPE`, so a default
+build needs no WPE headers.
 
-## Risks, ranked
+**This was predicted to be the main risk and was not.** Subclassing `WPEDisplay`,
+`WPEView` and `WPEToplevel` from Rust is mechanical: `g_type_query` reports the
+parent's instance and class sizes at runtime, `g_type_register_static_simple`
+registers against those, and the class structs are public so installing a vfunc is a
+field assignment. That is *more* robust than the C spike, which bakes the layout in at
+compile time. Friction amounted to two things: `GClassInitFunc` is already an
+`Option<fn>` and must not be wrapped again, and `gsize` is `u64`.
 
-1. **FFI surface is hand-built.** Biggest cost. Mitigate by binding only what
-   `ServoHost`'s public surface needs — look at its 30 methods, not at all of WebKit.
-2. **ABI churn.** WebKit majors move and Arch is rolling; expect periodic build
-   breaks. Pin the `pkg-config` name, accept the maintenance.
-3. **Multi-process and the sandbox.** WebKit spawns its own helper binaries, shipped
-   by the package, so `main()` is untouched — unlike CEF. But `wpewebkit` depends on
-   **`bubblewrap`**: the sandbox wants user namespaces, which is worth verifying early
-   inside the cce session rather than discovering late.
-4. **GLib main loop vs `calloop`.** WebKit needs a `GMainContext` turning. Either
-   integrate its fd into `calloop` or run it stepped from `pump`. Solvable, needs
-   design.
-5. **Cloudflare is likely-but-unproven.** WebKit *should* pass; not yet demonstrated
-   against a live challenge (see below).
+## Risks, as they actually landed
+
+The ranking was wrong in an instructive way: the mechanical risks were cheap and the
+undocumented-protocol ones were expensive.
+
+1. ~~**FFI surface is hand-built.**~~ Retired. Mechanical, see above.
+2. **ABI churn.** Unchanged and unavoidable. WebKit majors move, Arch is rolling;
+   expect periodic build breaks against `wpe-webkit-2.0` / `wpe-platform-2.0`.
+3. ~~**Multi-process and the sandbox.**~~ Retired. `WPENetworkProcess` and
+   `WPEWebProcess` come up under `bwrap` with no special setup.
+4. ~~**GLib main loop vs `calloop`.**~~ Done. `register_sources` registers the epoll fd
+   carrying GLib's pollfd set, plus a timer from `poll_timeout`. Measured at **63
+   wakeups per 8s against 495** for the fixed-interval version it replaced.
+5. **Cloudflare remains unproven**, and is no longer on the critical path — see below.
+
+**The real cost was none of these.** It was the object graph: that `WebKitWebView`
+takes a `WPEDisplay` and makes its own view, that a `WPEToplevel` is required at all,
+and that the buffer handshake has two halves. Every one of those fails *silently* —
+no error, healthy web process, simply no frames. Better bindings would not have helped
+with any of them.
 
 ## Still unproven
 
-WebKit rendered `cloudflare.com` correctly and instantly in a shadow session — but
-Servo did too, in the same session minutes later. **Neither was served a challenge**,
-so that comparison establishes nothing about surviving one. The decisive test is to
-catch a live `"Just a moment..."` and run both against that exact URL at that moment.
-The harness is ready: `scratchpad/wktest.py` drives WebKitGTK via PyGObject (no
-install needed — `WebKit-6.0.typelib` is already present).
+**Cloudflare.** WebKit rendered `cloudflare.com` correctly in a shadow session — but so
+did Servo, minutes later, because **neither was served a challenge**. That comparison
+establishes nothing. The decisive test is to catch a live `"Just a moment..."` and
+point both at that exact URL at that moment. Cheaper now than when this was written:
+the WPE build is a real browser, so it can be aimed at the challenge directly rather
+than through a Python harness.
 
 The port's case does **not** rest on this. Coverage alone justifies it.
 
-## Suggested order
+**Real-world use.** Everything verified so far is `example.com`, local servers and
+shadow sessions. Nobody has browsed actual sites on this. That is the largest gap
+between "the port runs" and "the port replaces Servo".
 
-1. ~~Confirm the WPE API generation~~ — done, WPEPlatform (above). Install
-   `wpewebkit`; get `build.rs` + bindgen over `wpe-webkit-2.0` and `wpe-platform-2.0`
-   producing symbols.
-2. A throwaway binary: `WPEDisplayHeadless` + one `WPEView`, load a URL, pull one
-   `WPEBufferSHM` out and write it to a PNG. No cce-ui, no Wayland, no chrome.
-3. `ServoHost` → `WebKitHost` behind the same method surface, Phase-1 SHM buffers,
-   single tab, no chrome changes.
-4. Tabs, then `cce:` schemes, then downloads-via-real-API.
-5. Phase 2 dmabuf, only once the rest is solid, and only after coordinating on
+## What remains
+
+Roughly in order of what would decide whether WPE becomes the default:
+
+1. **Soak it on real sites.** The gap named above. Everything else is speculation
+   until someone browses on it.
+2. **Settle Cloudflare**, next time a live challenge appears.
+3. **Clean up the Servo-shaped seams in `main.rs`.** `focus()` is a no-op on the Servo
+   side, and `set_force_dark` is only called under the feature. Both are honest
+   scaffolding for running two backends at once, and both should go when one wins.
+4. **Take the free WebKit features** — JS dialogs, HTTP auth, permissions,
+   find-in-page, zoom. Each is a signal.
+5. **Phase 2 dmabuf**, only once the rest is solid, and only after coordinating on
    `cce-ui`.
+
+## Verifying it yourself
+
+The examples are the test suite; all need `--features wpe`.
+
+| example | what it demonstrates |
+| --- | --- |
+| `wpe_host` | boot, frames, page state, navigation, history |
+| `wpe_input` | pointer / keyboard / wheel reaching the page, read back via `document.title` |
+| `wpe_tabs` | several views on one display, and a **backgrounded** tab still updating |
+| `wpe_loop` | blocking on GLib's fds vs polling, with the wakeup counts |
+| `wpe_dark` | force-dark, asserted on rendered pixels rather than on the call |
+
+`spike/wpe-spike.c` is the original C spike, kept because it is the shortest complete
+statement of the embedding contract.
