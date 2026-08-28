@@ -2,6 +2,14 @@
 name = "cce-browser"
 version = "0.1.0"
 edition = "2021"
+# Only runs bindgen when the `wpe` feature is on, so a default build needs
+# no WPE headers and stays exactly as it was.
+build = "build.rs"
+
+[features]
+# The in-progress WPE WebKit port (see WPE-PORT.md). Off by default: the
+# shipping browser is still Servo. Needs `pacman -S wpewebkit`.
+wpe = []
 
 [dependencies]
 cce-ui = { path = "../cce-ui" }
@@ -16,3 +24,7 @@ euclid = "0.22"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 log = "0.4"
 env_logger = "0.11"
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"
