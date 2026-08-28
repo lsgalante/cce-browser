@@ -19,7 +19,10 @@ use std::rc::Rc;
 
 use url::Url;
 
+use cce_ui::widget::{KeyEvent, MouseButton};
+
 use super::ffi::*;
+use super::input;
 use super::subclass::{types, FRAME_SINK};
 
 /// One tab: its webview plus the app-visible page state and the last frame
@@ -237,6 +240,137 @@ impl WebKitHost {
     }
     pub fn can_go_forward(&self) -> bool {
         unsafe { webkit_web_view_can_go_forward(self.active_tab().webview) != 0 }
+    }
+
+    // ---- input ----
+    //
+    // Coordinates are device pixels relative to the view origin, matching
+    // `ServoHost`'s convention so `main.rs` scales them the same way. Events
+    // are refcounted; `wpe_view_event` takes its own reference, so each one is
+    // unreffed here after delivery.
+
+    pub fn mouse_move(&self, x_px: f32, y_px: f32) {
+        unsafe {
+            let view = self.active_tab().view;
+            let e = wpe_event_pointer_move_new(
+                WPEEventType::WPE_EVENT_POINTER_MOVE,
+                view,
+                WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
+                input::now_ms(),
+                0,
+                x_px as f64,
+                y_px as f64,
+                0.0,
+                0.0,
+            );
+            self.send(view, e);
+        }
+    }
+
+    pub fn mouse_button(&self, button: MouseButton, pressed: bool, x_px: f32, y_px: f32) {
+        let Some(n) = input::button_number(button) else {
+            return;
+        };
+        unsafe {
+            let view = self.active_tab().view;
+            let time = input::now_ms();
+            // WPE tracks double/triple clicks for us; a frozen clock here
+            // would make every click read as a repeat.
+            let press_count = if pressed {
+                wpe_view_compute_press_count(view, x_px as f64, y_px as f64, n, time)
+            } else {
+                0
+            };
+            let e = wpe_event_pointer_button_new(
+                if pressed {
+                    WPEEventType::WPE_EVENT_POINTER_DOWN
+                } else {
+                    WPEEventType::WPE_EVENT_POINTER_UP
+                },
+                view,
+                WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
+                time,
+                0,
+                n,
+                x_px as f64,
+                y_px as f64,
+                press_count,
+            );
+            self.send(view, e);
+        }
+    }
+
+    /// Wheel deltas in device pixels, in cce-ui's winit convention (positive
+    /// = scroll up), passed through **unchanged**.
+    ///
+    /// Measured, not assumed: WPE already inverts on the way to the DOM, so a
+    /// negation here double-inverts and the page scrolls backwards. An
+    /// earlier cut negated these and `examples/wpe_input` caught it — the
+    /// page reported `deltaY` of the wrong sign.
+    pub fn wheel(&self, dx_px: f64, dy_px: f64, x_px: f32, y_px: f32) {
+        unsafe {
+            let view = self.active_tab().view;
+            let e = wpe_event_scroll_new(
+                view,
+                WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
+                input::now_ms(),
+                0,
+                dx_px,
+                dy_px,
+                1, // precise deltas: these are pixels, not notches
+                0, // not a scroll-stop event
+                x_px as f64,
+                y_px as f64,
+            );
+            self.send(view, e);
+        }
+    }
+
+    /// Takes cce-ui's `KeyEvent` directly — the keysym mapping lives in
+    /// `input`, so the chrome never learns engine vocabulary.
+    pub fn key(&self, event: &KeyEvent) {
+        let Some(keyval) = input::keyval(&event.logical_key) else {
+            return;
+        };
+        let pressed = input::is_pressed(event);
+        unsafe {
+            let view = self.active_tab().view;
+            let e = wpe_event_keyboard_new(
+                if pressed {
+                    WPEEventType::WPE_EVENT_KEYBOARD_KEY_DOWN
+                } else {
+                    WPEEventType::WPE_EVENT_KEYBOARD_KEY_UP
+                },
+                view,
+                WPEInputSource::WPE_INPUT_SOURCE_KEYBOARD,
+                input::now_ms(),
+                input::modifiers(event.ctrl, event.shift, event.alt),
+                0, // hardware keycode: unknown to us, and WebKit works off keyval
+                keyval,
+            );
+            self.send(view, e);
+        }
+    }
+
+    /// Page focus. Without this the page has no focused frame and keyboard
+    /// input is dropped, which looks exactly like a broken key mapping.
+    pub fn focus(&self, focused: bool) {
+        unsafe {
+            let view = self.active_tab().view;
+            if focused {
+                wpe_view_focus_in(view)
+            } else {
+                wpe_view_focus_out(view)
+            }
+        }
+    }
+
+    unsafe fn send(&self, view: *mut WPEView, event: *mut WPEEvent) {
+        if event.is_null() {
+            return;
+        }
+        wpe_view_event(view, event);
+        wpe_event_unref(event);
     }
 
     pub fn resize(&mut self, width_px: u32, height_px: u32, scale: f32) {

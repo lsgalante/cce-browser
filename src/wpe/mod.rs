@@ -10,6 +10,7 @@ pub mod ffi {
 }
 
 mod subclass;
+mod input;
 mod host;
 
 // Not consumed yet — main.rs still drives ServoHost.
