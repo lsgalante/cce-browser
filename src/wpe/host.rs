@@ -125,6 +125,18 @@ pub struct WebKitHost {
     pending: Rc<std::cell::RefCell<Pending>>,
     /// GLib's pollfd set, mirrored into one epoll fd for calloop.
     poll: Option<GlibPoll>,
+    /// Shared with the `cce:` pages, exactly as `ServoHost` holds them —
+    /// bookmarks and history are app state, not engine state, so they cross
+    /// the backend swap unchanged.
+    history: std::sync::Arc<crate::pages::History>,
+    bookmarks: std::sync::Arc<crate::pages::Bookmarks>,
+    history_enabled: bool,
+    force_dark: bool,
+    /// Retained only so tests can assert on rendered output; the registry
+    /// owns the copy that actually gets drawn.
+    last_frame: Option<(Vec<u8>, u32, u32)>,
+    /// Installed on every webview when force-dark is on.
+    ucm: *mut WebKitUserContentManager,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -170,6 +182,12 @@ impl WebKitHost {
                 poll: GlibPoll::new()
                     .map_err(|e| log::warn!("no GLib epoll bridge ({e}); pump will poll"))
                     .ok(),
+                history: std::sync::Arc::new(crate::pages::History::load()),
+                bookmarks: std::sync::Arc::new(crate::pages::Bookmarks::load()),
+                history_enabled: true,
+                force_dark: false,
+                last_frame: None,
+                ucm: webkit_user_content_manager_new(),
             };
             host.open_tab(url);
             host
@@ -178,11 +196,13 @@ impl WebKitHost {
 
     fn build_webview(&self, url: &Url, state: &Rc<TabState>) -> (*mut WebKitWebView, *mut WPEView) {
         unsafe {
-            let prop = cstr("display");
+            let (p_display, p_ucm) = (cstr("display"), cstr("user-content-manager"));
             let wv = g_object_new(
                 webkit_web_view_get_type(),
-                prop.as_ptr(),
+                p_display.as_ptr(),
                 self.display,
+                p_ucm.as_ptr(),
+                self.ucm,
                 std::ptr::null::<c_char>(),
             ) as *mut WebKitWebView;
             let view = webkit_web_view_get_wpe_view(wv);
@@ -314,6 +334,7 @@ impl WebKitHost {
         let Some((px, w, h)) = frame else {
             return (false, dirty);
         };
+        self.last_frame = Some((px.clone(), w, h));
         let id = cce_ui::vk::upload_rgba(px, w, h);
         let tab = &mut self.tabs[self.active];
         if let Some((old, ..)) = tab.image.replace((id, w, h)) {
@@ -341,6 +362,13 @@ impl WebKitHost {
             changed = true;
         }
         changed
+    }
+
+    /// Top-left pixel of the last frame, for tests that need to assert on
+    /// what was actually rendered rather than on what was configured.
+    pub fn sample_pixel(&self) -> Option<(u8, u8, u8)> {
+        let (px, ..) = self.last_frame.as_ref()?;
+        Some((px[0], px[1], px[2]))
     }
 
     pub fn image(&self) -> Option<(u32, u32, u32)> {
@@ -376,6 +404,94 @@ impl WebKitHost {
     }
     pub fn can_go_forward(&self) -> bool {
         unsafe { webkit_web_view_can_go_forward(self.active_tab().webview) != 0 }
+    }
+
+    // ---- settings and app-side state ----
+    //
+    // These exist so `WebKitHost` and `ServoHost` present the same surface;
+    // bookmarks and history are app state either way, so they are identical.
+
+    pub fn set_history_enabled(&mut self, on: bool) {
+        self.history_enabled = on;
+    }
+
+    /// Install or remove the inverting user stylesheet.
+    ///
+    /// Simpler than the Servo path, which needed *two* timed reloads to let
+    /// a user-content change and a scheme flip settle. WebKit applies user
+    /// content to live pages, so a reload is enough — and only to re-run
+    /// pages that already computed their colours.
+    pub fn set_force_dark(&mut self, on: bool) {
+        if on == self.force_dark {
+            return;
+        }
+        self.force_dark = on;
+        unsafe {
+            if on {
+                let css = cstr(FORCE_DARK_CSS);
+                let sheet = webkit_user_style_sheet_new(
+                    css.as_ptr(),
+                    WebKitUserContentInjectedFrames::WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                    WebKitUserStyleLevel::WEBKIT_USER_STYLE_LEVEL_USER,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                webkit_user_content_manager_add_style_sheet(self.ucm, sheet);
+                webkit_user_style_sheet_unref(sheet);
+            } else {
+                webkit_user_content_manager_remove_all_style_sheets(self.ucm);
+            }
+            for tab in &self.tabs {
+                webkit_web_view_reload(tab.webview);
+            }
+        }
+    }
+
+    /// What pages see for `prefers-color-scheme`, via WPE's own setting.
+    pub fn set_color_scheme(&self, dark: bool) {
+        unsafe {
+            let settings = wpe_display_get_settings(self.display);
+            let key = cstr("/wpe-platform/dark-mode");
+            let mut err: *mut GError = std::ptr::null_mut();
+            wpe_settings_set_boolean(
+                settings,
+                key.as_ptr(),
+                dark as gboolean,
+                WPESettingsSource::WPE_SETTINGS_SOURCE_APPLICATION,
+                &mut err,
+            );
+        }
+    }
+
+    /// A navigation became a download since the last check. Always false
+    /// until downloads are ported to WebKit's own API.
+    pub fn take_download_started(&self) -> bool {
+        false
+    }
+
+    pub fn active_bookmarked(&self) -> bool {
+        self.active_tab()
+            .url
+            .as_ref()
+            .is_some_and(|u| self.bookmarks.contains(u.as_str()))
+    }
+
+    pub fn toggle_bookmark(&self) {
+        let tab = self.active_tab();
+        if let Some(url) = &tab.url {
+            self.bookmarks
+                .toggle(url.as_str(), tab.title.as_deref().unwrap_or(""));
+        }
+    }
+
+    /// Clipboard on the page. WebKit takes these as named editing commands,
+    /// so unlike the Servo backend there is no separate clipboard delegate to
+    /// implement — it goes through the platform clipboard itself.
+    pub fn editing_action(&self, command: EditingCommand) {
+        unsafe {
+            let c = cstr(command.as_str());
+            webkit_web_view_execute_editing_command(self.active_tab().webview, c.as_ptr());
+        }
     }
 
     // ---- input ----
@@ -558,3 +674,32 @@ unsafe fn from_cstr(p: *const c_char) -> Option<String> {
         .then(|| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
 }
+
+/// Backend-neutral clipboard action, so `main.rs` names neither engine's.
+#[derive(Debug, Clone, Copy)]
+pub enum EditingCommand {
+    Copy,
+    Cut,
+    Paste,
+}
+
+impl EditingCommand {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "Copy",
+            Self::Cut => "Cut",
+            Self::Paste => "Paste",
+        }
+    }
+}
+
+/// Same inverting stylesheet the Servo backend uses, and for the same reason:
+/// it is the only thing that darkens a page shipping a hardcoded white with no
+/// `prefers-color-scheme` rule to honour.
+const FORCE_DARK_CSS: &str = "\
+html { background-color: #ffffff !important; filter: invert(1) hue-rotate(180deg) !important; }
+img, video, picture, canvas, svg, iframe, embed, object,
+[style*=\"background-image\"], [style*=\"background:url\"] {
+  filter: invert(1) hue-rotate(180deg) !important;
+}
+";

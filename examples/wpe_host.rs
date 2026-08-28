@@ -9,6 +9,12 @@ fn main() {
 }
 
 #[cfg(feature = "wpe")]
+#[path = "../src/pages.rs"]
+mod pages;
+#[cfg(feature = "wpe")]
+#[path = "../src/downloads.rs"]
+mod downloads;
+#[cfg(feature = "wpe")]
 #[path = "../src/wpe/mod.rs"]
 mod wpe;
 
