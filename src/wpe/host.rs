@@ -139,6 +139,8 @@ pub struct WebKitHost {
     clear_cookies: std::sync::Arc<std::sync::atomic::AtomicBool>,
     session: *mut WebKitNetworkSession,
     download_started: Rc<Cell<bool>>,
+    /// A page asked something and is blocked until we answer.
+    prompts: Rc<RefCell<Prompts>>,
     /// Retained only so tests can assert on rendered output; the registry
     /// owns the copy that actually gets drawn.
     last_frame: Option<(Vec<u8>, u32, u32)>,
@@ -230,6 +232,7 @@ impl WebKitHost {
                 0,
             );
 
+            let prompts = Rc::new(RefCell::new(Prompts::default()));
             let pending = Rc::new(std::cell::RefCell::new(Pending::default()));
             let sink = pending.clone();
             FRAME_SINK = Some(Box::new(move |buffer: *mut WPEBuffer| {
@@ -262,6 +265,7 @@ impl WebKitHost {
                 clear_cookies,
                 session,
                 download_started,
+                prompts,
                 last_frame: None,
                 ucm: webkit_user_content_manager_new(),
             };
@@ -294,6 +298,21 @@ impl WebKitHost {
             for sig in ["notify::title", "notify::uri", "notify::is-loading"] {
                 connect_notify(wv, sig, state);
             }
+            // A page's alert/confirm/prompt, and HTTP auth challenges. Both
+            // are held open and answered later, so the chrome can draw a real
+            // dialog rather than the handler having to decide inline.
+            connect_raw(
+                wv,
+                "script-dialog",
+                on_script_dialog as *const () as usize,
+                &self.prompts,
+            );
+            connect_raw(
+                wv,
+                "authenticate",
+                on_authenticate as *const () as usize,
+                &self.prompts,
+            );
             wpe_view_resized(view, self.size_px.0 as i32, self.size_px.1 as i32);
             wpe_view_set_visible(view, 1);
             wpe_view_map(view);
@@ -586,6 +605,69 @@ impl WebKitHost {
                 crate::EditingCommand::Paste => "Paste",
             });
             webkit_web_view_execute_editing_command(self.active_tab().webview, c.as_ptr());
+        }
+    }
+
+    // ---- pending prompts ----
+
+    /// The dialog a page is currently blocked on, if any. Cloned rather than
+    /// taken: the chrome redraws from this every frame, and the page stays
+    /// blocked until [`Self::respond_dialog`].
+    pub fn pending_dialog(&self) -> Option<PendingDialog> {
+        self.prompts.borrow().dialog.as_ref().map(|(_, d)| d.clone())
+    }
+
+    pub fn pending_auth(&self) -> Option<PendingAuth> {
+        self.prompts.borrow().auth.as_ref().map(|(_, a)| a.clone())
+    }
+
+    /// Answer the page. `text` carries a `prompt`'s reply; it is ignored for
+    /// alert and confirm.
+    pub fn respond_dialog(&self, ok: bool, text: Option<&str>) {
+        let Some((dialog, pending)) = self.prompts.borrow_mut().dialog.take() else {
+            return;
+        };
+        unsafe {
+            if pending.prompt_default.is_some() {
+                // A cancelled prompt must return null, not "" — a page
+                // distinguishes the two.
+                if ok {
+                    let t = cstr(text.unwrap_or(""));
+                    webkit_script_dialog_prompt_set_text(dialog, t.as_ptr());
+                } else {
+                    webkit_script_dialog_prompt_set_text(dialog, std::ptr::null());
+                }
+            } else if pending.has_cancel {
+                webkit_script_dialog_confirm_set_confirmed(dialog, ok as gboolean);
+            }
+            webkit_script_dialog_close(dialog);
+            webkit_script_dialog_unref(dialog);
+        }
+    }
+
+    /// Answer an auth challenge, or cancel it. Credentials are used for this
+    /// session only — `WEBKIT_CREDENTIAL_PERSISTENCE_FOR_SESSION` — rather
+    /// than written to the profile, which would need a deliberate decision
+    /// about storing passwords on disk.
+    pub fn respond_auth(&self, credentials: Option<(&str, &str)>) {
+        let Some((request, _)) = self.prompts.borrow_mut().auth.take() else {
+            return;
+        };
+        unsafe {
+            match credentials {
+                Some((user, password)) => {
+                    let (u, p) = (cstr(user), cstr(password));
+                    let cred = webkit_credential_new(
+                        u.as_ptr(),
+                        p.as_ptr(),
+                        WebKitCredentialPersistence::WEBKIT_CREDENTIAL_PERSISTENCE_FOR_SESSION,
+                    );
+                    webkit_authentication_request_authenticate(request, cred);
+                    webkit_credential_free(cred);
+                }
+                None => webkit_authentication_request_cancel(request),
+            }
+            g_object_unref(request as *mut _);
         }
     }
 
@@ -923,4 +1005,94 @@ unsafe extern "C" fn on_failed(_d: *mut WebKitDownload, error: *mut GError, data
     if one.id.get() != u64::MAX {
         one.ctx.downloads.set_finished(one.id.get(), Err(msg));
     }
+}
+
+/// What a page is currently blocked on. At most one of each: WebKit will not
+/// raise a second dialog on the same view until the first is answered.
+#[derive(Default)]
+pub(super) struct Prompts {
+    dialog: Option<(*mut WebKitScriptDialog, PendingDialog)>,
+    auth: Option<(*mut WebKitAuthenticationRequest, PendingAuth)>,
+}
+
+/// A page's `alert` / `confirm` / `prompt`, waiting on the chrome.
+#[derive(Debug, Clone)]
+pub struct PendingDialog {
+    pub message: String,
+    /// `Some` for `prompt`, carrying its default text; `None` otherwise.
+    pub prompt_default: Option<String>,
+    /// `confirm` and `beforeunload` offer a choice; `alert` only acknowledges.
+    pub has_cancel: bool,
+}
+
+/// An HTTP auth challenge, waiting on the chrome.
+#[derive(Debug, Clone)]
+pub struct PendingAuth {
+    pub host: String,
+    pub realm: String,
+    /// Set when the previous credentials were rejected — worth telling the
+    /// user, since the field otherwise looks identical to the first attempt.
+    pub retry: bool,
+}
+
+unsafe fn connect_raw(
+    wv: *mut WebKitWebView,
+    signal: &str,
+    cb: usize,
+    prompts: &Rc<RefCell<Prompts>>,
+) {
+    let name = cstr(signal);
+    g_signal_connect_data(
+        wv as *mut _,
+        name.as_ptr(),
+        Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(cb)),
+        Rc::into_raw(prompts.clone()) as gpointer,
+        Some(drop_prompts_ref),
+        0,
+    );
+}
+
+unsafe extern "C" fn drop_prompts_ref(data: gpointer, _c: *mut GClosure) {
+    drop(Rc::from_raw(data as *const RefCell<Prompts>));
+}
+
+/// Returning TRUE means *we* will answer. The dialog is reffed and held; the
+/// page stays blocked until `respond_dialog` closes it.
+unsafe extern "C" fn on_script_dialog(
+    _wv: *mut WebKitWebView,
+    dialog: *mut WebKitScriptDialog,
+    data: gpointer,
+) -> gboolean {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    let kind = webkit_script_dialog_get_dialog_type(dialog);
+    let message = from_cstr(webkit_script_dialog_get_message(dialog)).unwrap_or_default();
+    let is_prompt = kind == WebKitScriptDialogType::WEBKIT_SCRIPT_DIALOG_PROMPT;
+    let pending = PendingDialog {
+        message,
+        prompt_default: is_prompt
+            .then(|| from_cstr(webkit_script_dialog_prompt_get_default_text(dialog)))
+            .flatten()
+            .or_else(|| is_prompt.then(String::new)),
+        has_cancel: kind != WebKitScriptDialogType::WEBKIT_SCRIPT_DIALOG_ALERT,
+    };
+    webkit_script_dialog_ref(dialog);
+    prompts.borrow_mut().dialog = Some((dialog, pending));
+    1
+}
+
+/// Same contract: TRUE means we answer, and the request is reffed until we do.
+unsafe extern "C" fn on_authenticate(
+    _wv: *mut WebKitWebView,
+    request: *mut WebKitAuthenticationRequest,
+    data: gpointer,
+) -> gboolean {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    let pending = PendingAuth {
+        host: from_cstr(webkit_authentication_request_get_host(request)).unwrap_or_default(),
+        realm: from_cstr(webkit_authentication_request_get_realm(request)).unwrap_or_default(),
+        retry: webkit_authentication_request_is_retry(request) != 0,
+    };
+    g_object_ref(request as *mut _);
+    prompts.borrow_mut().auth = Some((request, pending));
+    1
 }

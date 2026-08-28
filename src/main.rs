@@ -7,6 +7,8 @@
 //! input events; the URL bar is a small hand-rolled line editor.
 
 mod downloads;
+#[cfg(feature = "wpe")]
+mod lineedit;
 mod pages;
 mod settings;
 mod webview;
@@ -79,6 +81,88 @@ const ACCENT: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
 const TEXT: [u8; 3] = [220, 220, 225];
 const TEXT_DIM: [u8; 3] = [120, 122, 128];
 
+/// A page-blocking prompt drawn over the content.
+///
+/// Modal on purpose: the page is genuinely blocked inside WebKit until it is
+/// answered, so letting the chrome carry on as if nothing were pending would
+/// misrepresent what the engine is doing.
+#[cfg(feature = "wpe")]
+struct Modal {
+    title: String,
+    message: String,
+    /// Editable fields, in tab order. Empty for a bare alert or confirm.
+    fields: Vec<(&'static str, lineedit::LineEdit)>,
+    focused: usize,
+    has_cancel: bool,
+    kind: ModalKind,
+}
+
+#[cfg(feature = "wpe")]
+enum ModalKind {
+    /// `alert` / `confirm` / `prompt`.
+    Script,
+    /// An HTTP auth challenge.
+    Auth,
+}
+
+#[cfg(feature = "wpe")]
+const MODAL_W: f32 = 420.0;
+#[cfg(feature = "wpe")]
+const MODAL_PAD: f32 = 18.0;
+#[cfg(feature = "wpe")]
+const MODAL_FIELD_H: f32 = 26.0;
+#[cfg(feature = "wpe")]
+const MODAL_BTN_W: f32 = 84.0;
+
+#[cfg(feature = "wpe")]
+impl Modal {
+    fn height(&self) -> f32 {
+        MODAL_PAD * 2.0
+            + 20.0
+            + 22.0
+            + self.fields.len() as f32 * (MODAL_FIELD_H + 8.0)
+            + 12.0
+            + BTN_H
+    }
+
+    /// Centred, and clamped so it stays on screen on a small window.
+    fn rect(&self, win: (f32, f32)) -> Rect {
+        let w = MODAL_W.min(win.0 - 40.0).max(240.0);
+        let h = self.height();
+        Rect {
+            x: ((win.0 - w) / 2.0).max(0.0),
+            y: ((win.1 - h) / 2.0).max(0.0),
+            width: w,
+            height: h,
+        }
+    }
+
+    fn field_rect(&self, r: &Rect, i: usize) -> Rect {
+        Rect {
+            x: r.x + MODAL_PAD,
+            y: r.y + MODAL_PAD + 42.0 + i as f32 * (MODAL_FIELD_H + 8.0),
+            width: r.width - MODAL_PAD * 2.0,
+            height: MODAL_FIELD_H,
+        }
+    }
+
+    /// (ok, cancel) — cancel is `None` for a bare alert.
+    fn button_rects(&self, r: &Rect) -> (Rect, Option<Rect>) {
+        let y = r.y + r.height - MODAL_PAD - BTN_H;
+        let ok = Rect {
+            x: r.x + r.width - MODAL_PAD - MODAL_BTN_W,
+            y,
+            width: MODAL_BTN_W,
+            height: BTN_H,
+        };
+        let cancel = self.has_cancel.then(|| Rect {
+            x: ok.x - MODAL_BTN_W - BTN_GAP,
+            ..ok
+        });
+        (ok, cancel)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Servo requested an event-loop spin (waker or delegate signal).
@@ -106,6 +190,11 @@ struct BrowserApp {
     /// Page title; drives the toplevel title (the engine re-applies
     /// `settings().title` whenever it changes).
     title: Option<String>,
+    /// The page-blocking dialog or auth challenge currently on screen, if
+    /// any. Only the WPE backend raises these — Servo has no delegate hooks
+    /// for them, which is why they were listed as "not implemented".
+    #[cfg(feature = "wpe")]
+    modal: Option<Modal>,
     /// Kept so the WPE backend's calloop sources can fire `Spin`; Servo
     /// wakes the loop itself through its `EventLoopWaker`.
     #[cfg(feature = "wpe")]
@@ -350,6 +439,77 @@ impl BrowserApp {
         }
     }
 
+    /// Adopt whatever the engine is blocked on. Returns whether the chrome
+    /// needs redrawing.
+    #[cfg(feature = "wpe")]
+    fn sync_modal(&mut self) -> bool {
+        if self.modal.is_some() {
+            return false;
+        }
+        if let Some(d) = self.host.pending_dialog() {
+            let mut fields = Vec::new();
+            if let Some(default) = d.prompt_default.clone() {
+                let mut e = lineedit::LineEdit::with_text(default);
+                e.select_all();
+                fields.push(("", e));
+            }
+            self.modal = Some(Modal {
+                title: "This page says".to_string(),
+                message: d.message,
+                fields,
+                focused: 0,
+                has_cancel: d.has_cancel,
+                kind: ModalKind::Script,
+            });
+            return true;
+        }
+        if let Some(a) = self.host.pending_auth() {
+            let where_ = if a.realm.is_empty() {
+                a.host.clone()
+            } else {
+                format!("{} — {}", a.host, a.realm)
+            };
+            self.modal = Some(Modal {
+                title: if a.retry {
+                    "Sign in failed — try again".to_string()
+                } else {
+                    "Sign in".to_string()
+                },
+                message: where_,
+                fields: vec![
+                    ("Username", lineedit::LineEdit::default()),
+                    ("Password", lineedit::LineEdit::masked()),
+                ],
+                focused: 0,
+                has_cancel: true,
+                kind: ModalKind::Auth,
+            });
+            return true;
+        }
+        false
+    }
+
+    /// Answer the engine and dismiss. `ok` false is cancel.
+    #[cfg(feature = "wpe")]
+    fn close_modal(&mut self, ok: bool) {
+        let Some(m) = self.modal.take() else { return };
+        match m.kind {
+            ModalKind::Script => {
+                let text = m.fields.first().map(|(_, e)| e.text.clone());
+                self.host.respond_dialog(ok, text.as_deref());
+            }
+            ModalKind::Auth => {
+                if ok {
+                    let user = m.fields[0].1.text.clone();
+                    let password = m.fields[1].1.text.clone();
+                    self.host.respond_auth(Some((&user, &password)));
+                } else {
+                    self.host.respond_auth(None);
+                }
+            }
+        }
+    }
+
     fn navigate(&mut self) {
         if let Some(url) = parse_url_input(&self.url_input, &self.settings.search_prefix) {
             self.host.load(url);
@@ -482,6 +642,79 @@ impl BrowserApp {
             }
         }
         String::new()
+    }
+
+    /// Draw the page-blocking prompt, if one is up. Same primitives as the
+    /// utility bar — there are no cce-ui widgets in this app — with a scrim
+    /// over the page so it reads as blocked, which it genuinely is.
+    #[cfg(feature = "wpe")]
+    fn paint_modal(&mut self, pc: &mut PaintCtx, sans: &str) {
+        let Some(m) = self.modal.as_ref() else { return };
+        let r = m.rect(self.win);
+
+        pc.quad(
+            Rect { x: 0.0, y: 0.0, width: self.win.0, height: self.win.1 },
+            [0.0, 0.0, 0.0, 0.45],
+        );
+        let radii = (BAR_RADIUS, BAR_RADIUS, BAR_RADIUS, BAR_RADIUS);
+        pc.plate(r, radii, [0.13, 0.14, 0.16, 1.0], cce_ui::layout::bevel_width().min(4.0));
+
+        pc.text(
+            m.title.clone(),
+            r.x + MODAL_PAD,
+            r.y + MODAL_PAD,
+            14.0,
+            TEXT,
+        );
+        pc.text(
+            Self::fit_text(&m.message, sans, 13.0, r.width - MODAL_PAD * 2.0),
+            r.x + MODAL_PAD,
+            r.y + MODAL_PAD + 22.0,
+            13.0,
+            TEXT_DIM,
+        );
+
+        for (i, (label, edit)) in m.fields.iter().enumerate() {
+            let f = m.field_rect(&r, i);
+            let focused = i == m.focused;
+            pc.rounded_rect(
+                Rect { x: f.x - 1.0, y: f.y - 1.0, width: f.width + 2.0, height: f.height + 2.0 },
+                7.0,
+                (true, true, true, true),
+                if focused { RIM_FOCUS } else { RIM },
+            );
+            pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
+            let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
+            // `display()` masks a password field; the text itself never
+            // reaches the paint list.
+            let shown = edit.display();
+            if shown.is_empty() && !label.is_empty() {
+                pc.text(*label, f.x + URL_PAD_X, ty, URL_FONT, TEXT_DIM);
+            } else {
+                pc.text(shown, f.x + URL_PAD_X, ty, URL_FONT, TEXT);
+            }
+        }
+
+        let (ok, cancel) = m.button_rects(&r);
+        for (rect, label, accent) in [(Some(ok), "OK", true), (cancel, "Cancel", false)]
+            .into_iter()
+            .filter_map(|(rc, l, a)| rc.map(|rc| (rc, l, a)))
+        {
+            pc.rounded_rect(
+                rect,
+                6.0,
+                (true, true, true, true),
+                if accent { ACCENT } else { BTN_BG },
+            );
+            let w = measure_text_width(label, sans, 13.0);
+            pc.text(
+                label,
+                rect.x + (rect.width - w) / 2.0,
+                cce_ui::layout::align_text_y(rect.y, rect.height, 13.0, 0.0),
+                13.0,
+                TEXT,
+            );
+        }
     }
 
     fn cursor_from_click(&mut self, click_x: f32, field: &Rect) -> usize {
@@ -673,6 +906,8 @@ impl Application for BrowserApp {
             loading: true,
             title: None,
             #[cfg(feature = "wpe")]
+            modal: None,
+            #[cfg(feature = "wpe")]
             sender,
             font_system: cce_ui::create_font_system(),
         }
@@ -739,6 +974,10 @@ impl Application for BrowserApp {
         match msg {
             Message::Spin => {
                 let (new_frame, dirty) = self.host.pump();
+                #[cfg(feature = "wpe")]
+                if self.sync_modal() {
+                    *needs_rebuild = true;
+                }
                 if self.host.take_download_started() {
                     self.open_internal_page("cce://downloads");
                 }
@@ -786,6 +1025,34 @@ impl Application for BrowserApp {
         needs_rebuild: &mut bool,
     ) -> Option<Self::Message> {
         let pressed = state == ElementState::Pressed;
+
+        #[cfg(feature = "wpe")]
+        if self.modal.is_some() {
+            if !pressed || button != MouseButton::Left {
+                return None;
+            }
+            *needs_rebuild = true;
+            let (hit_ok, hit_cancel, field) = {
+                let m = self.modal.as_ref().unwrap();
+                let r = m.rect(self.win);
+                let (ok, cancel) = m.button_rects(&r);
+                (
+                    hit(&ok, pos.x, pos.y),
+                    cancel.is_some_and(|c| hit(&c, pos.x, pos.y)),
+                    (0..m.fields.len()).find(|&i| hit(&m.field_rect(&r, i), pos.x, pos.y)),
+                )
+            };
+            if hit_ok {
+                self.close_modal(true);
+            } else if hit_cancel {
+                self.close_modal(false);
+            } else if let (Some(i), Some(m)) = (field, self.modal.as_mut()) {
+                m.focused = i;
+            }
+            // Anything else is swallowed: the page must not receive clicks
+            // while it is blocked waiting on this.
+            return None;
+        }
 
         let bar = self.bar();
         if hit(&bar, pos.x, pos.y) {
@@ -876,6 +1143,51 @@ impl Application for BrowserApp {
     }
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
+        // A modal is exactly that: the page is blocked inside WebKit, so the
+        // chrome's own chords must not fire behind it either.
+        #[cfg(feature = "wpe")]
+        if self.modal.is_some() {
+            *needs_rebuild = true;
+            if event.state == ElementState::Pressed
+                && event.logical_key == Key::Named(NamedKey::Tab)
+            {
+                if let Some(m) = self.modal.as_mut() {
+                    if !m.fields.is_empty() {
+                        let n = m.fields.len();
+                        m.focused = if event.shift {
+                            (m.focused + n - 1) % n
+                        } else {
+                            (m.focused + 1) % n
+                        };
+                    }
+                }
+                return None;
+            }
+            let outcome = match self.modal.as_mut() {
+                Some(m) if !m.fields.is_empty() => {
+                    let i = m.focused;
+                    m.fields[i].1.handle_key(event)
+                }
+                // No field: Enter accepts, Escape cancels, nothing else acts.
+                Some(_) => match (&event.logical_key, event.state) {
+                    (Key::Named(NamedKey::Enter), ElementState::Pressed) => {
+                        lineedit::EditOutcome::Submit
+                    }
+                    (Key::Named(NamedKey::Escape), ElementState::Pressed) => {
+                        lineedit::EditOutcome::Cancel
+                    }
+                    _ => lineedit::EditOutcome::Ignored,
+                },
+                None => lineedit::EditOutcome::Ignored,
+            };
+            match outcome {
+                lineedit::EditOutcome::Submit => self.close_modal(true),
+                lineedit::EditOutcome::Cancel => self.close_modal(false),
+                _ => {}
+            }
+            return None;
+        }
+
         // Tab shortcuts work regardless of URL-bar focus.
         if event.state == ElementState::Pressed && event.ctrl {
             let count = self.host.tab_count();
@@ -1131,6 +1443,9 @@ impl Application for BrowserApp {
                 );
             }
         });
+
+        #[cfg(feature = "wpe")]
+        self.paint_modal(&mut pc, &sans);
 
         Some(pc.finish())
     }
