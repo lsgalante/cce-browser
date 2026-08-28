@@ -15,7 +15,7 @@
 //! polling first keeps this milestone about the engine, not the event loop.
 
 use std::cell::{Cell, RefCell};
-use std::ffi::{c_char, CString};
+use std::ffi::{c_char, c_void, CString};
 use std::rc::Rc;
 
 use url::Url;
@@ -132,6 +132,13 @@ pub struct WebKitHost {
     bookmarks: std::sync::Arc<crate::pages::Bookmarks>,
     history_enabled: bool,
     force_dark: bool,
+    /// Serves the `cce:` pages. Boxed and leaked into the scheme callback,
+    /// so it must outlive every webview.
+    protocol: Rc<crate::pages::CceProtocol>,
+    downloads: std::sync::Arc<crate::downloads::Downloads>,
+    clear_cookies: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    session: *mut WebKitNetworkSession,
+    download_started: Rc<Cell<bool>>,
     /// Retained only so tests can assert on rendered output; the registry
     /// owns the copy that actually gets drawn.
     last_frame: Option<(Vec<u8>, u32, u32)>,
@@ -159,6 +166,49 @@ impl WebKitHost {
                 "wpe_display_connect failed"
             );
 
+            // Persisted profile: without a data directory WebKit keeps cookies
+            // in memory only, so every launch starts logged out of every site.
+            // Same location and the same 0700 reasoning as the Servo backend —
+            // the jar holds live sessions.
+            let profile = crate::pages::state_dir().join("profile");
+            let _ = std::fs::create_dir_all(&profile);
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700));
+            }
+            let (data_dir, cache_dir) = (
+                cstr(&profile.to_string_lossy()),
+                cstr(&profile.join("cache").to_string_lossy()),
+            );
+            let session = webkit_network_session_new(data_dir.as_ptr(), cache_dir.as_ptr());
+
+            let history = std::sync::Arc::new(crate::pages::History::load());
+            let bookmarks = std::sync::Arc::new(crate::pages::Bookmarks::load());
+            let downloads = std::sync::Arc::new(crate::downloads::Downloads::default());
+            let clear_cookies =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let protocol = Rc::new(crate::pages::CceProtocol {
+                history: history.clone(),
+                bookmarks: bookmarks.clone(),
+                downloads: downloads.clone(),
+                clear_cookies: clear_cookies.clone(),
+            });
+
+            // The `cce:` scheme, served straight out of the app exactly as the
+            // Servo backend serves it — same routing table, so the pages and
+            // their mutating links behave identically on both engines.
+            let ctx = webkit_web_context_get_default();
+            let scheme = cstr("cce");
+            webkit_web_context_register_uri_scheme(
+                ctx,
+                scheme.as_ptr(),
+                Some(on_cce_request),
+                Rc::into_raw(protocol.clone()) as gpointer,
+                None,
+            );
+
+            let download_started = Rc::new(Cell::new(false));
+
             let pending = Rc::new(std::cell::RefCell::new(Pending::default()));
             let sink = pending.clone();
             FRAME_SINK = Some(Box::new(move |buffer: *mut WPEBuffer| {
@@ -182,10 +232,15 @@ impl WebKitHost {
                 poll: GlibPoll::new()
                     .map_err(|e| log::warn!("no GLib epoll bridge ({e}); pump will poll"))
                     .ok(),
-                history: std::sync::Arc::new(crate::pages::History::load()),
-                bookmarks: std::sync::Arc::new(crate::pages::Bookmarks::load()),
+                history: history.clone(),
+                bookmarks: bookmarks.clone(),
                 history_enabled: true,
                 force_dark: false,
+                protocol,
+                downloads,
+                clear_cookies,
+                session,
+                download_started,
                 last_frame: None,
                 ucm: webkit_user_content_manager_new(),
             };
@@ -196,13 +251,19 @@ impl WebKitHost {
 
     fn build_webview(&self, url: &Url, state: &Rc<TabState>) -> (*mut WebKitWebView, *mut WPEView) {
         unsafe {
-            let (p_display, p_ucm) = (cstr("display"), cstr("user-content-manager"));
+            let (p_display, p_ucm, p_session) = (
+                cstr("display"),
+                cstr("user-content-manager"),
+                cstr("network-session"),
+            );
             let wv = g_object_new(
                 webkit_web_view_get_type(),
                 p_display.as_ptr(),
                 self.display,
                 p_ucm.as_ptr(),
                 self.ucm,
+                p_session.as_ptr(),
+                self.session,
                 std::ptr::null::<c_char>(),
             ) as *mut WebKitWebView;
             let view = webkit_web_view_get_wpe_view(wv);
@@ -473,10 +534,9 @@ impl WebKitHost {
         }
     }
 
-    /// A navigation became a download since the last check. Always false
-    /// until downloads are ported to WebKit's own API.
+    /// A navigation became a download since the last check.
     pub fn take_download_started(&self) -> bool {
-        false
+        self.download_started.replace(false)
     }
 
     pub fn active_bookmarked(&self) -> bool {
@@ -700,3 +760,34 @@ img, video, picture, canvas, svg, iframe, embed, object,
   filter: invert(1) hue-rotate(180deg) !important;
 }
 ";
+
+/// Serves a `cce:` page. Runs on the main thread, unlike the Servo handler
+/// which runs on fetch threads — the `Arc<Mutex<_>>` stores are shared with
+/// that backend and stay as they are.
+unsafe extern "C" fn on_cce_request(request: *mut WebKitURISchemeRequest, data: gpointer) {
+    let protocol = &*(data as *const crate::pages::CceProtocol);
+    let uri = from_cstr(webkit_uri_scheme_request_get_uri(request)).unwrap_or_default();
+    match protocol.route(&uri) {
+        Some(html) => {
+            let len = html.len() as i64;
+            let bytes = html.into_bytes().into_boxed_slice();
+            let ptr = Box::into_raw(bytes) as *mut c_void;
+            // The stream owns the buffer and frees it with g_free, so the box
+            // is deliberately leaked into it rather than dropped here.
+            let stream = g_memory_input_stream_new_from_data(ptr, len, Some(free_boxed));
+            let ctype = cstr("text/html; charset=utf-8");
+            webkit_uri_scheme_request_finish(request, stream, len, ctype.as_ptr());
+            g_object_unref(stream as *mut _);
+        }
+        None => {
+            let msg = cstr(&format!("no such cce: page: {uri}"));
+            let err = g_error_new_literal(1, 0, msg.as_ptr());
+            webkit_uri_scheme_request_finish_error(request, err);
+            g_error_free(err);
+        }
+    }
+}
+
+unsafe extern "C" fn free_boxed(p: gpointer) {
+    drop(Box::from_raw(p as *mut u8));
+}

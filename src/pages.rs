@@ -284,17 +284,17 @@ fn cookies_cleared_page() -> String {
     )
 }
 
-impl ProtocolHandler for CceProtocol {
-    fn load(
-        &self,
-        request: &mut Request,
-        _done_chan: &mut DoneChannel,
-        _context: &FetchContext,
-    ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
-        let url = request.current_url();
-        let full = url.as_str().trim_start_matches("cce://");
+impl CceProtocol {
+    /// Route a `cce:` URL to its page. Shared by both engine backends —
+    /// Servo reaches it through `ProtocolHandler` below, WebKit through its
+    /// URI-scheme callback — so the table of pages exists once.
+    ///
+    /// `None` means no such page; the caller turns that into its engine's
+    /// idea of a failed load.
+    pub(crate) fn route(&self, url: &str) -> Option<String> {
+        let full = url.trim_start_matches("cce://");
         let (path, query) = full.split_once('?').unwrap_or((full, ""));
-        let body = match path.trim_end_matches('/') {
+        match path.trim_end_matches('/') {
             "history" => Some(self.history.html()),
             "history/clear" => {
                 self.history.clear();
@@ -320,7 +320,19 @@ impl ProtocolHandler for CceProtocol {
                 Some(cookies_cleared_page())
             }
             _ => None,
-        };
+        }
+    }
+}
+
+impl ProtocolHandler for CceProtocol {
+    fn load(
+        &self,
+        request: &mut Request,
+        _done_chan: &mut DoneChannel,
+        _context: &FetchContext,
+    ) -> Pin<Box<dyn Future<Output = Response> + Send>> {
+        let url = request.current_url();
+        let body = self.route(url.as_str());
         let response = match body {
             Some(html) => {
                 let mut response =
@@ -334,7 +346,7 @@ impl ProtocolHandler for CceProtocol {
                 response
             }
             None => Response::network_error(NetworkError::ResourceLoadError(format!(
-                "no such cce: page: {path}"
+                "no such cce: page: {url}"
             ))),
         };
         Box::pin(std::future::ready(response))

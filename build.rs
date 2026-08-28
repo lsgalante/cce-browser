@@ -35,6 +35,9 @@ fn main() {
         .allowlist_item("G(Object|Type|Value|Bytes|Error|MainLoop|ParamSpec|Closure).*")
         // The main-context poll protocol: GPollFD is what `query` fills in.
         .allowlist_item("G(MainContext|PollFD|Source).*")
+        // Serving `cce:` pages: the handler answers with an input stream.
+        .allowlist_item("g_(memory_input_stream|input_stream|file)_.*")
+        .allowlist_item("G(InputStream|MemoryInputStream|File|Cancellable|AsyncResult).*")
         .allowlist_item("g_(type|object)_.*")
         // GObject's generated enums are plain C enums; keep them as consts so
         // vfunc tables and property flags stay comparable without casts.
