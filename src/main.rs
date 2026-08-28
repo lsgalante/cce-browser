@@ -7,7 +7,6 @@
 //! input events; the URL bar is a small hand-rolled line editor.
 
 mod downloads;
-#[cfg(feature = "wpe")]
 mod lineedit;
 mod pages;
 mod settings;
@@ -179,13 +178,10 @@ struct BrowserApp {
     scale: f64,
     pointer: (f32, f32),
     /// URL bar contents; mirrors the page URL unless the bar is focused.
-    url_input: String,
+    /// Text, caret and selection all live in the shared editor — the same
+    /// one the dialog fields use.
+    url: lineedit::LineEdit,
     url_focused: bool,
-    /// Byte index of the URL-bar cursor.
-    cursor: usize,
-    /// Selected byte range in the URL bar, normalized (start < end). Set by
-    /// clicking into an unfocused bar; any edit replaces or drops it.
-    selection: Option<(usize, usize)>,
     loading: bool,
     /// Page title; drives the toplevel title (the engine re-applies
     /// `settings().title` whenever it changes).
@@ -388,27 +384,7 @@ fn dom_key(key: &Key) -> Option<servo::Key> {
     })
 }
 
-fn prev_boundary(s: &str, i: usize) -> usize {
-    let mut j = i;
-    while j > 0 {
-        j -= 1;
-        if s.is_char_boundary(j) {
-            return j;
-        }
-    }
-    0
-}
 
-fn next_boundary(s: &str, i: usize) -> usize {
-    let mut j = i;
-    while j < s.len() {
-        j += 1;
-        if s.is_char_boundary(j) {
-            return j;
-        }
-    }
-    s.len()
-}
 
 impl BrowserApp {
     /// The utility bar's rect for the current window size and configured
@@ -432,9 +408,9 @@ impl BrowserApp {
         if !self.url_focused {
             if let Some(u) = self.host.url() {
                 let s = u.to_string();
-                self.url_input = if s == "about:blank" { String::new() } else { s };
-                self.cursor = self.url_input.len();
-                self.selection = None;
+                self.url = lineedit::LineEdit::with_text(
+                    if s == "about:blank" { String::new() } else { s },
+                );
             }
         }
     }
@@ -511,10 +487,10 @@ impl BrowserApp {
     }
 
     fn navigate(&mut self) {
-        if let Some(url) = parse_url_input(&self.url_input, &self.settings.search_prefix) {
+        if let Some(url) = parse_url_input(&self.url.text, &self.settings.search_prefix) {
             self.host.load(url);
             self.url_focused = false;
-            self.selection = None;
+            self.url.selection = None;
             self.loading = true;
         }
     }
@@ -546,7 +522,7 @@ impl BrowserApp {
             .host
             .url()
             .map(|u| u.to_string())
-            .or_else(|| parse_url_input(&self.url_input, &self.settings.search_prefix).map(|u| u.to_string()))
+            .or_else(|| parse_url_input(&self.url.text, &self.settings.search_prefix).map(|u| u.to_string()))
         else {
             return;
         };
@@ -584,9 +560,7 @@ impl BrowserApp {
     fn new_tab(&mut self) {
         let url = Url::parse("about:blank").expect("about:blank");
         self.host.open_tab(url);
-        self.url_input.clear();
-        self.cursor = 0;
-        self.selection = None;
+        self.url = lineedit::LineEdit::default();
         self.url_focused = true;
         self.sync_page_state();
     }
@@ -635,7 +609,7 @@ impl BrowserApp {
         }
         let mut end = text.len();
         while end > 0 {
-            end = prev_boundary(text, end);
+            end = lineedit::prev_boundary(text, end);
             let cut = format!("{}...", &text[..end]);
             if measure_text_width(&cut, sans, size) <= avail {
                 return cut;
@@ -721,18 +695,22 @@ impl BrowserApp {
         let rel = click_x - field.x - URL_PAD_X;
         // Boundary x offsets from the same shaped buffer the bar draws (font=None,
         // matching `pc.text`), then the closest boundary to the click.
-        let offsets = cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, &self.url_input, URL_FONT, None);
+        let text = self.url.text.clone();
+        let offsets =
+            cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, &text, URL_FONT, None);
         offsets
             .iter()
             .min_by(|a, b| (a.1 - rel).abs().total_cmp(&(b.1 - rel).abs()))
             .map(|&(b, _)| b)
-            .unwrap_or(self.url_input.len())
+            .unwrap_or(text.len())
     }
 
     /// X offset (text-origin relative) of a byte index, off the same shaped
     /// buffer as `cursor_from_click`.
     fn x_offset(&mut self, byte: usize) -> f32 {
-        let offsets = cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, &self.url_input, URL_FONT, None);
+        let text = self.url.text.clone();
+        let offsets =
+            cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, &text, URL_FONT, None);
         offsets
             .iter()
             .rev()
@@ -743,126 +721,29 @@ impl BrowserApp {
 
     /// Caret x offset for the current byte cursor.
     fn caret_offset(&mut self) -> f32 {
-        self.x_offset(self.cursor)
+        self.x_offset(self.url.cursor)
     }
 
     /// Select the whole URL, caret at the end — what entering the bar does,
     /// whether from a click, Ctrl+L or Ctrl+A. No-op on an empty field.
     fn select_all_url(&mut self) {
-        self.cursor = self.url_input.len();
-        self.selection = (self.cursor > 0).then_some((0, self.cursor));
+        self.url.select_all();
     }
 
-    /// The selected substring, if a selection covers any text.
-    fn selected_text(&self) -> Option<String> {
-        self.selection
-            .filter(|&(a, b)| a < b && b <= self.url_input.len())
-            .map(|(a, b)| self.url_input[a..b].to_string())
-    }
 
-    /// Drop a selection, deleting its text first if it covers any. Returns
-    /// whether text was removed, so edits can treat "replace the selection"
-    /// and "act at the cursor" as one path.
-    fn take_selection(&mut self) -> bool {
-        match self.selection.take() {
-            Some((a, b)) if a < b && b <= self.url_input.len() => {
-                self.url_input.replace_range(a..b, "");
-                self.cursor = a;
-                true
-            }
-            _ => false,
-        }
-    }
 
+    /// URL-bar keys. Editing is the shared [`lineedit::LineEdit`]; only what
+    /// makes this bar a *URL* bar — Enter navigates, Escape returns focus to
+    /// the page — is decided here.
     fn edit_url(&mut self, event: &KeyEvent) {
-        match &event.logical_key {
-            Key::Named(NamedKey::Enter) => self.navigate(),
-            Key::Named(NamedKey::Escape) => {
+        match self.url.handle_key(event) {
+            lineedit::EditOutcome::Submit => self.navigate(),
+            lineedit::EditOutcome::Cancel => {
                 self.url_focused = false;
-                self.selection = None;
+                self.url.selection = None;
                 self.sync_page_state();
             }
-            Key::Named(NamedKey::Backspace) => {
-                if !self.take_selection() && self.cursor > 0 {
-                    let prev = prev_boundary(&self.url_input, self.cursor);
-                    self.url_input.replace_range(prev..self.cursor, "");
-                    self.cursor = prev;
-                }
-            }
-            Key::Named(NamedKey::Delete) => {
-                if !self.take_selection() && self.cursor < self.url_input.len() {
-                    let next = next_boundary(&self.url_input, self.cursor);
-                    self.url_input.replace_range(self.cursor..next, "");
-                }
-            }
-            // Arrows collapse a selection to the edge they move toward,
-            // rather than stepping from the cursor.
-            Key::Named(NamedKey::ArrowLeft) => {
-                self.cursor = match self.selection.take() {
-                    Some((a, _)) => a,
-                    None => prev_boundary(&self.url_input, self.cursor),
-                };
-            }
-            Key::Named(NamedKey::ArrowRight) => {
-                self.cursor = match self.selection.take() {
-                    Some((_, b)) => b,
-                    None => next_boundary(&self.url_input, self.cursor),
-                };
-            }
-            Key::Named(NamedKey::Home) => {
-                self.selection = None;
-                self.cursor = 0;
-            }
-            Key::Named(NamedKey::End) => {
-                self.selection = None;
-                self.cursor = self.url_input.len();
-            }
-            Key::Character(c) if event.ctrl => match c.as_str() {
-                "u" => {
-                    self.url_input.clear();
-                    self.cursor = 0;
-                    self.selection = None;
-                }
-                "a" => self.select_all_url(),
-                "c" => {
-                    if let Some(text) = self.selected_text() {
-                        cce_ui::widget::clipboard::copy_to_clipboard(&text);
-                    }
-                }
-                "x" => {
-                    if let Some(text) = self.selected_text() {
-                        cce_ui::widget::clipboard::copy_to_clipboard(&text);
-                        self.take_selection();
-                    }
-                }
-                "v" => {
-                    if let Some(text) = cce_ui::widget::clipboard::read_from_clipboard() {
-                        // The bar is one line: a multi-line paste would put
-                        // text where the caret math cannot reach it.
-                        let flat: String =
-                            text.chars().filter(|c| !c.is_control()).collect();
-                        if !flat.is_empty() {
-                            self.take_selection();
-                            self.url_input.insert_str(self.cursor, &flat);
-                            self.cursor += flat.len();
-                        }
-                    }
-                }
-                _ => {}
-            },
-            _ => {
-                let insert = match (&event.text, &event.logical_key) {
-                    (Some(t), _) if !event.ctrl && !t.chars().any(char::is_control) => Some(t.clone()),
-                    (None, Key::Named(NamedKey::Space)) => Some(" ".to_string()),
-                    (None, Key::Character(c)) if !event.ctrl => Some(c.clone()),
-                    _ => None,
-                };
-                if let Some(t) = insert {
-                    self.take_selection();
-                    self.url_input.insert_str(self.cursor, &t);
-                    self.cursor += t.len();
-                }
-            }
+            lineedit::EditOutcome::Edited | lineedit::EditOutcome::Ignored => {}
         }
     }
 }
@@ -880,8 +761,9 @@ impl Application for BrowserApp {
             .and_then(|arg| parse_startup_arg(&arg, &settings.search_prefix))
             .or_else(|| parse_url_input(&settings.homepage, &settings.search_prefix))
             .unwrap_or_else(|| Url::parse(settings::DEFAULT_HOMEPAGE).expect("home url"));
-        let url_input = url.to_string();
-        let cursor = url_input.len();
+        // Taken before `url` moves into the host.
+        let url_text = url.to_string();
+
         #[cfg(not(feature = "wpe"))]
         let mut host = Host::new(sender, url, (1200, 800), settings.color_scheme.forces_dark());
         #[cfg(feature = "wpe")]
@@ -899,10 +781,8 @@ impl Application for BrowserApp {
             win: (1200.0, 800.0),
             scale: 1.0,
             pointer: (0.0, 0.0),
-            url_input,
+            url: lineedit::LineEdit::with_text(url_text),
             url_focused: false,
-            cursor,
-            selection: None,
             loading: true,
             title: None,
             #[cfg(feature = "wpe")]
@@ -1092,8 +972,8 @@ impl Application for BrowserApp {
                 let field = url_rect(&bar);
                 if hit(&field, pos.x, pos.y) {
                     if self.url_focused {
-                        self.cursor = self.cursor_from_click(pos.x, &field);
-                        self.selection = None;
+                        self.url.cursor = self.cursor_from_click(pos.x, &field);
+                        self.url.selection = None;
                     } else {
                         // Entering the bar selects the whole URL, so typing
                         // replaces it instead of appending to it.
@@ -1102,7 +982,7 @@ impl Application for BrowserApp {
                     }
                 } else {
                     self.url_focused = false;
-                    self.selection = None;
+                    self.url.selection = None;
                 }
             }
             return None;
@@ -1111,7 +991,7 @@ impl Application for BrowserApp {
         // Page area: a click dismisses URL-bar focus, then goes to the page.
         if self.url_focused && pressed {
             self.url_focused = false;
-            self.selection = None;
+            self.url.selection = None;
             self.sync_page_state();
             *needs_rebuild = true;
         }
@@ -1420,6 +1300,7 @@ impl Application for BrowserApp {
         let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
         let caret_x = if self.url_focused { Some(self.caret_offset()) } else { None };
         let sel_x = self
+            .url
             .selection
             .filter(|&(a, b)| a < b)
             .map(|(a, b)| (self.x_offset(a), self.x_offset(b)));
@@ -1435,7 +1316,7 @@ impl Application for BrowserApp {
                     SEL_BG,
                 );
             }
-            pc.text(self.url_input.clone(), f.x + URL_PAD_X, ty, URL_FONT, TEXT);
+            pc.text(self.url.text.clone(), f.x + URL_PAD_X, ty, URL_FONT, TEXT);
             if let Some(offset) = caret_x {
                 pc.quad(
                     Rect { x: f.x + URL_PAD_X + offset, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },

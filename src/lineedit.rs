@@ -30,7 +30,8 @@ pub struct LineEdit {
     pub masked: bool,
 }
 
-fn prev_boundary(s: &str, i: usize) -> usize {
+/// Also used by the chrome's text elision.
+pub fn prev_boundary(s: &str, i: usize) -> usize {
     let mut j = i;
     while j > 0 {
         j -= 1;
@@ -176,5 +177,128 @@ impl LineEdit {
             }
         }
         EditOutcome::Edited
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cce_ui::widget::{ElementState, Key, NamedKey};
+
+    fn ev(key: Key, ctrl: bool) -> KeyEvent {
+        let text = match &key {
+            Key::Character(c) if !ctrl => Some(c.clone()),
+            _ => None,
+        };
+        KeyEvent {
+            state: ElementState::Pressed,
+            logical_key: key,
+            text,
+            repeat: false,
+            ctrl,
+            shift: false,
+            alt: false,
+        }
+    }
+    fn ch(c: &str) -> KeyEvent {
+        ev(Key::Character(c.into()), false)
+    }
+    fn ctrl(c: &str) -> KeyEvent {
+        ev(Key::Character(c.into()), true)
+    }
+    fn named(n: NamedKey) -> KeyEvent {
+        ev(Key::Named(n), false)
+    }
+
+    fn typed(e: &mut LineEdit, s: &str) {
+        for c in s.chars() {
+            e.handle_key(&ch(&c.to_string()));
+        }
+    }
+
+    #[test]
+    fn typing_inserts_at_the_caret() {
+        let mut e = LineEdit::default();
+        typed(&mut e, "abc");
+        assert_eq!(e.text, "abc");
+        assert_eq!(e.cursor, 3);
+    }
+
+    /// The URL bar's defining behaviour: entering it selects everything, so
+    /// the next keystroke replaces the address rather than appending to it.
+    #[test]
+    fn typing_over_a_selection_replaces_it() {
+        let mut e = LineEdit::with_text("https://example.com");
+        e.select_all();
+        typed(&mut e, "x");
+        assert_eq!(e.text, "x");
+        assert_eq!(e.selection, None);
+    }
+
+    #[test]
+    fn ctrl_a_selects_all_and_ctrl_u_clears() {
+        let mut e = LineEdit::with_text("abc");
+        e.handle_key(&ctrl("a"));
+        assert_eq!(e.selection, Some((0, 3)));
+        e.handle_key(&ctrl("u"));
+        assert_eq!(e.text, "");
+        assert_eq!(e.selection, None);
+    }
+
+    #[test]
+    fn backspace_deletes_a_selection_whole_or_one_char() {
+        let mut e = LineEdit::with_text("abc");
+        e.select_all();
+        e.handle_key(&named(NamedKey::Backspace));
+        assert_eq!(e.text, "");
+
+        let mut e = LineEdit::with_text("abc");
+        e.handle_key(&named(NamedKey::Backspace));
+        assert_eq!(e.text, "ab");
+    }
+
+    /// Arrows collapse to the edge they move toward rather than stepping from
+    /// the caret — otherwise Left after a select-all lands in the wrong place.
+    #[test]
+    fn arrows_collapse_a_selection_to_its_edge() {
+        let mut e = LineEdit::with_text("abc");
+        e.select_all();
+        e.handle_key(&named(NamedKey::ArrowLeft));
+        assert_eq!((e.cursor, e.selection), (0, None));
+
+        e.select_all();
+        e.handle_key(&named(NamedKey::ArrowRight));
+        assert_eq!((e.cursor, e.selection), (3, None));
+    }
+
+    #[test]
+    fn enter_and_escape_are_reported_not_swallowed() {
+        let mut e = LineEdit::with_text("x");
+        assert_eq!(e.handle_key(&named(NamedKey::Enter)), EditOutcome::Submit);
+        assert_eq!(e.handle_key(&named(NamedKey::Escape)), EditOutcome::Cancel);
+    }
+
+    /// Multi-byte text must not be split mid-character.
+    #[test]
+    fn caret_moves_by_character_not_byte() {
+        let mut e = LineEdit::with_text("é1");
+        e.handle_key(&named(NamedKey::Home));
+        e.handle_key(&named(NamedKey::ArrowRight));
+        assert_eq!(e.cursor, 2, "é is two bytes");
+        e.handle_key(&named(NamedKey::Backspace));
+        assert_eq!(e.text, "1");
+    }
+
+    /// A password must not leave through a chord the user may not have meant.
+    #[test]
+    fn a_masked_field_hides_its_text_and_refuses_copy() {
+        let mut e = LineEdit::masked();
+        typed(&mut e, "hunter2");
+        assert_eq!(e.display(), "•".repeat(7));
+        assert_ne!(e.display(), e.text);
+        e.select_all();
+        assert_eq!(e.handle_key(&ctrl("c")), EditOutcome::Ignored);
+        assert_eq!(e.handle_key(&ctrl("x")), EditOutcome::Ignored);
+        assert_eq!(e.text, "hunter2", "cut must not have removed it");
     }
 }
