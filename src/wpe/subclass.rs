@@ -54,6 +54,7 @@ pub(super) struct Types {
     pub display: GType,
     pub view: GType,
     pub toplevel: GType,
+    pub clipboard: GType,
 }
 
 static mut TYPES: Option<Types> = None;
@@ -69,6 +70,11 @@ pub(super) unsafe fn types() -> &'static Types {
                 toplevel_class_init,
             ),
             display: register_subclass(wpe_display_get_type(), "CceWpeDisplay", display_class_init),
+            clipboard: register_subclass(
+                wpe_clipboard_get_type(),
+                "CceWpeClipboard",
+                clipboard_class_init,
+            ),
         });
     }
     #[allow(static_mut_refs)]
@@ -162,9 +168,140 @@ unsafe extern "C" fn display_create_toplevel(
     ) as *mut WPEToplevel
 }
 
+/// One clipboard per process, cached: `get_clipboard` is called repeatedly
+/// and must return the same object, since WebKit tracks its change count.
+static mut CLIPBOARD: *mut WPEClipboard = std::ptr::null_mut();
+
+unsafe extern "C" fn display_get_clipboard(d: *mut WPEDisplay) -> *mut WPEClipboard {
+    if CLIPBOARD.is_null() {
+        let prop = CString::new("display").unwrap();
+        CLIPBOARD = g_object_new(types().clipboard, prop.as_ptr(), d, std::ptr::null::<c_char>())
+            as *mut WPEClipboard;
+    }
+    CLIPBOARD
+}
+
 unsafe extern "C" fn display_class_init(class: *mut c_void, _data: *mut c_void) {
     let c = class as *mut WPEDisplayClass;
     (*c).connect = Some(display_connect);
     (*c).create_view = Some(display_create_view);
     (*c).create_toplevel = Some(display_create_toplevel);
+    // Without this, WebKit has no clipboard at all: Ctrl+V in a page reads
+    // nothing and Ctrl+C writes nowhere, silently.
+    (*c).get_clipboard = Some(display_get_clipboard);
+}
+
+// ---- clipboard ----
+//
+// Routed through `cce_ui`'s wl-copy/wl-paste helpers, which is what the Servo
+// backend does too — it keeps the browser on the same clipboard path as the
+// rest of the DE rather than opening a second connection of its own.
+
+/// Formats we answer to. WebKit asks by MIME type; anything textual maps to
+/// the one string the toolkit deals in.
+fn is_text_format(f: &str) -> bool {
+    f.starts_with("text/plain") || f == "UTF8_STRING" || f == "STRING"
+}
+
+unsafe extern "C" fn clipboard_read(
+    _clipboard: *mut WPEClipboard,
+    format: *const c_char,
+) -> *mut GBytes {
+    let format = if format.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(format).to_string_lossy().into_owned()
+    };
+    if !is_text_format(&format) {
+        return std::ptr::null_mut();
+    }
+    let Some(text) = cce_ui::widget::clipboard::read_from_clipboard() else {
+        return std::ptr::null_mut();
+    };
+    let bytes = text.into_bytes().into_boxed_slice();
+    let len = bytes.len();
+    // The GBytes owns the buffer and frees it through the notify below.
+    g_bytes_new_with_free_func(
+        Box::into_raw(bytes) as *const c_void,
+        len as u64,
+        Some(free_boxed_bytes),
+        std::ptr::null_mut(),
+    )
+}
+
+unsafe extern "C" fn free_boxed_bytes(p: gpointer) {
+    drop(Box::from_raw(p as *mut u8));
+}
+
+/// Set while we push the system clipboard into WPE, so the `changed` that
+/// results is not echoed straight back out again.
+pub(super) static mut SYNCING: bool = false;
+
+/// Make WPE aware of what the system clipboard holds.
+///
+/// WPE only knows about content it has been *given*: `read` is never called
+/// for a clipboard it believes is empty, which is why paste silently did
+/// nothing until this existed. A native Wayland backend would push this on
+/// every selection change; we do it at the moment it matters — the paste —
+/// rather than polling `wl-paste` in the background forever.
+pub(super) unsafe fn sync_system_clipboard(display: *mut WPEDisplay) {
+    let Some(text) = cce_ui::widget::clipboard::read_from_clipboard() else {
+        return;
+    };
+    let clipboard = wpe_display_get_clipboard(display);
+    if clipboard.is_null() {
+        return;
+    }
+    let content = wpe_clipboard_content_new();
+    let c = CString::new(text).unwrap_or_default();
+    wpe_clipboard_content_set_text(content, c.as_ptr());
+    SYNCING = true;
+    wpe_clipboard_set_content(clipboard, content);
+    SYNCING = false;
+    wpe_clipboard_content_unref(content);
+
+}
+
+/// The page put something on the clipboard. `is_local` distinguishes that
+/// from us being told about someone else's copy — without the check we would
+/// echo a foreign clipboard straight back and clobber it.
+/// The parent `changed`, kept because overriding it without chaining up is
+/// what silently broke paste: `wpe_clipboard_set_content` routes through this
+/// vfunc, and the **base implementation is what actually stores the content
+/// and bumps the change count**. Without the chain-up, `set_content` appeared
+/// to succeed while WPE still reported no formats and an empty clipboard, so
+/// WebKit never even called `read`.
+static mut PARENT_CHANGED: Option<
+    unsafe extern "C" fn(*mut WPEClipboard, *mut GPtrArray, gboolean, *mut WPEClipboardContent),
+> = None;
+
+unsafe extern "C" fn clipboard_changed(
+    clipboard: *mut WPEClipboard,
+    formats: *mut GPtrArray,
+    is_local: gboolean,
+    content: *mut WPEClipboardContent,
+) {
+    if let Some(parent) = PARENT_CHANGED {
+        parent(clipboard, formats, is_local, content);
+    }
+    // SYNCING guards the other direction: we just pushed the system
+    // clipboard in, and copying it straight back out is a pointless round
+    // trip through wl-copy.
+    if is_local == 0 || content.is_null() || SYNCING {
+        return;
+    }
+    // Borrowed from the content, not ours to free.
+    let text = wpe_clipboard_content_get_text(content);
+    if !text.is_null() {
+        let s = std::ffi::CStr::from_ptr(text).to_string_lossy().into_owned();
+        cce_ui::widget::clipboard::copy_to_clipboard(&s);
+    }
+}
+
+unsafe extern "C" fn clipboard_class_init(class: *mut c_void, _data: *mut c_void) {
+    let c = class as *mut WPEClipboardClass;
+    let parent = g_type_class_peek_parent(class as gpointer) as *mut WPEClipboardClass;
+    PARENT_CHANGED = (!parent.is_null()).then(|| (*parent).changed).flatten();
+    (*c).read = Some(clipboard_read);
+    (*c).changed = Some(clipboard_changed);
 }

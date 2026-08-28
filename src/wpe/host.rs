@@ -601,8 +601,20 @@ impl WebKitHost {
     /// Clipboard on the page. WebKit takes these as named editing commands,
     /// so unlike the Servo backend there is no separate clipboard delegate to
     /// implement — it goes through the platform clipboard itself.
+    /// Push the system selection into WPE. Separated so it can be done
+    /// ahead of a paste rather than in the same breath — the web process is
+    /// a different process, and the content has to reach it.
+    pub fn sync_clipboard(&self) {
+        unsafe { super::subclass::sync_system_clipboard(self.display) }
+    }
+
     pub fn editing_action_cmd(&self, command: crate::EditingCommand) {
         unsafe {
+            // WebKit will not read a clipboard it thinks is empty, so the
+            // system selection has to be pushed in before Paste runs.
+            if matches!(command, crate::EditingCommand::Paste) {
+                super::subclass::sync_system_clipboard(self.display);
+            }
             let c = cstr(match command {
                 crate::EditingCommand::Copy => "Copy",
                 crate::EditingCommand::Cut => "Cut",

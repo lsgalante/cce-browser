@@ -58,3 +58,7 @@ required-features = ["wpe"]
 [[example]]
 name = "wpe_dark"
 required-features = ["wpe"]
+
+[[example]]
+name = "wpe_paste"
+required-features = ["wpe"]
