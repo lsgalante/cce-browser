@@ -304,6 +304,16 @@ impl WebKitHost {
         self.poll.as_ref().map(|p| p.fd())
     }
 
+    /// An owned duplicate of [`Self::poll_fd`], for handing to calloop.
+    ///
+    /// calloop wants to own what it polls, and the borrow above is tied to
+    /// `&self`. A dup refers to the same epoll instance, so registrations
+    /// made through the original are still what this observes.
+    pub fn poll_fd_owned(&self) -> Option<std::os::fd::OwnedFd> {
+        let fd = self.poll.as_ref()?.fd();
+        rustix::io::dup(fd).ok()
+    }
+
     /// How long calloop may sleep before pumping anyway, per GLib.
     pub fn poll_timeout(&self) -> Option<std::time::Duration> {
         self.poll
@@ -448,7 +458,7 @@ impl WebKitHost {
     }
 
     /// What pages see for `prefers-color-scheme`, via WPE's own setting.
-    pub fn set_color_scheme(&self, dark: bool) {
+    pub fn set_color_scheme_dark(&self, dark: bool) {
         unsafe {
             let settings = wpe_display_get_settings(self.display);
             let key = cstr("/wpe-platform/dark-mode");
@@ -487,9 +497,13 @@ impl WebKitHost {
     /// Clipboard on the page. WebKit takes these as named editing commands,
     /// so unlike the Servo backend there is no separate clipboard delegate to
     /// implement — it goes through the platform clipboard itself.
-    pub fn editing_action(&self, command: EditingCommand) {
+    pub fn editing_action_cmd(&self, command: crate::EditingCommand) {
         unsafe {
-            let c = cstr(command.as_str());
+            let c = cstr(match command {
+                crate::EditingCommand::Copy => "Copy",
+                crate::EditingCommand::Cut => "Cut",
+                crate::EditingCommand::Paste => "Paste",
+            });
             webkit_web_view_execute_editing_command(self.active_tab().webview, c.as_ptr());
         }
     }
@@ -519,7 +533,7 @@ impl WebKitHost {
         }
     }
 
-    pub fn mouse_button(&self, button: MouseButton, pressed: bool, x_px: f32, y_px: f32) {
+    pub fn mouse_button_ui(&self, button: MouseButton, pressed: bool, x_px: f32, y_px: f32) {
         let Some(n) = input::button_number(button) else {
             return;
         };
@@ -580,7 +594,7 @@ impl WebKitHost {
 
     /// Takes cce-ui's `KeyEvent` directly — the keysym mapping lives in
     /// `input`, so the chrome never learns engine vocabulary.
-    pub fn key(&self, event: &KeyEvent) {
+    pub fn key_ui(&self, event: &KeyEvent) {
         let Some(keyval) = input::keyval(&event.logical_key) else {
             return;
         };
@@ -675,23 +689,6 @@ unsafe fn from_cstr(p: *const c_char) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Backend-neutral clipboard action, so `main.rs` names neither engine's.
-#[derive(Debug, Clone, Copy)]
-pub enum EditingCommand {
-    Copy,
-    Cut,
-    Paste,
-}
-
-impl EditingCommand {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Copy => "Copy",
-            Self::Cut => "Cut",
-            Self::Paste => "Paste",
-        }
-    }
-}
 
 /// Same inverting stylesheet the Servo backend uses, and for the same reason:
 /// it is the only thing that darkens a page shipping a hardcoded white with no

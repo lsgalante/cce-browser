@@ -716,6 +716,84 @@ impl ServoHost {
         )));
     }
 
+    /// Clipboard action on the page, in backend-neutral terms.
+    pub fn editing_action_cmd(&self, command: crate::EditingCommand) {
+        self.editing_action(match command {
+            crate::EditingCommand::Copy => EditingActionEvent::Copy,
+            crate::EditingCommand::Cut => EditingActionEvent::Cut,
+            crate::EditingCommand::Paste => EditingActionEvent::Paste,
+        });
+    }
+
+    /// Pointer button in cce-ui's vocabulary. The Servo mapping lives here
+    /// rather than in `main.rs` so the chrome names no engine's types — the
+    /// WPE backend takes the same arguments.
+    pub fn mouse_button_ui(
+        &self,
+        button: cce_ui::widget::MouseButton,
+        pressed: bool,
+        x_px: f32,
+        y_px: f32,
+    ) {
+        use cce_ui::widget::MouseButton as Ui;
+        let Some(b) = (match button {
+            Ui::Left => Some(DomMouseButton::Left),
+            Ui::Right => Some(DomMouseButton::Right),
+            Ui::Middle => Some(DomMouseButton::Middle),
+            _ => None,
+        }) else {
+            return;
+        };
+        self.mouse_button(b, pressed, x_px, y_px);
+    }
+
+    /// A cce-ui key event, translated and forwarded. Same signature as the
+    /// WPE backend's `key`.
+    pub fn key_ui(&self, event: &cce_ui::widget::KeyEvent) {
+        use cce_ui::widget::{ElementState as St, Key as UiKey, NamedKey as Nk};
+        let Some(k) = (match &event.logical_key {
+            UiKey::Character(s) => Some(DomKey::Character(s.clone())),
+            UiKey::Named(Nk::Space) => Some(DomKey::Character(" ".into())),
+            UiKey::Named(n) => Some(DomKey::Named(match n {
+                Nk::Backspace => servo::NamedKey::Backspace,
+                Nk::Tab => servo::NamedKey::Tab,
+                Nk::Enter => servo::NamedKey::Enter,
+                Nk::Escape => servo::NamedKey::Escape,
+                Nk::ArrowDown => servo::NamedKey::ArrowDown,
+                Nk::ArrowLeft => servo::NamedKey::ArrowLeft,
+                Nk::ArrowRight => servo::NamedKey::ArrowRight,
+                Nk::ArrowUp => servo::NamedKey::ArrowUp,
+                Nk::End => servo::NamedKey::End,
+                Nk::Home => servo::NamedKey::Home,
+                Nk::PageDown => servo::NamedKey::PageDown,
+                Nk::PageUp => servo::NamedKey::PageUp,
+                Nk::Delete => servo::NamedKey::Delete,
+                Nk::Control => servo::NamedKey::Control,
+                Nk::Shift => servo::NamedKey::Shift,
+                Nk::Alt => servo::NamedKey::Alt,
+                Nk::Super => servo::NamedKey::Meta,
+                Nk::F5 => servo::NamedKey::F5,
+                Nk::Space => unreachable!("handled above"),
+            })),
+        }) else {
+            return;
+        };
+        let mut modifiers = Modifiers::empty();
+        modifiers.set(Modifiers::CONTROL, event.ctrl);
+        modifiers.set(Modifiers::SHIFT, event.shift);
+        modifiers.set(Modifiers::ALT, event.alt);
+        self.key(k, event.state == St::Pressed, modifiers);
+    }
+
+    /// Colour scheme in backend-neutral terms: dark or not.
+    pub fn set_color_scheme_dark(&mut self, dark: bool) {
+        self.set_color_scheme(if dark { Theme::Dark } else { Theme::Light });
+    }
+
+    /// Page focus. A no-op for Servo, which tracks focus itself; present so
+    /// both backends accept the same call.
+    pub fn focus(&self, _focused: bool) {}
+
     /// Forward a key to the page, modifiers included.
     ///
     /// `from_state_and_key` defaults the modifiers to empty, which delivers

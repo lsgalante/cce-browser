@@ -16,4 +16,4 @@ mod host;
 
 // Not consumed yet — main.rs still drives ServoHost.
 #[allow(unused_imports)]
-pub use host::{EditingCommand, Tab, WebKitHost};
+pub use host::{Tab, WebKitHost};

@@ -50,6 +50,15 @@ impl ColorScheme {
         }
     }
 
+    /// What to report for `prefers-color-scheme`, backend-neutrally.
+    ///
+    /// Force-dark reports **light** on purpose: the filter inverts
+    /// unconditionally, so a site with a real dark theme would be handed an
+    /// already-dark page and inverted back into a light one.
+    pub fn is_dark(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
     /// Whether the inverting user stylesheet is installed.
     pub fn forces_dark(self) -> bool {
         matches!(self, Self::ForceDark)

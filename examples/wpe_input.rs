@@ -44,8 +44,8 @@ fn main() {
     println!("-- pointer move + left click at (300,220) --");
     host.mouse_move(300.0, 220.0);
     settle(&mut host, 4);
-    host.mouse_button(MouseButton::Left, true, 300.0, 220.0);
-    host.mouse_button(MouseButton::Left, false, 300.0, 220.0);
+    host.mouse_button_ui(MouseButton::Left, true, 300.0, 220.0);
+    host.mouse_button_ui(MouseButton::Left, false, 300.0, 220.0);
     settle(&mut host, 8);
     println!("   title={:?}", host.title());
 
@@ -59,8 +59,8 @@ fn main() {
         shift: false,
         alt: false,
     };
-    host.key(&key("a", true));
-    host.key(&key("a", false));
+    host.key_ui(&key("a", true));
+    host.key_ui(&key("a", false));
     settle(&mut host, 8);
     println!("   title={:?}", host.title());
 

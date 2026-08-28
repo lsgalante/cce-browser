@@ -31,3 +31,30 @@ rustix = { version = "0.38", features = ["event"], optional = true }
 [build-dependencies]
 bindgen = "0.72"
 pkg-config = "0.3"
+
+# The WPE examples need the generated bindings, so they only build with
+# the feature — otherwise `cargo test` would try them on a default build.
+
+[[example]]
+name = "wpe_spike"
+required-features = ["wpe"]
+
+[[example]]
+name = "wpe_host"
+required-features = ["wpe"]
+
+[[example]]
+name = "wpe_input"
+required-features = ["wpe"]
+
+[[example]]
+name = "wpe_loop"
+required-features = ["wpe"]
+
+[[example]]
+name = "wpe_tabs"
+required-features = ["wpe"]
+
+[[example]]
+name = "wpe_dark"
+required-features = ["wpe"]

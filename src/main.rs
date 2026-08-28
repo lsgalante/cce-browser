@@ -24,7 +24,20 @@ use cce_ui::scene::paint::{DisplayList, PaintCtx};
 use cce_ui::widget::display::measure_text_width;
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
 
-use webview::ServoHost;
+#[cfg(not(feature = "wpe"))]
+use webview::ServoHost as Host;
+#[cfg(feature = "wpe")]
+use wpe::WebKitHost as Host;
+
+/// Clipboard action, named by neither engine. Each backend maps it to its
+/// own vocabulary — Servo needs an `EditingActionEvent`, WebKit a named
+/// editing command — so the chrome never learns either.
+#[derive(Debug, Clone, Copy)]
+pub enum EditingCommand {
+    Copy,
+    Cut,
+    Paste,
+}
 
 const BAR_MARGIN: f32 = 10.0;
 /// Two rows: tab strip on top, nav controls + URL field below.
@@ -75,7 +88,7 @@ pub enum Message {
 }
 
 struct BrowserApp {
-    host: ServoHost,
+    host: Host,
     /// Loaded from the app config; re-read when the window regains focus.
     settings: settings::Settings,
     win: (f32, f32),
@@ -93,6 +106,10 @@ struct BrowserApp {
     /// Page title; drives the toplevel title (the engine re-applies
     /// `settings().title` whenever it changes).
     title: Option<String>,
+    /// Kept so the WPE backend's calloop sources can fire `Spin`; Servo
+    /// wakes the loop itself through its `EventLoopWaker`.
+    #[cfg(feature = "wpe")]
+    sender: calloop::channel::Sender<Message>,
     /// App-side bundled-fonts `FontSystem` (the same set the toolkit renders
     /// with) for URL-bar caret/click metrics via `shaped_cluster_offsets` —
     /// `measure_text_width`'s inked-extent numbers drift off the drawn glyphs.
@@ -351,7 +368,7 @@ impl BrowserApp {
         }
         downloads::set_download_dir(new.download_dir.clone());
         self.host.set_history_enabled(new.history);
-        self.host.set_color_scheme(new.color_scheme.into());
+        self.host.set_color_scheme_dark(new.color_scheme.is_dark());
         self.host.set_force_dark(new.color_scheme.forces_dark());
         self.settings = new;
         true
@@ -632,9 +649,17 @@ impl Application for BrowserApp {
             .unwrap_or_else(|| Url::parse(settings::DEFAULT_HOMEPAGE).expect("home url"));
         let url_input = url.to_string();
         let cursor = url_input.len();
-        let mut host = ServoHost::new(sender, url, (1200, 800), settings.color_scheme.forces_dark());
+        #[cfg(not(feature = "wpe"))]
+        let mut host = Host::new(sender, url, (1200, 800), settings.color_scheme.forces_dark());
+        #[cfg(feature = "wpe")]
+        let mut host = {
+            let _ = &sender; // WPE wakes through register_sources, not a waker
+            Host::new(url, (1200, 800))
+        };
         host.set_history_enabled(settings.history);
-        host.set_color_scheme(settings.color_scheme.into());
+        host.set_color_scheme_dark(settings.color_scheme.is_dark());
+        #[cfg(feature = "wpe")]
+        host.set_force_dark(settings.color_scheme.forces_dark());
         Self {
             host,
             settings,
@@ -647,7 +672,55 @@ impl Application for BrowserApp {
             selection: None,
             loading: true,
             title: None,
+            #[cfg(feature = "wpe")]
+            sender,
             font_system: cce_ui::create_font_system(),
+        }
+    }
+
+    /// Wake on GLib activity rather than polling for it.
+    ///
+    /// Servo pushed `Message::Spin` into calloop from its own threads; WPE
+    /// runs a GLib main context, so we register the epoll fd carrying its
+    /// pollfd set plus a timer for the timeout GLib asks for. Both just fire
+    /// `Spin`, which lands in `update` and calls `pump` — the same path the
+    /// Servo waker used, so nothing downstream changes.
+    #[cfg(feature = "wpe")]
+    fn register_sources(&mut self, handle: &calloop::LoopHandle<'_, EngineState<Self>>) {
+        use calloop::{generic::Generic, Interest, Mode, PostAction};
+
+        if let Some(fd) = self.host.poll_fd_owned() {
+            let tx = self.sender.clone();
+            // Level-triggered: `pump` drains the epoll, so an un-consumed
+            // socket re-arms rather than being missed.
+            let source = Generic::new(fd, Interest::READ, Mode::Level);
+            if let Err(e) = handle.insert_source(source, move |_, _, _| {
+                let _ = tx.send(Message::Spin);
+                Ok(PostAction::Continue)
+            }) {
+                log::warn!("could not watch the GLib fd ({e}); falling back to the timer alone");
+            }
+        }
+
+        // GLib also asks to be woken on its own schedule (timeouts, animation
+        // frames), which no fd reports. Re-armed from `poll_timeout` each
+        // fire, so an idle page settles to long sleeps instead of a fixed tick.
+        let tx = self.sender.clone();
+        let timer = calloop::timer::Timer::from_duration(std::time::Duration::from_millis(16));
+        if let Err(e) = handle.insert_source(timer, move |_, _, state| {
+            let _ = tx.send(Message::Spin);
+            let next = state
+                .inner
+                .as_ref()
+                .and_then(|app| app.host.poll_timeout())
+                .unwrap_or(std::time::Duration::from_millis(100))
+                .clamp(
+                    std::time::Duration::from_millis(4),
+                    std::time::Duration::from_millis(250),
+                );
+            calloop::timer::TimeoutAction::ToDuration(next)
+        }) {
+            log::warn!("could not arm the GLib timer ({e})");
         }
     }
 
@@ -779,10 +852,9 @@ impl Application for BrowserApp {
             MouseButton::Back if pressed => self.host.back(),
             MouseButton::Forward if pressed => self.host.forward(),
             _ => {
-                if let Some(b) = dom_button(button) {
-                    let s = self.scale as f32;
-                    self.host.mouse_button(b, pressed, pos.x * s, pos.y * s);
-                }
+                let s = self.scale as f32;
+                self.host
+                    .mouse_button_ui(button, pressed, pos.x * s, pos.y * s);
             }
         }
         None
@@ -870,10 +942,10 @@ impl Application for BrowserApp {
                         // Page clipboard: Servo needs the chord as an
                         // editing action, not as the raw keystroke.
                         "c" | "x" | "v" => {
-                            self.host.editing_action(match c.as_str() {
-                                "c" => servo::EditingActionEvent::Copy,
-                                "x" => servo::EditingActionEvent::Cut,
-                                _ => servo::EditingActionEvent::Paste,
+                            self.host.editing_action_cmd(match c.as_str() {
+                                "c" => EditingCommand::Copy,
+                                "x" => EditingCommand::Cut,
+                                _ => EditingCommand::Paste,
                             });
                             return None;
                         }
@@ -897,13 +969,7 @@ impl Application for BrowserApp {
             }
         }
 
-        if let Some(k) = dom_key(&event.logical_key) {
-            let mut modifiers = servo::Modifiers::empty();
-            modifiers.set(servo::Modifiers::CONTROL, event.ctrl);
-            modifiers.set(servo::Modifiers::SHIFT, event.shift);
-            modifiers.set(servo::Modifiers::ALT, event.alt);
-            self.host.key(k, event.state == ElementState::Pressed, modifiers);
-        }
+        self.host.key_ui(event);
         None
     }
 
