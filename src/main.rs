@@ -169,6 +169,74 @@ impl Modal {
     }
 }
 
+/// The right-click menu, drawn by the chrome at the pointer.
+///
+/// Not modal: the page is not blocked (unlike a script dialog), so this only
+/// intercepts input for as long as it is open, and any click outside closes
+/// it and is otherwise swallowed.
+#[cfg(feature = "wpe")]
+struct CtxMenu {
+    items: Vec<CtxItem>,
+    /// Top-left corner, already clamped to the window.
+    pos: (f32, f32),
+}
+
+#[cfg(feature = "wpe")]
+struct CtxItem {
+    label: String,
+    action: CtxAction,
+    enabled: bool,
+}
+
+#[cfg(feature = "wpe")]
+enum CtxAction {
+    Back,
+    Forward,
+    Reload,
+    /// Copy the page's current selection (through the engine, so it lands on
+    /// the system clipboard via the clipboard bridge).
+    CopySelection,
+    Paste,
+    OpenInTab(String),
+    /// Put this text on the clipboard directly (link/image addresses).
+    CopyText(String),
+    /// Fetch through WebKit's download pipeline.
+    Download(String),
+    OpenExternal,
+}
+
+#[cfg(feature = "wpe")]
+const CTX_ROW_H: f32 = 24.0;
+#[cfg(feature = "wpe")]
+const CTX_W: f32 = 200.0;
+#[cfg(feature = "wpe")]
+const CTX_PAD: f32 = 6.0;
+
+#[cfg(feature = "wpe")]
+impl CtxMenu {
+    fn rect(&self) -> Rect {
+        Rect {
+            x: self.pos.0,
+            y: self.pos.1,
+            width: CTX_W,
+            height: CTX_PAD * 2.0 + self.items.len() as f32 * CTX_ROW_H,
+        }
+    }
+
+    fn row_rect(&self, i: usize) -> Rect {
+        Rect {
+            x: self.pos.0 + 2.0,
+            y: self.pos.1 + CTX_PAD + i as f32 * CTX_ROW_H,
+            width: CTX_W - 4.0,
+            height: CTX_ROW_H,
+        }
+    }
+
+    fn item_at(&self, x: f32, y: f32) -> Option<usize> {
+        (0..self.items.len()).find(|&i| hit(&self.row_rect(i), x, y))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Servo requested an event-loop spin (waker or delegate signal).
@@ -198,6 +266,9 @@ struct BrowserApp {
     /// for them, which is why they were listed as "not implemented".
     #[cfg(feature = "wpe")]
     modal: Option<Modal>,
+    /// Open right-click menu, if any.
+    #[cfg(feature = "wpe")]
+    ctx_menu: Option<CtxMenu>,
     /// Kept so the WPE backend's calloop sources can fire `Spin`; Servo
     /// wakes the loop itself through its `EventLoopWaker`.
     #[cfg(feature = "wpe")]
@@ -458,6 +529,71 @@ impl BrowserApp {
         }
     }
 
+    /// Build the right-click menu from what the hit test found, placed at
+    /// the pointer and clamped to the window.
+    #[cfg(feature = "wpe")]
+    fn open_ctx_menu(&mut self, info: wpe::ContextMenuInfo) {
+        let mut items = Vec::new();
+        let item = |label: &str, action: CtxAction, enabled: bool| CtxItem {
+            label: label.to_string(),
+            action,
+            enabled,
+        };
+        if let Some((uri, _label)) = info.link {
+            items.push(item("Open Link in New Tab", CtxAction::OpenInTab(uri.clone()), true));
+            items.push(item("Copy Link", CtxAction::CopyText(uri.clone()), true));
+            items.push(item("Download Link", CtxAction::Download(uri), true));
+        }
+        if let Some(uri) = info.image_uri {
+            items.push(item("Copy Image Address", CtxAction::CopyText(uri.clone()), true));
+            items.push(item("Download Image", CtxAction::Download(uri), true));
+        }
+        if info.is_selection {
+            items.push(item("Copy", CtxAction::CopySelection, true));
+        }
+        if info.is_editable {
+            items.push(item("Paste", CtxAction::Paste, true));
+        }
+        items.push(item("Back", CtxAction::Back, self.host.can_go_back()));
+        items.push(item("Forward", CtxAction::Forward, self.host.can_go_forward()));
+        items.push(item("Reload", CtxAction::Reload, true));
+        items.push(item("Open in Other Browser", CtxAction::OpenExternal, true));
+
+        let h = CTX_PAD * 2.0 + items.len() as f32 * CTX_ROW_H;
+        let pos = (
+            self.pointer.0.min(self.win.0 - CTX_W - 4.0).max(0.0),
+            self.pointer.1.min(self.win.1 - h - 4.0).max(0.0),
+        );
+        self.ctx_menu = Some(CtxMenu { items, pos });
+    }
+
+    #[cfg(feature = "wpe")]
+    fn dispatch_ctx_action(&mut self, index: usize) {
+        let Some(menu) = self.ctx_menu.take() else { return };
+        let Some(it) = menu.items.get(index) else { return };
+        if !it.enabled {
+            return;
+        }
+        match &it.action {
+            CtxAction::Back => self.host.back(),
+            CtxAction::Forward => self.host.forward(),
+            CtxAction::Reload => self.host.reload(),
+            CtxAction::CopySelection => self.host.editing_action_cmd(EditingCommand::Copy),
+            CtxAction::Paste => self.host.editing_action_cmd(EditingCommand::Paste),
+            CtxAction::OpenInTab(uri) => {
+                if let Ok(url) = Url::parse(uri) {
+                    self.host.open_tab(url);
+                    self.sync_page_state();
+                }
+            }
+            CtxAction::CopyText(text) => {
+                cce_ui::widget::clipboard::copy_to_clipboard(text);
+            }
+            CtxAction::Download(uri) => self.host.download_uri(uri),
+            CtxAction::OpenExternal => self.open_external(),
+        }
+    }
+
     fn navigate(&mut self) {
         if let Some(url) = parse_url_input(&self.url.text, &self.settings.search_prefix) {
             self.host.load(url);
@@ -663,6 +799,36 @@ impl BrowserApp {
         }
     }
 
+    /// Draw the right-click menu: a small plate at the pointer, rows with a
+    /// hover highlight, disabled rows dimmed. Same primitives as everything
+    /// else in this chrome.
+    #[cfg(feature = "wpe")]
+    fn paint_ctx_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
+        let Some(menu) = self.ctx_menu.as_ref() else { return };
+        let r = menu.rect();
+        pc.plate(
+            r,
+            (8.0, 8.0, 8.0, 8.0),
+            [0.13, 0.14, 0.16, 1.0],
+            cce_ui::layout::bevel_width().min(3.0),
+        );
+        let hovered = menu.item_at(self.pointer.0, self.pointer.1);
+        for (i, it) in menu.items.iter().enumerate() {
+            let row = menu.row_rect(i);
+            if hovered == Some(i) && it.enabled {
+                pc.rounded_rect(row, 5.0, (true, true, true, true), TAB_ACTIVE_BG);
+            }
+            let color = if it.enabled { TEXT } else { TEXT_DIM };
+            pc.text(
+                Self::fit_text(&it.label, sans, 13.0, row.width - 20.0),
+                row.x + 10.0,
+                cce_ui::layout::align_text_y(row.y, row.height, 13.0, 0.0),
+                13.0,
+                color,
+            );
+        }
+    }
+
     fn cursor_from_click(&mut self, click_x: f32, field: &Rect) -> usize {
         let rel = click_x - field.x - URL_PAD_X;
         // Boundary x offsets from the same shaped buffer the bar draws (font=None,
@@ -760,6 +926,8 @@ impl Application for BrowserApp {
             #[cfg(feature = "wpe")]
             modal: None,
             #[cfg(feature = "wpe")]
+            ctx_menu: None,
+            #[cfg(feature = "wpe")]
             sender,
             font_system: cce_ui::create_font_system(),
         }
@@ -830,6 +998,11 @@ impl Application for BrowserApp {
                 if self.sync_modal() {
                     *needs_rebuild = true;
                 }
+                #[cfg(feature = "wpe")]
+                if let Some(info) = self.host.take_context_menu() {
+                    self.open_ctx_menu(info);
+                    *needs_rebuild = true;
+                }
                 if self.host.take_download_started() {
                     self.open_internal_page("cce://downloads");
                 }
@@ -863,6 +1036,13 @@ impl Application for BrowserApp {
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, _needs_rebuild: &mut bool) {
         self.pointer = (pos.x, pos.y);
+        #[cfg(feature = "wpe")]
+        if self.ctx_menu.is_some() {
+            // Hover highlight tracks the pointer; the page underneath does
+            // not see moves while the menu is up.
+            *_needs_rebuild = true;
+            return;
+        }
         if !hit(&self.bar(), pos.x, pos.y) {
             let s = self.scale as f32;
             self.host.mouse_move(pos.x * s, pos.y * s);
@@ -903,6 +1083,20 @@ impl Application for BrowserApp {
             }
             // Anything else is swallowed: the page must not receive clicks
             // while it is blocked waiting on this.
+            return None;
+        }
+
+        // An open context menu owns the next click: on an item it dispatches,
+        // anywhere else it just closes — either way the click goes no further.
+        #[cfg(feature = "wpe")]
+        if let Some(menu) = self.ctx_menu.as_ref() {
+            if pressed {
+                *needs_rebuild = true;
+                match (button, menu.item_at(pos.x, pos.y)) {
+                    (MouseButton::Left, Some(i)) => self.dispatch_ctx_action(i),
+                    _ => self.ctx_menu = None,
+                }
+            }
             return None;
         }
 
@@ -995,6 +1189,14 @@ impl Application for BrowserApp {
     }
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
+        #[cfg(feature = "wpe")]
+        if self.ctx_menu.is_some() && event.state == ElementState::Pressed {
+            // Any key dismisses; Escape is just the one people will mean.
+            self.ctx_menu = None;
+            *needs_rebuild = true;
+            return None;
+        }
+
         // A modal is exactly that: the page is blocked inside WebKit, so the
         // chrome's own chords must not fire behind it either.
         #[cfg(feature = "wpe")]
@@ -1297,6 +1499,8 @@ impl Application for BrowserApp {
             }
         });
 
+        #[cfg(feature = "wpe")]
+        self.paint_ctx_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_modal(&mut pc, &sans);
 

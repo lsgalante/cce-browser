@@ -315,6 +315,15 @@ impl WebKitHost {
                 on_authenticate as *const () as usize,
                 &self.prompts,
             );
+            // Right-click reaches the page as button 3; if the page does not
+            // preventDefault, WebKit asks for a menu here. Returning TRUE
+            // claims presentation, so the chrome draws it.
+            connect_raw(
+                wv,
+                "context-menu",
+                on_context_menu as *const () as usize,
+                &self.prompts,
+            );
             let (lw, lh) = self.logical_size();
             wpe_view_resized(view, lw, lh);
             wpe_view_set_visible(view, 1);
@@ -631,6 +640,22 @@ impl WebKitHost {
     /// blocked until [`Self::respond_dialog`].
     pub fn pending_dialog(&self) -> Option<PendingDialog> {
         self.prompts.borrow().dialog.as_ref().map(|(_, d)| d.clone())
+    }
+
+    /// One-shot: the context menu the page just requested, if any. Taken
+    /// rather than cloned — the chrome opens it once, at the pointer.
+    pub fn take_context_menu(&self) -> Option<ContextMenuInfo> {
+        self.prompts.borrow_mut().context_menu.take()
+    }
+
+    /// Fetch `uri` through WebKit's download pipeline — same signals, same
+    /// store, same `cce://downloads` page as a navigated download. This is
+    /// what "Download Link/Image" in the context menu dispatches to.
+    pub fn download_uri(&self, uri: &str) {
+        unsafe {
+            let c = cstr(uri);
+            webkit_web_view_download_uri(self.active_tab().webview, c.as_ptr());
+        }
     }
 
     pub fn pending_auth(&self) -> Option<PendingAuth> {
@@ -1057,6 +1082,19 @@ unsafe extern "C" fn on_failed(_d: *mut WebKitDownload, error: *mut GError, data
 pub(super) struct Prompts {
     dialog: Option<(*mut WebKitScriptDialog, PendingDialog)>,
     auth: Option<(*mut WebKitAuthenticationRequest, PendingAuth)>,
+    /// The page asked for a context menu; the chrome draws its own.
+    context_menu: Option<ContextMenuInfo>,
+}
+
+/// What was under the pointer when the page asked for a context menu, read
+/// off WebKit's hit test. The chrome builds its menu from this.
+#[derive(Debug, Clone, Default)]
+pub struct ContextMenuInfo {
+    /// `(uri, label)` when the hit was a link.
+    pub link: Option<(String, Option<String>)>,
+    pub image_uri: Option<String>,
+    pub is_selection: bool,
+    pub is_editable: bool,
 }
 
 /// A page's `alert` / `confirm` / `prompt`, waiting on the chrome.
@@ -1138,5 +1176,32 @@ unsafe extern "C" fn on_authenticate(
     };
     g_object_ref(request as *mut _);
     prompts.borrow_mut().auth = Some((request, pending));
+    1
+}
+
+/// The page asked for a context menu. Stash what the hit test says was under
+/// the pointer and claim presentation; the chrome draws the menu at the
+/// pointer position it already tracks (the hit test carries no coordinates).
+unsafe extern "C" fn on_context_menu(
+    _wv: *mut WebKitWebView,
+    _menu: *mut WebKitContextMenu,
+    hit: *mut WebKitHitTestResult,
+    data: gpointer,
+) -> gboolean {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    let mut info = ContextMenuInfo::default();
+    if !hit.is_null() {
+        if webkit_hit_test_result_context_is_link(hit) != 0 {
+            if let Some(uri) = from_cstr(webkit_hit_test_result_get_link_uri(hit)) {
+                info.link = Some((uri, from_cstr(webkit_hit_test_result_get_link_label(hit))));
+            }
+        }
+        if webkit_hit_test_result_context_is_image(hit) != 0 {
+            info.image_uri = from_cstr(webkit_hit_test_result_get_image_uri(hit));
+        }
+        info.is_selection = webkit_hit_test_result_context_is_selection(hit) != 0;
+        info.is_editable = webkit_hit_test_result_context_is_editable(hit) != 0;
+    }
+    prompts.borrow_mut().context_menu = Some(info);
     1
 }

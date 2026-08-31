@@ -16,4 +16,4 @@ mod host;
 
 // Not consumed yet — main.rs still drives ServoHost.
 #[allow(unused_imports)]
-pub use host::{PendingAuth, PendingDialog, Tab, WebKitHost};
+pub use host::{ContextMenuInfo, PendingAuth, PendingDialog, Tab, WebKitHost};
