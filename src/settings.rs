@@ -65,6 +65,7 @@ impl ColorScheme {
     }
 }
 
+#[cfg(feature = "servo")]
 impl From<ColorScheme> for servo::Theme {
     fn from(scheme: ColorScheme) -> Self {
         match scheme {

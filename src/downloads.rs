@@ -147,7 +147,9 @@ fn human_size(bytes: u64) -> String {
 }
 
 impl Downloads {
-    /// Start fetching `url` on a worker thread.
+    /// Start fetching `url` on a worker thread. Servo path only: WebKit does
+    /// its own fetching and enters the store through [`Downloads::adopt`].
+    #[cfg(feature = "servo")]
     pub fn start(self: &Arc<Self>, url: Url) {
         let dir = download_dir();
         let _ = std::fs::create_dir_all(&dir);
@@ -250,6 +252,7 @@ impl Downloads {
         }
     }
 
+    #[cfg(feature = "servo")]
     fn fetch(&self, id: u64, url: Url, path: PathBuf) -> Result<(), String> {
         let client = reqwest::blocking::Client::builder()
             .user_agent(concat!("cce-browser/", env!("CARGO_PKG_VERSION")))

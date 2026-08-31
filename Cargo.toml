@@ -7,21 +7,28 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-# The in-progress WPE WebKit port (see WPE-PORT.md). Off by default: the
-# shipping browser is still Servo. Needs `pacman -S wpewebkit`.
+# WPE WebKit is the engine as of 2026-08-30 (see WPE-PORT.md). Default, so a
+# plain `cargo build` — including another session's sweep or reinstall —
+# ships the right engine instead of silently reverting to Servo, which is
+# exactly what happened two days after the port landed. Needs
+# `pacman -S wpewebkit`.
+default = ["wpe"]
 wpe = ["dep:rustix"]
+# The retired Servo backend, kept buildable for comparison:
+#   cargo build --release -p cce-browser --no-default-features --features servo
+servo = ["dep:servo", "dep:dpi", "dep:euclid", "dep:rustls", "dep:reqwest", "dep:http"]
 
 [dependencies]
 cce-ui = { path = "../cce-ui" }
 calloop = "0.13.0"
 wayland-client = { version = "0.31", features = ["system"] }
-servo = "0.4"
+servo = { version = "0.4", optional = true }
 url = "2"
-http = "1"
-reqwest = { version = "0.12", features = ["blocking"] }
-dpi = "0.1"
-euclid = "0.22"
-rustls = { version = "0.23", features = ["aws-lc-rs"] }
+http = { version = "1", optional = true }
+reqwest = { version = "0.12", features = ["blocking"], optional = true }
+dpi = { version = "0.1", optional = true }
+euclid = { version = "0.22", optional = true }
+rustls = { version = "0.23", features = ["aws-lc-rs"], optional = true }
 log = "0.4"
 env_logger = "0.11"
 # Only used by the `wpe` backend, to hold GLib's changing pollfd set in one

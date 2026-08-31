@@ -10,6 +10,8 @@ mod downloads;
 mod lineedit;
 mod pages;
 mod settings;
+/// The retired Servo backend; compiled only under `--features servo`.
+#[cfg(feature = "servo")]
 mod webview;
 /// The in-progress WPE WebKit backend (see WPE-PORT.md). Compiled only under
 /// `--features wpe`; the shipping browser is still Servo.
@@ -25,10 +27,15 @@ use cce_ui::scene::paint::{DisplayList, PaintCtx};
 use cce_ui::widget::display::measure_text_width;
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
 
-#[cfg(not(feature = "wpe"))]
+#[cfg(all(not(feature = "wpe"), feature = "servo"))]
 use webview::ServoHost as Host;
 #[cfg(feature = "wpe")]
 use wpe::WebKitHost as Host;
+#[cfg(not(any(feature = "wpe", feature = "servo")))]
+compile_error!(
+    "cce-browser needs an engine: build with the default `wpe` feature \
+     (pacman -S wpewebkit), or --no-default-features --features servo"
+);
 
 /// Clipboard action, named by neither engine. Each backend maps it to its
 /// own vocabulary — Servo needs an `EditingActionEvent`, WebKit a named
@@ -347,42 +354,7 @@ fn parse_startup_arg(arg: &str, search_prefix: &str) -> Option<Url> {
     parse_url_input(arg, search_prefix)
 }
 
-fn dom_button(button: MouseButton) -> Option<servo::MouseButton> {
-    match button {
-        MouseButton::Left => Some(servo::MouseButton::Left),
-        MouseButton::Right => Some(servo::MouseButton::Right),
-        MouseButton::Middle => Some(servo::MouseButton::Middle),
-        _ => None,
-    }
-}
 
-fn dom_key(key: &Key) -> Option<servo::Key> {
-    Some(match key {
-        Key::Character(s) => servo::Key::Character(s.clone()),
-        Key::Named(NamedKey::Space) => servo::Key::Character(" ".into()),
-        Key::Named(n) => servo::Key::Named(match n {
-            NamedKey::Backspace => servo::NamedKey::Backspace,
-            NamedKey::Tab => servo::NamedKey::Tab,
-            NamedKey::Enter => servo::NamedKey::Enter,
-            NamedKey::Escape => servo::NamedKey::Escape,
-            NamedKey::ArrowDown => servo::NamedKey::ArrowDown,
-            NamedKey::ArrowLeft => servo::NamedKey::ArrowLeft,
-            NamedKey::ArrowRight => servo::NamedKey::ArrowRight,
-            NamedKey::ArrowUp => servo::NamedKey::ArrowUp,
-            NamedKey::End => servo::NamedKey::End,
-            NamedKey::Home => servo::NamedKey::Home,
-            NamedKey::PageDown => servo::NamedKey::PageDown,
-            NamedKey::PageUp => servo::NamedKey::PageUp,
-            NamedKey::Delete => servo::NamedKey::Delete,
-            NamedKey::Control => servo::NamedKey::Control,
-            NamedKey::Shift => servo::NamedKey::Shift,
-            NamedKey::Alt => servo::NamedKey::Alt,
-            NamedKey::Super => servo::NamedKey::Meta,
-            NamedKey::F5 => servo::NamedKey::F5,
-            NamedKey::Space => unreachable!(),
-        }),
-    })
-}
 
 
 
@@ -764,7 +736,7 @@ impl Application for BrowserApp {
         // Taken before `url` moves into the host.
         let url_text = url.to_string();
 
-        #[cfg(not(feature = "wpe"))]
+        #[cfg(all(not(feature = "wpe"), feature = "servo"))]
         let mut host = Host::new(sender, url, (1200, 800), settings.color_scheme.forces_dark());
         #[cfg(feature = "wpe")]
         let mut host = {

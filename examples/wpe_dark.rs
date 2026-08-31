@@ -5,6 +5,10 @@
 fn main() { eprintln!("build with --features wpe"); }
 
 #[cfg(feature = "wpe")]
+#[derive(Debug, Clone, Copy)]
+pub enum EditingCommand { Copy, Cut, Paste }
+
+#[cfg(feature = "wpe")]
 #[path = "../src/pages.rs"]
 mod pages;
 #[cfg(feature = "wpe")]

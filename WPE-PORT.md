@@ -1,13 +1,17 @@
 # Porting cce-browser from Servo to WPE WebKit
 
-Status as of 2026-08-28: **the port runs.** `cargo build --release -p cce-browser
---features wpe` produces a working WebKit browser — chrome, rendering, input,
-navigation, tabs, `cce:` pages, persistent cookies, downloads. It is **not the
-default**: the shipping browser is still Servo, and every step was verified to leave
-that build and its tests untouched.
+Status as of 2026-08-30: **WPE is the default engine.** A plain
+`cargo build --release -p cce-browser` produces the WebKit browser; the Servo backend
+survives behind `--no-default-features --features servo`.
+
+The flip was forced by an incident, not a ceremony: while WPE was opt-in, a routine
+featureless rebuild by another session silently reverted the installed browser to
+Servo — two days after the port landed, with the user's WebKit-stored logins invisible
+and the interstitial memory leak live again. An opt-in engine cannot survive a
+multi-session workspace; defaults are what other sessions build.
 
 ```sh
-cargo build --release -p cce-browser --features wpe
+cargo build --release -p cce-browser
 ```
 
 Written 2026-08-27 as a scoping document; kept as the record of what the port

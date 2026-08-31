@@ -11,13 +11,16 @@
 //! stores shared with the main thread.
 
 use std::fs::{self, OpenOptions};
+#[cfg(feature = "servo")]
 use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
+#[cfg(feature = "servo")]
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "servo")]
 use servo::protocol_handler::{
     DoneChannel, FetchContext, HttpStatus, NetworkError, ProtocolHandler, Request, Response,
     ResponseBody, ResourceFetchTiming,
@@ -324,6 +327,7 @@ impl CceProtocol {
     }
 }
 
+#[cfg(feature = "servo")]
 impl ProtocolHandler for CceProtocol {
     fn load(
         &self,

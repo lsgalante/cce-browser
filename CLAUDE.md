@@ -4,8 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`cce-browser` is a web browser for the CCE Wayland desktop environment, built on an
-**embedded, in-process Servo**. It is one crate of the multi-repo `cce` workspace (its
+`cce-browser` is a web browser for the CCE Wayland desktop environment, built on
+**embedded WPE WebKit** (since 2026-08-30; the original Servo backend survives behind
+a feature flag — see WPE-PORT.md for the whole port). It is one crate of the multi-repo `cce` workspace (its
 own git repo side-by-side with its siblings; published read-only at
 `https://git.lucas.co/cce-browser.git` via gitsite — the local repo is the source of
 truth, there is no push remote). Read the workspace-level
@@ -22,26 +23,34 @@ Five files, ~2.6k lines:
 | `src/downloads.rs` | the chrome-side download pipeline (Servo has none) |
 | `src/settings.rs` | the per-app KDL config |
 
-## Build: this crate is the expensive one
+## Build
 
-**Building this crate builds Servo.** That costs more than the entire rest of the
-workspace combined, and the linked binary is ~175 MB. WORKSPACE.md singles this crate
-out for that reason: leave it out of `cce-ui` sweeps unless someone has decided the
-rebuild is worth it. Before starting, check whether Servo artifacts are even present
-(`ls ../target/release/deps | grep -c servo`) — if `target/` has been pruned, the next
-build is from scratch, so kick it off early and in the background.
+The **default build is the WPE WebKit browser**: seconds to compile, ~14 MB linked
+against the system `libWPEWebKit` (`pacman -S wpewebkit` is the one prerequisite).
+That default is deliberate and load-bearing — while WPE was opt-in, a routine
+featureless rebuild by another session silently reverted the installed browser to
+Servo within two days. WORKSPACE.md's old "leave cce-browser out of `cce-ui` sweeps"
+rule was about Servo's build cost and no longer applies to the default build.
 
 ```sh
-cargo build --release -p cce-browser     # scope to this crate (shared ../target/)
-cargo test -p cce-browser                # the argv-parsing tests in main.rs
+cargo build --release -p cce-browser     # WPE WebKit (default); shared ../target/
+cargo test --release -p cce-browser      # release, or it builds Servo-debug from scratch
 ccebuild install --no-build cce-browser  # install binary + desktop entry
 ```
+
+**`--no-default-features --features servo` builds the retired Servo backend**, and
+*that* is the expensive one: it compiles Servo (more than the rest of the workspace
+combined, ~175 MB binary). Only pay for it deliberately. A last-known-good Servo
+binary sits at `~/.local/state/cce/browser/cce-browser-servo-fallback`.
 
 There is **no `Makefile`** here (most siblings have one) — install goes
 through `ccebuild` directly. `Cargo.lock` is gitignored in this crate. Running needs a
 live Wayland session; it will not run headless.
 
-`servo = "0.4"` comes from crates.io, not a git pin. Servo's embedding API churns
+The engine-specific sections below (frame pipeline, tabs, key routing) describe the
+**Servo backend** (`src/webview.rs`, feature `servo`); the WPE equivalents live in
+`src/wpe/` and are documented in WPE-PORT.md. `servo = "0.4"` comes from crates.io,
+not a git pin. Servo's embedding API churns
 hard between releases, so when a version bump breaks the build, expect the delegate
 trait, the input-event constructors, and `Preferences`/`Opts` to be where it broke.
 
