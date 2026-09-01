@@ -13,11 +13,12 @@ truth, there is no push remote). Read the workspace-level
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
-Five files, ~2.6k lines:
+Six files, ~2.8k lines:
 
 | file | what it owns |
 | --- | --- |
 | `src/main.rs` | `BrowserApp` — the `cce-ui` `Application`: chrome layout, hit-testing, the URL line editor, key/pointer routing |
+| `src/instance.rs` | single-instance forwarding: a later launch hands its argument to the running instance's socket and exits |
 | `src/webview.rs` | `ServoHost` — Servo boot, the delegate, one `WebView` per tab, the frame pipeline |
 | `src/pages.rs` | the `cce:` protocol handler and its History / Bookmarks stores |
 | `src/downloads.rs` | the chrome-side download pipeline (Servo has none) |
@@ -53,6 +54,22 @@ The engine-specific sections below (frame pipeline, tabs, key routing) describe 
 not a git pin. Servo's embedding API churns
 hard between releases, so when a version bump breaks the build, expect the delegate
 trait, the input-event constructors, and `Preferences`/`Opts` to be where it broke.
+
+## Single instance
+
+An external open (`xdg-open` → the desktop entry's `cce-browser %u`) spawns a
+fresh process per link. `src/instance.rs` turns that into a tab: `main()` tries
+`/tmp/cce-browser-<WAYLAND_DISPLAY>.sock` (the standard `cce_ui::ipc`
+convention; display keying isolates shadow sessions) before any engine or
+Wayland work, forwards `open <arg>` / `new-tab` and exits on success, or binds
+the socket and becomes the instance. The listener thread pushes
+`Message::OpenExternal` into calloop; `update()` parses the relayed argument
+with `parse_startup_arg` — it *is* a launch argument, so the URL bar's
+domain-guess parsing stays wrong for it — and a forwarded relative file path is
+canonicalized on the *sending* side, whose cwd it is relative to. Beyond
+tidiness this guards the profile dir: two engines must not share the plaintext
+cookie jar. There is deliberately no `--new-window` yet; raising the existing
+window on forward is also still open.
 
 ## The frame pipeline
 

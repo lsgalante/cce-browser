@@ -7,6 +7,7 @@
 //! input events; the URL bar is a small hand-rolled line editor.
 
 mod downloads;
+mod instance;
 mod lineedit;
 mod pages;
 mod settings;
@@ -243,6 +244,10 @@ pub enum Message {
     Spin,
     /// Last tab closed: exit the app.
     Quit,
+    /// A later launch forwarded its argument here (see `instance.rs`):
+    /// `Some` is a URL or file path to open in a new tab, `None` a bare
+    /// launch that becomes a blank tab.
+    OpenExternal(Option<String>),
 }
 
 struct BrowserApp {
@@ -890,6 +895,8 @@ impl Application for BrowserApp {
     type Message = Message;
 
     fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
+        // Serve the instance socket claimed in main(), if this launch won it.
+        instance::spawn_listener(sender.clone());
         let settings = settings::load();
         downloads::set_download_dir(settings.download_dir.clone());
         // Optional CLI arg: the start URL (same parsing as the URL bar);
@@ -1014,6 +1021,21 @@ impl Application for BrowserApp {
                 }
             }
             Message::Quit => *exit = true,
+            Message::OpenExternal(arg) => {
+                match arg {
+                    Some(arg) => {
+                        // Same parsing as the launch argument, and for the
+                        // same reason: this *is* one, relayed.
+                        if let Some(url) = parse_startup_arg(&arg, &self.settings.search_prefix) {
+                            self.host.open_tab(url);
+                            self.url_focused = false;
+                            self.sync_page_state();
+                        }
+                    }
+                    None => self.new_tab(),
+                }
+                *needs_rebuild = true;
+            }
         }
     }
 
@@ -1518,7 +1540,14 @@ impl Application for BrowserApp {
 
 fn main() {
     env_logger::init();
+    // Hand the launch to a running instance before any engine work: an
+    // external open (`xdg-open` → `cce-browser %u`) becomes a tab there,
+    // and this process never touches Wayland or the shared profile dir.
+    if instance::forward_or_claim(std::env::args().nth(1).as_deref()) {
+        return;
+    }
     cce_ui::engine::run::<BrowserApp>();
+    instance::cleanup();
 }
 
 #[cfg(test)]
