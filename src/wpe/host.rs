@@ -176,10 +176,13 @@ impl WebKitHost {
                 "wpe_display_connect failed"
             );
 
-            // Persisted profile: without a data directory WebKit keeps cookies
-            // in memory only, so every launch starts logged out of every site.
-            // Same location and the same 0700 reasoning as the Servo backend —
-            // the jar holds live sessions.
+            // Persisted profile. The data directory persists website data
+            // (localStorage, IndexedDB, service workers) on its own, but the
+            // cookie store stays memory-only until it is explicitly given a
+            // file — the set_persistent_storage call below, without which
+            // every launch starts logged out of every site even though the
+            // rest of the profile survives. Same location and the same 0700
+            // reasoning as the Servo backend — the jar holds live sessions.
             let profile = crate::pages::state_dir().join("profile");
             let _ = std::fs::create_dir_all(&profile);
             {
@@ -191,6 +194,12 @@ impl WebKitHost {
                 cstr(&profile.join("cache").to_string_lossy()),
             );
             let session = webkit_network_session_new(data_dir.as_ptr(), cache_dir.as_ptr());
+            let cookie_db = cstr(&profile.join("cookies.sqlite").to_string_lossy());
+            webkit_cookie_manager_set_persistent_storage(
+                webkit_network_session_get_cookie_manager(session),
+                cookie_db.as_ptr(),
+                WebKitCookiePersistentStorage::WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE,
+            );
 
             let history = std::sync::Arc::new(crate::pages::History::load());
             let bookmarks = std::sync::Arc::new(crate::pages::Bookmarks::load());
@@ -486,6 +495,24 @@ impl WebKitHost {
         // underlying socket would spin the loop.
         if let Some(p) = &self.poll {
             p.drain();
+        }
+        // `cce://cookies/clear` runs on WebKit's fetch path and cannot reach
+        // the session from there, so it sets the flag and this acts on it —
+        // the same relay `ServoHost::pump` uses. Timespan 0 clears them all.
+        if self
+            .clear_cookies
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            unsafe {
+                webkit_website_data_manager_clear(
+                    webkit_network_session_get_website_data_manager(self.session),
+                    WebKitWebsiteDataTypes::WEBKIT_WEBSITE_DATA_COOKIES,
+                    0,
+                    std::ptr::null_mut(),
+                    None,
+                    std::ptr::null_mut(),
+                );
+            }
         }
         unsafe {
             while g_main_context_iteration(std::ptr::null_mut(), 0) != 0 {}

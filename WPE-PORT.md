@@ -278,9 +278,16 @@ been served one), but it is a far higher bar than the marketing page that earlie
 used: a heavy JS application behind Cloudflare's own protection, reached through a
 login. The engine-identity worry that motivated half this document has not materialised.
 
-**Cookies persist.** The login survives in WebKit's own origin-keyed store under
-`~/.local/state/cce/browser/profile/storage`. (`cookie_jar.json` beside it is Servo's
-format, now dead weight.)
+**Website data persists — but cookies did not, at first.** What survived restarts
+in the early days was WebKit's origin-keyed store under
+`~/.local/state/cce/browser/profile/storage` (localStorage, IndexedDB, service
+workers), which a persistent `WebKitNetworkSession` writes on its own — and which
+made this section originally claim "cookies persist". They didn't: WebKit's cookie
+store is memory-only until `webkit_cookie_manager_set_persistent_storage()` names a
+file, so cookie-backed logins (Google) evaporated with the process while
+token-in-localStorage logins (Cloudflare) survived, disguising the gap. Fixed
+2026-09-01: cookies now live in `profile/cookies.sqlite`. (`cookie_jar.json` beside
+it is Servo's format, now dead weight.)
 
 **Three bugs found by use, none by testing:**
 
