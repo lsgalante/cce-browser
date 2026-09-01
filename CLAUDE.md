@@ -74,8 +74,13 @@ with `parse_startup_arg` — it *is* a launch argument, so the URL bar's
 domain-guess parsing stays wrong for it — and a forwarded relative file path is
 canonicalized on the *sending* side, whose cwd it is relative to. Beyond
 tidiness this guards the profile dir: two engines must not share the plaintext
-cookie jar. There is deliberately no `--new-window` yet; raising the existing
-window on forward is also still open.
+cookie jar. There is deliberately no `--new-window` yet. On every forwarded
+open the app asks the compositor to `focus-window cce-browser` over the
+control socket — focus pans the camera to the window, which is what makes a
+forwarded link *visible*; without it the tab opens in a window parked
+off-camera and the click looks inert (that shipped for half a day). The
+compositor's xdg-activation is not the route: it deliberately answers with an
+attention notification, not focus.
 
 The other half of click-to-tab latency is inside WebKit: creating a webview
 and spawning its WebProcess is ~200ms, so the WPE host keeps a hidden **spare

@@ -1034,6 +1034,16 @@ impl Application for BrowserApp {
                     }
                     None => self.new_tab(),
                 }
+                // Bring the window to the user: focus + camera pan + raise
+                // over the control socket. A fresh launch used to get this
+                // from the compositor for free; without it the tab opens in
+                // a window parked somewhere off-camera and the click looks
+                // like it did nothing. (xdg-activation is not the route: the
+                // compositor deliberately answers it with an attention
+                // notification, not focus.)
+                std::thread::spawn(|| {
+                    let _ = cce_ui::ipc::send_command("cce", "focus-window cce-browser");
+                });
                 *needs_rebuild = true;
             }
         }
