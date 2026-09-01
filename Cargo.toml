@@ -39,6 +39,15 @@ rustix = { version = "0.38", features = ["event"], optional = true }
 bindgen = "0.72"
 pkg-config = "0.3"
 
+# The desktop entry's Exec target: a forwarder that links (almost) nothing,
+# so the click-to-tab path skips the ~20ms of library loading the full
+# binary pays before main(). Explicit [[bin]] only for the name — src/bin/
+# autodiscovery would call it `open`. ccebuild installs it automatically
+# via cargo metadata; no Makefile involvement.
+[[bin]]
+name = "cce-browser-open"
+path = "src/bin/open.rs"
+
 # The WPE examples need the generated bindings, so they only build with
 # the feature — otherwise `cargo test` would try them on a default build.
 

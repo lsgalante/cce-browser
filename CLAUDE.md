@@ -13,12 +13,13 @@ truth, there is no push remote). Read the workspace-level
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
-Six files, ~2.8k lines:
+Seven files, ~2.9k lines:
 
 | file | what it owns |
 | --- | --- |
 | `src/main.rs` | `BrowserApp` — the `cce-ui` `Application`: chrome layout, hit-testing, the URL line editor, key/pointer routing |
 | `src/instance.rs` | single-instance forwarding: a later launch hands its argument to the running instance's socket and exits |
+| `src/bin/open.rs` | `cce-browser-open`, the desktop entry's `Exec` target: a ~500KB forwarder linking only libc (~4ms vs ~22ms through the full binary), exec'ing `cce-browser` when no instance answers |
 | `src/webview.rs` | `ServoHost` — Servo boot, the delegate, one `WebView` per tab, the frame pipeline |
 | `src/pages.rs` | the `cce:` protocol handler and its History / Bookmarks stores |
 | `src/downloads.rs` | the chrome-side download pipeline (Servo has none) |
@@ -57,12 +58,17 @@ trait, the input-event constructors, and `Preferences`/`Opts` to be where it bro
 
 ## Single instance
 
-An external open (`xdg-open` → the desktop entry's `cce-browser %u`) spawns a
-fresh process per link. `src/instance.rs` turns that into a tab: `main()` tries
+An external open (the desktop entry's `%u`) spawns a fresh process per link.
+`src/instance.rs` turns that into a tab: `main()` tries
 `/tmp/cce-browser-<WAYLAND_DISPLAY>.sock` (the standard `cce_ui::ipc`
 convention; display keying isolates shadow sessions) before any engine or
 Wayland work, forwards `open <arg>` / `new-tab` and exits on success, or binds
-the socket and becomes the instance. The listener thread pushes
+the socket and becomes the instance. The desktop entry's `Exec` is
+**`cce-browser-open`** (`src/bin/open.rs`), a forwarder that links only libc —
+the full binary spends ~20ms loading libWPEWebKit before `main()` runs, the
+slim bin forwards in ~4ms — and execs `cce-browser` when nothing answers. It
+deliberately duplicates the tiny client protocol rather than import anything;
+keep it, `instance.rs`, and the socket-path convention in agreement. The listener thread pushes
 `Message::OpenExternal` into calloop; `update()` parses the relayed argument
 with `parse_startup_arg` — it *is* a launch argument, so the URL bar's
 domain-guess parsing stays wrong for it — and a forwarded relative file path is
