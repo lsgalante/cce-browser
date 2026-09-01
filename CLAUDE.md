@@ -77,6 +77,15 @@ tidiness this guards the profile dir: two engines must not share the plaintext
 cookie jar. There is deliberately no `--new-window` yet; raising the existing
 window on forward is also still open.
 
+The other half of click-to-tab latency is inside WebKit: creating a webview
+and spawning its WebProcess is ~200ms, so the WPE host keeps a hidden **spare
+webview** prewarmed on about:blank and `open_tab` adopts it (see the `spare`
+field in `src/wpe/host.rs`). Measured end to end: a link is a live tab in
+~65ms (internal page) / ~120ms (example.com, warm) against ~250/~400ms
+without. WPE's platform API has no
+`webkit_web_context_prewarm_spare_web_process` (the GTK port's answer), which
+is why the spare is hand-rolled.
+
 ## The frame pipeline
 
 Servo renders into a **`SoftwareRenderingContext`** (CPU, no GPU handoff), one context

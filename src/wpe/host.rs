@@ -146,6 +146,14 @@ pub struct WebKitHost {
     last_frame: Option<(Vec<u8>, u32, u32)>,
     /// Installed on every webview when force-dark is on.
     ucm: *mut WebKitUserContentManager,
+    /// A pre-built hidden webview parked on about:blank, WebProcess already
+    /// spawned. `open_tab` adopts it and pays only the navigation — measured
+    /// at ~65ms to a live internal page against ~250ms building from scratch
+    /// (~200ms of which is webview creation + process spawn). The price is
+    /// one idle WebProcess held per window. Theme changes reach it anyway:
+    /// the colour scheme is display-level and force-dark lives in the shared
+    /// user-content-manager it was built with.
+    spare: Option<(*mut WebKitWebView, *mut WPEView, Rc<TabState>)>,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -270,6 +278,7 @@ impl WebKitHost {
                 prompts,
                 last_frame: None,
                 ucm: webkit_user_content_manager_new(),
+                spare: None,
             };
             host.open_tab(url);
             host
@@ -334,11 +343,40 @@ impl WebKitHost {
         }
     }
 
-    pub fn open_tab(&mut self, url: Url) {
+    /// Build the hidden spare webview so its WebProcess is up before the
+    /// next `open_tab` needs it.
+    fn prewarm_spare(&mut self) {
+        if self.spare.is_some() {
+            return;
+        }
         let state = Rc::new(TabState::default());
+        let url = Url::parse("about:blank").expect("about:blank");
+        let (wv, view) = self.build_webview(&url, &state);
+        unsafe {
+            wpe_view_unmap(view);
+            wpe_view_set_visible(view, 0);
+        }
+        self.spare = Some((wv, view, state));
+    }
+
+    pub fn open_tab(&mut self, url: Url) {
+        let (webview, view, state) = match self.spare.take() {
+            // Adopt the prewarmed webview; only the navigation is paid.
+            Some((wv, view, state)) => {
+                unsafe {
+                    let curl = cstr(url.as_str());
+                    webkit_web_view_load_uri(wv, curl.as_ptr());
+                }
+                (wv, view, state)
+            }
+            None => {
+                let state = Rc::new(TabState::default());
+                let (wv, view) = self.build_webview(&url, &state);
+                (wv, view, state)
+            }
+        };
         state.loading.set(true);
         *state.url.borrow_mut() = Some(url.clone());
-        let (webview, view) = self.build_webview(&url, &state);
         self.tabs.push(Tab {
             webview,
             view,
@@ -349,6 +387,10 @@ impl WebKitHost {
             image: None,
         });
         self.activate(self.tabs.len() - 1);
+        // Replace the spare right away, but after the load started, so the
+        // page fetch runs while this builds — measured, it does not show up
+        // in the click-to-tab time.
+        self.prewarm_spare();
     }
 
     /// Close a tab. Returns false when that was the last one (the app should
