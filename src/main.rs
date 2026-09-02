@@ -10,6 +10,7 @@ mod downloads;
 mod instance;
 mod lineedit;
 mod pages;
+mod session;
 mod settings;
 /// The retired Servo backend; compiled only under `--features servo`.
 #[cfg(feature = "servo")]
@@ -282,6 +283,8 @@ struct BrowserApp {
     /// with) for URL-bar caret/click metrics via `shaped_cluster_offsets` —
     /// `measure_text_width`'s inked-extent numbers drift off the drawn glyphs.
     font_system: cce_ui::cosmic_text::FontSystem,
+    /// The open-tab set, persisted across restarts (see `session.rs`).
+    session: session::Session,
 }
 
 fn hit(r: &Rect, x: f32, y: f32) -> bool {
@@ -669,6 +672,20 @@ impl BrowserApp {
         });
     }
 
+    /// Write the open-tab set to the session store (a no-op when nothing
+    /// changed). Blank tabs are not worth resurrecting, so they are skipped —
+    /// which also means a browser left on nothing but "New Tab" starts fresh.
+    fn persist_session(&mut self) {
+        let active = self.host.active_index();
+        let tabs: Vec<(String, bool)> = (0..self.host.tab_count())
+            .filter_map(|i| {
+                let url = self.host.tab(i)?.url.as_ref()?.to_string();
+                (url != "about:blank").then_some((url, i == active))
+            })
+            .collect();
+        self.session.save(&tabs);
+    }
+
     /// New blank tab with the URL bar focused for typing.
     fn new_tab(&mut self) {
         let url = Url::parse("about:blank").expect("about:blank");
@@ -676,15 +693,20 @@ impl BrowserApp {
         self.url = lineedit::LineEdit::default();
         self.url_focused = true;
         self.sync_page_state();
+        self.persist_session();
     }
 
     /// Close a tab; returns `Message::Quit` when it was the last one.
     fn close_tab(&mut self, index: usize) -> Option<Message> {
         if !self.host.close_tab(index) {
+            // Deliberately emptied: save the empty set so the next launch
+            // starts on the homepage instead of restoring what was closed.
+            self.persist_session();
             return Some(Message::Quit);
         }
         self.url_focused = false;
         self.sync_page_state();
+        self.persist_session();
         None
     }
 
@@ -692,6 +714,7 @@ impl BrowserApp {
         self.host.activate(index);
         self.url_focused = false;
         self.sync_page_state();
+        self.persist_session();
     }
 
     /// Show an internal page: reuse a tab already on it (reloading, so
@@ -713,6 +736,7 @@ impl BrowserApp {
         self.host.open_tab(url);
         self.url_focused = false;
         self.sync_page_state();
+        self.persist_session();
     }
 
     /// Widest prefix of `text` fitting `avail`, with a "…"-style tail cut.
@@ -899,23 +923,51 @@ impl Application for BrowserApp {
         instance::spawn_listener(sender.clone());
         let settings = settings::load();
         downloads::set_download_dir(settings.download_dir.clone());
-        // Optional CLI arg: the start URL (same parsing as the URL bar);
-        // otherwise the configured homepage.
-        let url = std::env::args()
+        // Optional CLI arg: the start URL (same parsing as the URL bar).
+        let arg = std::env::args()
             .nth(1)
-            .and_then(|arg| parse_startup_arg(&arg, &settings.search_prefix))
-            .or_else(|| parse_url_input(&settings.homepage, &settings.search_prefix))
-            .unwrap_or_else(|| Url::parse(settings::DEFAULT_HOMEPAGE).expect("home url"));
-        // Taken before `url` moves into the host.
-        let url_text = url.to_string();
+            .and_then(|arg| parse_startup_arg(&arg, &settings.search_prefix));
+        // The previous run's tabs. When there are some, they come back in
+        // order and an argv URL opens as an extra tab on top of them —
+        // otherwise the argument (or the configured homepage) is the one
+        // starting tab, as before session restore existed.
+        let mut session = session::Session::new();
+        let (saved, saved_active) = session.load();
+        let restored = !saved.is_empty();
+        let mut queue = saved;
+        if queue.is_empty() {
+            queue.push(
+                arg.clone()
+                    .or_else(|| parse_url_input(&settings.homepage, &settings.search_prefix))
+                    .unwrap_or_else(|| {
+                        Url::parse(settings::DEFAULT_HOMEPAGE).expect("home url")
+                    }),
+            );
+        }
+        let first = queue.remove(0);
 
         #[cfg(all(not(feature = "wpe"), feature = "servo"))]
-        let mut host = Host::new(sender, url, (1200, 800), settings.color_scheme.forces_dark());
+        let mut host = Host::new(sender, first, (1200, 800), settings.color_scheme.forces_dark());
         #[cfg(feature = "wpe")]
         let mut host = {
             let _ = &sender; // WPE wakes through register_sources, not a waker
-            Host::new(url, (1200, 800))
+            Host::new(first, (1200, 800))
         };
+        for url in queue {
+            host.open_tab(url);
+        }
+        if restored {
+            host.activate(saved_active.min(host.tab_count() - 1));
+            if let Some(url) = arg {
+                host.open_tab(url);
+            }
+        }
+        // The bar mirrors whichever tab ended up active.
+        let url_text = host
+            .url()
+            .map(|u| u.to_string())
+            .filter(|s| s != "about:blank")
+            .unwrap_or_default();
         host.set_history_enabled(settings.history);
         host.set_color_scheme_dark(settings.color_scheme.is_dark());
         #[cfg(feature = "wpe")]
@@ -937,6 +989,7 @@ impl Application for BrowserApp {
             #[cfg(feature = "wpe")]
             sender,
             font_system: cce_ui::create_font_system(),
+            session,
         }
     }
 
@@ -1015,6 +1068,9 @@ impl Application for BrowserApp {
                 }
                 if dirty {
                     self.sync_page_state();
+                    // Navigation reaches the tab set through these signals,
+                    // so this is where an address change gets persisted.
+                    self.persist_session();
                 }
                 if new_frame || dirty {
                     *needs_rebuild = true;
@@ -1030,6 +1086,7 @@ impl Application for BrowserApp {
                             self.host.open_tab(url);
                             self.url_focused = false;
                             self.sync_page_state();
+                            self.persist_session();
                         }
                     }
                     None => self.new_tab(),

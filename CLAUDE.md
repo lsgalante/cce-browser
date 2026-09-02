@@ -13,7 +13,7 @@ truth, there is no push remote). Read the workspace-level
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
-Seven files, ~2.9k lines:
+Eight files, ~3k lines:
 
 | file | what it owns |
 | --- | --- |
@@ -23,6 +23,7 @@ Seven files, ~2.9k lines:
 | `src/webview.rs` | `ServoHost` — Servo boot, the delegate, one `WebView` per tab, the frame pipeline |
 | `src/pages.rs` | the `cce:` protocol handler and its History / Bookmarks stores |
 | `src/downloads.rs` | the chrome-side download pipeline (Servo has none) |
+| `src/session.rs` | open-tab persistence: the tab set survives a restart |
 | `src/settings.rs` | the per-app KDL config |
 
 ## Build
@@ -133,6 +134,32 @@ frame, so switching shows content instantly while the resize refreshes it.
   `UserContentManager` — parked in `pending_new`, and adopted as tabs by the next
   `pump`. They are built before anyone told them the theme, so `pump` calls
   `notify_theme_change` on adoption.
+
+### Session restore
+
+The open-tab set persists across restarts: `src/session.rs` writes
+`~/.local/state/cce/browser/tabs.tsv` (one `<active-flag>\t<url>` line per tab)
+and startup restores it, engine-agnostically — the chrome reads tabs back
+through the shared host surface, so both backends get it for free. Points that
+are choices, not accidents:
+
+- **Saves are eager, not on-exit** — `persist_session()` fires on every tab
+  open/close/switch and on navigation (via the Spin-dirty path), so a crash or
+  a compositor-side window close loses nothing. `Session::save` compares
+  against the last serialization and skips no-op writes, which is what keeps
+  the loading-time signal storm off the disk.
+- **Closing the last tab saves the empty set** before `Message::Quit`, so a
+  deliberately emptied browser starts fresh on the homepage instead of
+  resurrecting what was just closed. Quitting via the window close keeps the
+  tabs (they were never closed).
+- **A launch argument opens as an extra tab on top of the restored set**; only
+  when there is nothing to restore does it become the single starting tab
+  (then falling back to the homepage, as before).
+- **`about:blank` tabs are skipped on save** — a "New Tab" is not worth
+  resurrecting.
+- Restore is **eager**: every saved tab starts loading at launch (one
+  WebProcess each on WPE). Fine at normal tab counts; lazy restore is the
+  upgrade path if someone lives with dozens.
 
 ## The chrome is hand-rolled
 
