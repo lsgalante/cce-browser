@@ -2,9 +2,11 @@
 //!
 //! Servo renders pages into a CPU (software) rendering context; each
 //! finished frame is read back and uploaded to cce-ui's image registry,
-//! then drawn as a single quad under a thin chrome bar (back / forward /
-//! reload / URL field). Input over the page area is translated into Servo
-//! input events; the URL bar is a small hand-rolled line editor.
+//! then drawn as a single quad under the chrome: a circle menu that rests
+//! as a small orb in the window corner and opens into the utility bar
+//! (tabs, back / forward / reload, URL field). Input over the page area is
+//! translated into Servo input events; the URL bar is a small hand-rolled
+//! line editor.
 
 mod downloads;
 mod instance;
@@ -54,6 +56,15 @@ const BAR_MARGIN: f32 = 10.0;
 const BAR_H: f32 = BAR_PAD + TAB_H + ROW_GAP + BTN_H + BAR_PAD;
 const BAR_RADIUS: f32 = 10.0;
 const BAR_PAD: f32 = 7.0;
+/// Diameter of the collapsed chrome — the orb the bar folds down to. One
+/// control's height plus the bar padding, so the closed and open plates
+/// share an edge thickness.
+const ORB_D: f32 = BAR_PAD + BTN_H + BAR_PAD;
+/// Seconds for the orb to unfold into the bar (and back).
+const CHROME_ANIM_S: f32 = 0.18;
+/// Hamburger glyph inside the orb: line length and spacing.
+const ORB_GLYPH_W: f32 = 14.0;
+const ORB_GLYPH_GAP: f32 = 4.5;
 const TAB_H: f32 = 24.0;
 const TAB_GAP: f32 = 4.0;
 const TAB_MIN_W: f32 = 56.0;
@@ -263,6 +274,11 @@ struct BrowserApp {
     /// one the dialog fields use.
     url: lineedit::LineEdit,
     url_focused: bool,
+    /// The circle menu: closed is the orb, open is the full utility bar.
+    /// `chrome_t` is the unfold progress (0 = orb, 1 = bar), animated in
+    /// `tick` toward whichever state `chrome_open` names.
+    chrome_open: bool,
+    chrome_t: f32,
     loading: bool,
     /// Page title; drives the toplevel title (the engine re-applies
     /// `settings().title` whenever it changes).
@@ -444,6 +460,67 @@ impl BrowserApp {
         bar_rect(self.win, self.settings.bar_position)
     }
 
+    /// The closed chrome: a circle in the bar's corner nearest the anchored
+    /// window edge, so the bar unfolds away from it and the orb never moves.
+    fn orb_rect(&self) -> Rect {
+        let bar = self.bar();
+        let y = match self.settings.bar_position {
+            settings::BarPosition::Top => bar.y,
+            settings::BarPosition::Bottom => bar.y + bar.height - ORB_D,
+        };
+        Rect { x: bar.x, y, width: ORB_D, height: ORB_D }
+    }
+
+    /// Unfold progress with easing applied — what the plate is drawn from.
+    fn chrome_ease(&self) -> f32 {
+        let t = self.chrome_t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// The chrome plate as currently drawn — the orb, the bar, or the
+    /// in-between shape while it unfolds — and its corner radius.
+    fn chrome_plate(&self) -> (Rect, f32) {
+        let e = self.chrome_ease();
+        let orb = self.orb_rect();
+        let bar = self.bar();
+        let lerp = |a: f32, b: f32| a + (b - a) * e;
+        let plate = Rect {
+            x: lerp(orb.x, bar.x),
+            y: lerp(orb.y, bar.y),
+            width: lerp(orb.width, bar.width),
+            height: lerp(orb.height, bar.height),
+        };
+        (plate, lerp(ORB_D / 2.0, BAR_RADIUS))
+    }
+
+    /// Whether a pointer position is over the chrome — the circle proper
+    /// when closed (its corners belong to the page), the plate otherwise.
+    fn chrome_hit(&self, x: f32, y: f32) -> bool {
+        if self.chrome_t <= 0.0 {
+            let o = self.orb_rect();
+            let (cx, cy) = (o.x + o.width / 2.0, o.y + o.height / 2.0);
+            let r = o.width / 2.0;
+            (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r
+        } else {
+            hit(&self.chrome_plate().0, x, y)
+        }
+    }
+
+    fn open_chrome(&mut self) {
+        self.chrome_open = true;
+    }
+
+    /// Fold the bar back into the orb; drops URL-bar focus with it, since
+    /// a field that is not on screen must not keep eating keystrokes.
+    fn close_chrome(&mut self) {
+        self.chrome_open = false;
+        if self.url_focused {
+            self.url_focused = false;
+            self.url.selection = None;
+            self.sync_page_state();
+        }
+    }
+
     /// The page fills the whole window; the utility bar floats above it.
     fn content_px(&self) -> (u32, u32) {
         (
@@ -608,6 +685,8 @@ impl BrowserApp {
             self.url_focused = false;
             self.url.selection = None;
             self.loading = true;
+            // Submitting is the menu's "pick": it folds away to show the page.
+            self.chrome_open = false;
         }
     }
 
@@ -692,6 +771,9 @@ impl BrowserApp {
         self.host.open_tab(url);
         self.url = lineedit::LineEdit::default();
         self.url_focused = true;
+        // The focused field has to be on screen, so a new tab unfolds the
+        // menu even when it was opened by chord.
+        self.open_chrome();
         self.sync_page_state();
         self.persist_session();
     }
@@ -980,6 +1062,8 @@ impl Application for BrowserApp {
             pointer: (0.0, 0.0),
             url: lineedit::LineEdit::with_text(url_text),
             url_focused: false,
+            chrome_open: false,
+            chrome_t: 0.0,
             loading: true,
             title: None,
             #[cfg(feature = "wpe")]
@@ -1106,7 +1190,19 @@ impl Application for BrowserApp {
         }
     }
 
-    fn tick(&mut self, _dt: f32, _needs_rebuild: &mut bool) {}
+    fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
+        let target = if self.chrome_open { 1.0 } else { 0.0 };
+        if self.chrome_t != target {
+            let step = dt / CHROME_ANIM_S;
+            self.chrome_t = if target > self.chrome_t {
+                (self.chrome_t + step).min(1.0)
+            } else {
+                (self.chrome_t - step).max(0.0)
+            };
+            // Keeps the runner's warm loop alive until the morph lands.
+            *needs_rebuild = true;
+        }
+    }
 
     fn handle_focus_change(&mut self, focused: bool, needs_rebuild: &mut bool) {
         // A settings change can move the bar to the other edge, so a reload
@@ -1132,7 +1228,7 @@ impl Application for BrowserApp {
             *_needs_rebuild = true;
             return;
         }
-        if !hit(&self.bar(), pos.x, pos.y) {
+        if !self.chrome_hit(pos.x, pos.y) {
             let s = self.scale as f32;
             self.host.mouse_move(pos.x * s, pos.y * s);
         }
@@ -1190,11 +1286,19 @@ impl Application for BrowserApp {
         }
 
         let bar = self.bar();
-        if hit(&bar, pos.x, pos.y) {
+        if self.chrome_hit(pos.x, pos.y) {
             if !pressed || !matches!(button, MouseButton::Left | MouseButton::Middle) {
                 return None;
             }
             *needs_rebuild = true;
+            // Closed (or still folding): the whole orb is the open control.
+            // Anything folding open is treated as the bar it is becoming.
+            if !self.chrome_open {
+                if button == MouseButton::Left {
+                    self.open_chrome();
+                }
+                return None;
+            }
             // Tab strip: activate / close (x region or middle click) / new tab.
             let count = self.host.tab_count();
             for i in 0..count {
@@ -1208,6 +1312,9 @@ impl Application for BrowserApp {
                     return self.close_tab(i);
                 }
                 self.switch_tab(i);
+                // Picking a tab is a menu choice: the bar folds away. Closing
+                // one is not — several may go in a row.
+                self.close_chrome();
                 return None;
             }
             if button != MouseButton::Left {
@@ -1243,11 +1350,10 @@ impl Application for BrowserApp {
             return None;
         }
 
-        // Page area: a click dismisses URL-bar focus, then goes to the page.
-        if self.url_focused && pressed {
-            self.url_focused = false;
-            self.url.selection = None;
-            self.sync_page_state();
+        // Page area: a click folds the menu (and URL-bar focus with it),
+        // then goes to the page.
+        if self.chrome_open && pressed {
+            self.close_chrome();
             *needs_rebuild = true;
         }
         match button {
@@ -1263,7 +1369,7 @@ impl Application for BrowserApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, _needs_rebuild: &mut bool) {
-        if hit(&self.bar(), pos.x, pos.y) {
+        if self.chrome_hit(pos.x, pos.y) {
             return;
         }
         // WheelDelta keeps cce-ui's winit sign convention (positive = scroll
@@ -1405,6 +1511,7 @@ impl Application for BrowserApp {
                             return None;
                         }
                         "l" => {
+                            self.open_chrome();
                             self.url_focused = true;
                             self.select_all_url();
                             *needs_rebuild = true;
@@ -1420,6 +1527,12 @@ impl Application for BrowserApp {
             }
             if event.logical_key == Key::Named(NamedKey::F5) {
                 self.host.reload();
+                return None;
+            }
+            // An open menu owns Escape; closed, the page keeps it.
+            if self.chrome_open && event.logical_key == Key::Named(NamedKey::Escape) {
+                self.close_chrome();
+                *needs_rebuild = true;
                 return None;
             }
         }
@@ -1449,144 +1562,188 @@ impl Application for BrowserApp {
             pc.text("Loading...", BAR_MARGIN + 6.0, y, 13.0, TEXT_DIM);
         }
 
-        // Floating utility bar: a blur-behind plate frosting the page under it.
-        let radii = (BAR_RADIUS, BAR_RADIUS, BAR_RADIUS, BAR_RADIUS);
-        pc.plate(bar, radii, BAR_FILL, cce_ui::layout::bevel_width().min(4.0));
-        if self.loading {
-            pc.clip_rounded(bar, BAR_RADIUS, |pc| {
-                pc.quad(
-                    Rect { x: bar.x, y: bar.y + bar.height - 2.0, width: bar.width, height: 2.0 },
-                    ACCENT,
+        // The chrome plate: the orb, the bar, or the shape between them
+        // while it unfolds. Blur-behind either way, frosting the page.
+        let e = self.chrome_ease();
+        let (plate, radius) = self.chrome_plate();
+        // A circle when closed — exponent 2 with half-extent radii — easing
+        // into the DE's own corner shape as it becomes the bar, so the orb is
+        // round even in a squircle DE and the open bar matches its neighbours.
+        let shape = 2.0 + (cce_ui::layout::corner_shape() - 2.0) * e;
+        pc.plate_shaped(
+            plate,
+            (radius, radius, radius, radius),
+            BAR_FILL,
+            cce_ui::layout::bevel_width().min(4.0),
+            Some(shape),
+        );
+        let (sans, ..) = cce_ui::layout::read_preferred_fonts();
+
+        // Closed: the orb carries a menu glyph and, while a page loads, an
+        // accent ring — the collapsed reading of the bar's loading strip.
+        // Both fade out as the bar unfolds over them.
+        if e < 1.0 {
+            let o = self.orb_rect();
+            let (cx, cy) = (o.x + o.width / 2.0, o.y + o.height / 2.0);
+            let fade = 1.0 - e;
+            let glyph = [0.86, 0.87, 0.90, 0.95 * fade];
+            for k in -1..=1 {
+                let y = cy + k as f32 * ORB_GLYPH_GAP;
+                pc.vector(
+                    cx - ORB_GLYPH_W / 2.0,
+                    y,
+                    cx + ORB_GLYPH_W / 2.0,
+                    y,
+                    1.6,
+                    glyph,
+                    cce_ui::scene::paint::Cap::Round,
                 );
-            });
+            }
+            if self.loading {
+                let ring = [ACCENT[0], ACCENT[1], ACCENT[2], fade];
+                pc.arc(cx, cy, ORB_D / 2.0 - 2.0, 2.0, 0.0, std::f32::consts::TAU, ring);
+            }
         }
 
-        // Tab strip.
-        let (sans, ..) = cce_ui::layout::read_preferred_fonts();
-        let count = self.host.tab_count();
-        let active = self.host.active_index();
-        for i in 0..count {
-            let pill = tab_rect(&bar, count, i);
-            let is_active = i == active;
+        // Open: the bar's contents, laid out at their final positions and
+        // clipped to the plate, so they are revealed as it unfolds.
+        if e > 0.0 {
+            pc.clip_rounded(plate, radius, |pc| {
+                if self.loading {
+                    pc.quad(
+                        Rect { x: bar.x, y: bar.y + bar.height - 2.0, width: bar.width, height: 2.0 },
+                        ACCENT,
+                    );
+                }
+
+                // Tab strip.
+            let count = self.host.tab_count();
+            let active = self.host.active_index();
+            for i in 0..count {
+                let pill = tab_rect(&bar, count, i);
+                let is_active = i == active;
+                pc.rounded_rect(
+                    pill,
+                    7.0,
+                    (true, true, true, true),
+                    if is_active { TAB_ACTIVE_BG } else { TAB_BG },
+                );
+                let tab = self.host.tab(i);
+                let title = tab
+                    .and_then(|t| t.title.clone().filter(|s| !s.is_empty()))
+                    .or_else(|| tab.and_then(|t| t.url.clone()).map(|u| u.to_string()))
+                    .filter(|s| s != "about:blank")
+                    .unwrap_or_else(|| "New Tab".to_string());
+                let close = tab_close_rect(&pill);
+                let text_avail = pill.width - 16.0 - close.map_or(0.0, |_| TAB_CLOSE_W - 4.0);
+                let label = Self::fit_text(&title, &sans, 12.0, text_avail);
+                let color = if is_active { TEXT } else { TEXT_DIM };
+                pc.text(
+                    label,
+                    pill.x + 8.0,
+                    cce_ui::layout::align_text_y(pill.y, pill.height, 12.0, 0.0),
+                    12.0,
+                    color,
+                );
+                if tab.is_some_and(|t| t.loading) {
+                    pc.quad(
+                        Rect { x: pill.x, y: pill.y + pill.height - 2.0, width: pill.width, height: 2.0 },
+                        ACCENT,
+                    );
+                }
+                if let Some(cr) = close {
+                    let xw = measure_text_width("x", &sans, 11.0);
+                    pc.text(
+                        "x",
+                        cr.x + (cr.width - xw) / 2.0 - 2.0,
+                        cce_ui::layout::align_text_y(cr.y, cr.height, 11.0, 0.0),
+                        11.0,
+                        TEXT_DIM,
+                    );
+                }
+            }
+            let plus = plus_rect(&bar);
+            pc.rounded_rect(plus, 7.0, (true, true, true, true), BTN_BG);
+            let pw = measure_text_width("+", &sans, 14.0);
+            pc.text(
+                "+",
+                plus.x + (plus.width - pw) / 2.0,
+                cce_ui::layout::align_text_y(plus.y, plus.height, 14.0, 0.0),
+                14.0,
+                TEXT,
+            );
+
+            let labels = ["<", ">", "R"];
+            let enabled = [self.host.can_go_back(), self.host.can_go_forward(), true];
+            for (i, label) in labels.iter().enumerate() {
+                let r = btn_rect(&bar, i);
+                pc.rounded_rect(r, 6.0, (true, true, true, true), BTN_BG);
+                let color = if enabled[i] { TEXT } else { TEXT_DIM };
+                let (sans, ..) = cce_ui::layout::read_preferred_fonts();
+                let lw = measure_text_width(label, &sans, 14.0);
+                pc.text(
+                    *label,
+                    r.x + (r.width - lw) / 2.0,
+                    cce_ui::layout::align_text_y(r.y, r.height, 14.0, 0.0),
+                    14.0,
+                    color,
+                );
+            }
+
+            // Bookmark star: accent-lit when the page is bookmarked.
+            let star = star_rect(&bar);
+            pc.rounded_rect(star, 6.0, (true, true, true, true), BTN_BG);
+            let starred = self.host.active_bookmarked();
+            let star_color: [u8; 3] = if starred { [150, 190, 240] } else { TEXT_DIM };
+            let sw = measure_text_width("*", &sans, 17.0);
+            pc.text(
+                "*",
+                star.x + (star.width - sw) / 2.0,
+                cce_ui::layout::align_text_y(star.y, star.height, 17.0, 0.0) + 3.0,
+                17.0,
+                star_color,
+            );
+
+            // URL field: rim + recess, brighter rim when focused.
+            let f = url_rect(&bar);
+            let rim = if self.url_focused { RIM_FOCUS } else { RIM };
             pc.rounded_rect(
-                pill,
+                Rect { x: f.x - 1.0, y: f.y - 1.0, width: f.width + 2.0, height: f.height + 2.0 },
                 7.0,
                 (true, true, true, true),
-                if is_active { TAB_ACTIVE_BG } else { TAB_BG },
+                rim,
             );
-            let tab = self.host.tab(i);
-            let title = tab
-                .and_then(|t| t.title.clone().filter(|s| !s.is_empty()))
-                .or_else(|| tab.and_then(|t| t.url.clone()).map(|u| u.to_string()))
-                .filter(|s| s != "about:blank")
-                .unwrap_or_else(|| "New Tab".to_string());
-            let close = tab_close_rect(&pill);
-            let text_avail = pill.width - 16.0 - close.map_or(0.0, |_| TAB_CLOSE_W - 4.0);
-            let label = Self::fit_text(&title, &sans, 12.0, text_avail);
-            let color = if is_active { TEXT } else { TEXT_DIM };
-            pc.text(
-                label,
-                pill.x + 8.0,
-                cce_ui::layout::align_text_y(pill.y, pill.height, 12.0, 0.0),
-                12.0,
-                color,
-            );
-            if tab.is_some_and(|t| t.loading) {
-                pc.quad(
-                    Rect { x: pill.x, y: pill.y + pill.height - 2.0, width: pill.width, height: 2.0 },
-                    ACCENT,
-                );
-            }
-            if let Some(cr) = close {
-                let xw = measure_text_width("x", &sans, 11.0);
-                pc.text(
-                    "x",
-                    cr.x + (cr.width - xw) / 2.0 - 2.0,
-                    cce_ui::layout::align_text_y(cr.y, cr.height, 11.0, 0.0),
-                    11.0,
-                    TEXT_DIM,
-                );
-            }
+            pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
+            let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
+            let caret_x = if self.url_focused { Some(self.caret_offset()) } else { None };
+            let sel_x = self
+                .url
+                .selection
+                .filter(|&(a, b)| a < b)
+                .map(|(a, b)| (self.x_offset(a), self.x_offset(b)));
+            pc.clip(f, |pc| {
+                if let Some((x0, x1)) = sel_x {
+                    pc.quad(
+                        Rect {
+                            x: f.x + URL_PAD_X + x0,
+                            y: f.y + 4.0,
+                            width: x1 - x0,
+                            height: f.height - 8.0,
+                        },
+                        SEL_BG,
+                    );
+                }
+                pc.text(self.url.text.clone(), f.x + URL_PAD_X, ty, URL_FONT, TEXT);
+                if let Some(offset) = caret_x {
+                    pc.quad(
+                        Rect { x: f.x + URL_PAD_X + offset, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
+                        [0.85, 0.87, 0.92, 1.0],
+                    );
+                }
+            });
+
+            });
         }
-        let plus = plus_rect(&bar);
-        pc.rounded_rect(plus, 7.0, (true, true, true, true), BTN_BG);
-        let pw = measure_text_width("+", &sans, 14.0);
-        pc.text(
-            "+",
-            plus.x + (plus.width - pw) / 2.0,
-            cce_ui::layout::align_text_y(plus.y, plus.height, 14.0, 0.0),
-            14.0,
-            TEXT,
-        );
-
-        let labels = ["<", ">", "R"];
-        let enabled = [self.host.can_go_back(), self.host.can_go_forward(), true];
-        for (i, label) in labels.iter().enumerate() {
-            let r = btn_rect(&bar, i);
-            pc.rounded_rect(r, 6.0, (true, true, true, true), BTN_BG);
-            let color = if enabled[i] { TEXT } else { TEXT_DIM };
-            let (sans, ..) = cce_ui::layout::read_preferred_fonts();
-            let lw = measure_text_width(label, &sans, 14.0);
-            pc.text(
-                *label,
-                r.x + (r.width - lw) / 2.0,
-                cce_ui::layout::align_text_y(r.y, r.height, 14.0, 0.0),
-                14.0,
-                color,
-            );
-        }
-
-        // Bookmark star: accent-lit when the page is bookmarked.
-        let star = star_rect(&bar);
-        pc.rounded_rect(star, 6.0, (true, true, true, true), BTN_BG);
-        let starred = self.host.active_bookmarked();
-        let star_color: [u8; 3] = if starred { [150, 190, 240] } else { TEXT_DIM };
-        let sw = measure_text_width("*", &sans, 17.0);
-        pc.text(
-            "*",
-            star.x + (star.width - sw) / 2.0,
-            cce_ui::layout::align_text_y(star.y, star.height, 17.0, 0.0) + 3.0,
-            17.0,
-            star_color,
-        );
-
-        // URL field: rim + recess, brighter rim when focused.
-        let f = url_rect(&bar);
-        let rim = if self.url_focused { RIM_FOCUS } else { RIM };
-        pc.rounded_rect(
-            Rect { x: f.x - 1.0, y: f.y - 1.0, width: f.width + 2.0, height: f.height + 2.0 },
-            7.0,
-            (true, true, true, true),
-            rim,
-        );
-        pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
-        let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
-        let caret_x = if self.url_focused { Some(self.caret_offset()) } else { None };
-        let sel_x = self
-            .url
-            .selection
-            .filter(|&(a, b)| a < b)
-            .map(|(a, b)| (self.x_offset(a), self.x_offset(b)));
-        pc.clip(f, |pc| {
-            if let Some((x0, x1)) = sel_x {
-                pc.quad(
-                    Rect {
-                        x: f.x + URL_PAD_X + x0,
-                        y: f.y + 4.0,
-                        width: x1 - x0,
-                        height: f.height - 8.0,
-                    },
-                    SEL_BG,
-                );
-            }
-            pc.text(self.url.text.clone(), f.x + URL_PAD_X, ty, URL_FONT, TEXT);
-            if let Some(offset) = caret_x {
-                pc.quad(
-                    Rect { x: f.x + URL_PAD_X + offset, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
-                    [0.85, 0.87, 0.92, 1.0],
-                );
-            }
-        });
 
         #[cfg(feature = "wpe")]
         self.paint_ctx_menu(&mut pc, &sans);

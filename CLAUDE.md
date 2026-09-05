@@ -169,6 +169,37 @@ every hit test in `handle_mouse_input` re-derives the same rects from the same
 `bar_rect`/`tab_rect`/`btn_rect`/`url_rect` helpers. **Draw and hit-test are two
 readings of one geometry** — change a rect helper, not one call site.
 
+### The bar is a circle menu
+
+The chrome rests as a **40px orb** (`ORB_D`) in the bar's corner nearest the
+anchored window edge and unfolds into the two-row bar on demand; `chrome_open`
+names the state and `chrome_t` is the unfold progress, animated in `tick` over
+`CHROME_ANIM_S`. `chrome_plate()` is the one shape both draw and hit-test read
+— the orb, the bar, or the lerp between them — and `chrome_hit()` is the
+chrome's pointer gate (a circle-distance test when closed, so the orb's corner
+pixels belong to the page). The bar's contents are laid out at their *final*
+rects and clipped to the growing plate, which is what makes the unfold a reveal
+rather than a re-layout; `bar_rect` and every helper under it are unchanged.
+
+The orb is drawn through `plate_shaped(.., Some(2.0))`, a per-plate corner
+exponent added to `cce-ui` for exactly this: the DE runs `corner_shape 4.5`, and
+at half-extent radii that squircle is a rounded square, not a circle. The
+exponent eases back to the DE's as the plate becomes the bar, so the open bar's
+corners match its neighbours.
+
+Menu semantics, all in `handle_mouse_input` / `handle_key_input`:
+
+- **Open**: click the orb; `Ctrl+L` (then focuses the URL); `Ctrl+T` (a new
+  tab focuses the URL field, which must be on screen).
+- **Fold**: click the page; `Escape` with the URL unfocused (the first Escape
+  in a focused field only drops focus, as before); submitting a URL; picking a
+  tab. Closing a tab does *not* fold — several often go in a row.
+- Folding drops URL-bar focus (`close_chrome`), so an off-screen field never
+  keeps eating keystrokes. Wheel and pointer moves over the chrome stay off the
+  page, gated by `chrome_hit`, not `bar_rect`.
+- While loading, the orb wears an accent ring where the bar wears its bottom
+  strip; both fade across the morph.
+
 - Everything bar-relative derives from `bar_rect`, never from `BAR_MARGIN` directly,
   or the bar-position setting silently stops moving things to the bottom edge.
 - `BAR_FILL`'s **negative alpha is the frost sentinel** (`cce-ui/src/scene/paint.rs`):
