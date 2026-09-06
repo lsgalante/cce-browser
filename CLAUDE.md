@@ -174,15 +174,18 @@ readings of one geometry** — change a rect helper, not one call site.
 The chrome's persistent element is the **DE's corner control** —
 `cce_ui::widget::plate_dock::draw_corner_dot`, the same 8px plate-border-colored
 dot a designer pane or the terminal window wears at its top-right — sitting at
-the bar plate's top-right inset (`dot_center()`). It is always drawn and always
-live: clicking it unfolds the two-row bar from under it, clicking it again
-folds the bar back. `chrome_open` names the state, `chrome_t` the unfold
+the **window's** top-right inset (`dot_center()`, via `plate_dock::corner_center`
+on the window rect, exactly as the terminal places its own). It is always drawn
+and always live: clicking it unfolds the two-row bar, clicking it again folds
+the bar back. `chrome_open` names the state, `chrome_t` the unfold
 progress (animated in `tick` over `CHROME_ANIM_S`), and `dot_hover` its hover
 emphasis, which is a repaint. **Do not decorate the dot** — no glyph, no
 lines, no ring; it is the DE's control, not a browser icon.
 
 `chrome_plate()` is the one shape draw and hit-test both read — the bar, or
-the lerp from a dot-sized seed disc under the control up to the bar — and
+the lerp from a dot-sized seed disc at the bar's own top-right corner
+(`seed_center()`, the corner nearest the control; a bottom-anchored bar grows
+from its own corner rather than flying down the window) up to the bar — and
 `chrome_hit()` is the chrome's pointer gate (the dot always, the plate while
 any of it shows). The bar's contents are laid out at their *final* rects and
 clipped to the growing plate, so the unfold is a reveal, not a re-layout. The

@@ -59,9 +59,9 @@ const BAR_RADIUS: f32 = 10.0;
 const BAR_PAD: f32 = 7.0;
 /// Seconds for the bar to unfold from the corner control (and back).
 const CHROME_ANIM_S: f32 = 0.18;
-/// Width reserved at the right end of the tab row for the corner control,
-/// which rides the bar's top-right at the DE's inset and would otherwise
-/// sit on the "+" button.
+/// Width reserved at the right end of the tab row for the corner control:
+/// at the window's top-right it overlaps a top-anchored bar's "+" button
+/// otherwise. Reserved for a bottom bar too, so the two layouts agree.
 const DOT_COL: f32 = 2.0 * plate_dock::CORNER_INSET;
 const TAB_H: f32 = 24.0;
 const TAB_GAP: f32 = 4.0;
@@ -462,11 +462,22 @@ impl BrowserApp {
         bar_rect(self.win, self.settings.bar_position)
     }
 
-    /// Centre of the corner control: the bar plate's top-right at the DE's
-    /// inset, exactly where a designer pane or the terminal wears its own.
-    /// It is there whether the bar is open or not — the bar unfolds from
-    /// under it, and it is what folds the bar back.
+    /// Centre of the corner control: the WINDOW's top-right at the DE's
+    /// inset — the terminal's placement, the window being the plate the
+    /// control belongs to. It is there whether the bar is open or not, and
+    /// it is what folds the bar back.
     fn dot_center(&self) -> (f32, f32) {
+        plate_dock::corner_center((0.0, 0.0, self.win.0, self.win.1), false).unwrap_or((
+            self.win.0 - plate_dock::CORNER_INSET,
+            plate_dock::CORNER_INSET,
+        ))
+    }
+
+    /// Where the bar grows from: its own top-right corner, the one nearest
+    /// the control. For a top-anchored bar that is a few px from the dot,
+    /// so the unfold still reads as coming from it; a bottom-anchored bar
+    /// grows from its own corner rather than flying down the window.
+    fn seed_center(&self) -> (f32, f32) {
         let bar = self.bar();
         (bar.x + bar.width - plate_dock::CORNER_INSET, bar.y + plate_dock::CORNER_INSET)
     }
@@ -483,11 +494,10 @@ impl BrowserApp {
 
     /// The bar plate as currently drawn — the full bar, or the shape it is
     /// unfolding through — and its corner radius. It grows out of a
-    /// dot-sized disc under the corner control, so the unfold reads as the
-    /// bar coming from the control that was clicked.
+    /// dot-sized disc at its corner nearest the control.
     fn chrome_plate(&self) -> (Rect, f32) {
         let e = self.chrome_ease();
-        let (cx, cy) = self.dot_center();
+        let (cx, cy) = self.seed_center();
         let seed = plate_dock::CORNER_INSET;
         let bar = self.bar();
         let lerp = |a: f32, b: f32| a + (b - a) * e;
