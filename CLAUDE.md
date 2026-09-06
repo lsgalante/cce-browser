@@ -171,50 +171,38 @@ readings of one geometry** — change a rect helper, not one call site.
 
 ### The bar is a circle menu
 
-The chrome rests as a **40px orb** (`ORB_D`) in the bar's corner nearest the
-anchored window edge and unfolds into the two-row bar on demand; `chrome_open`
-names the state and `chrome_t` is the unfold progress, animated in `tick` over
-`CHROME_ANIM_S`. `chrome_plate()` is the one shape both draw and hit-test read
-— the orb, the bar, or the lerp between them — and `chrome_hit()` is the
-chrome's pointer gate (a circle-distance test when closed, so the orb's corner
-pixels belong to the page). The bar's contents are laid out at their *final*
-rects and clipped to the growing plate, which is what makes the unfold a reveal
-rather than a re-layout; `bar_rect` and every helper under it are unchanged.
+The chrome's persistent element is the **DE's corner control** —
+`cce_ui::widget::plate_dock::draw_corner_dot`, the same 8px plate-border-colored
+dot a designer pane or the terminal window wears at its top-right — sitting at
+the bar plate's top-right inset (`dot_center()`). It is always drawn and always
+live: clicking it unfolds the two-row bar from under it, clicking it again
+folds the bar back. `chrome_open` names the state, `chrome_t` the unfold
+progress (animated in `tick` over `CHROME_ANIM_S`), and `dot_hover` its hover
+emphasis, which is a repaint. **Do not decorate the dot** — no glyph, no
+lines, no ring; it is the DE's control, not a browser icon.
 
-The orb is drawn through `plate_shaped(.., Some(2.0))`, a per-plate corner
-exponent added to `cce-ui` for exactly this: the DE runs `corner_shape 4.5`, and
-at half-extent radii that squircle is a rounded square, not a circle. The
-exponent eases back to the DE's as the plate becomes the bar, so the open bar's
-corners match its neighbours.
+`chrome_plate()` is the one shape draw and hit-test both read — the bar, or
+the lerp from a dot-sized seed disc under the control up to the bar — and
+`chrome_hit()` is the chrome's pointer gate (the dot always, the plate while
+any of it shows). The bar's contents are laid out at their *final* rects and
+clipped to the growing plate, so the unfold is a reveal, not a re-layout. The
+tab row reserves `DOT_COL` at its right end so the "+" button clears the dot;
+`bar_rect` and the rest of the helpers are otherwise unchanged. The plate is
+drawn through `plate_shaped`, a per-plate corner exponent added to `cce-ui`,
+easing from circular at the seed to the DE's own squircle as it becomes the
+bar.
 
 Menu semantics, all in `handle_mouse_input` / `handle_key_input`:
 
-- **Open**: click the orb; `Ctrl+L` (then focuses the URL); `Ctrl+T` (a new
+- **Open**: click the dot; `Ctrl+L` (then focuses the URL); `Ctrl+T` (a new
   tab focuses the URL field, which must be on screen).
-- **Fold**: click the page; `Escape` with the URL unfocused (the first Escape
-  in a focused field only drops focus, as before); submitting a URL; picking a
-  tab. Closing a tab does *not* fold — several often go in a row.
+- **Fold**: click the dot again; click the page; `Escape` with the URL
+  unfocused (the first Escape in a focused field only drops focus, as
+  before); submitting a URL; picking a tab. Closing a tab does *not* fold —
+  several often go in a row.
 - Folding drops URL-bar focus (`close_chrome`), so an off-screen field never
   keeps eating keystrokes. Wheel and pointer moves over the chrome stay off the
   page, gated by `chrome_hit`, not `bar_rect`.
-- While loading, the orb wears an accent ring where the bar wears its bottom
-  strip; both fade across the morph.
-
-- Everything bar-relative derives from `bar_rect`, never from `BAR_MARGIN` directly,
-  or the bar-position setting silently stops moving things to the bottom edge.
-- `BAR_FILL`'s **negative alpha is the frost sentinel** (`cce-ui/src/scene/paint.rs`):
-  it marks the plate for the in-app blur pass, so the page shows through. Keep
-  `|alpha|` low; a positive alpha just paints an opaque bar.
-- **URL-bar caret and click mapping must use
-  `cce_ui::engine::shaped_cluster_offsets`**, not `measure_text_width`. The latter
-  returns inked extents, which drift off the glyph positions the renderer actually
-  lays down — the caret ended up in the wrong place and clicks landed on the wrong
-  character (commit `b280e6b`). Same shaped buffer (`font=None`) as `pc.text` draws
-  with, or they disagree again.
-- Clicking into an unfocused bar selects the whole URL, as do Ctrl+L and Ctrl+A, so
-  typing replaces rather than appends. Arrows collapse a selection to the edge they
-  move toward. `take_selection()` is the shared "replace the selection or act at the
-  cursor" path for every edit.
 
 ### Key routing
 

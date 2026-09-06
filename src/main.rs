@@ -2,11 +2,11 @@
 //!
 //! Servo renders pages into a CPU (software) rendering context; each
 //! finished frame is read back and uploaded to cce-ui's image registry,
-//! then drawn as a single quad under the chrome: a circle menu that rests
-//! as a small orb in the window corner and opens into the utility bar
-//! (tabs, back / forward / reload, URL field). Input over the page area is
-//! translated into Servo input events; the URL bar is a small hand-rolled
-//! line editor.
+//! then drawn as a single quad under the chrome: the DE's circular corner
+//! control (`cce_ui::widget::plate_dock`), which here toggles the utility
+//! bar (tabs, back / forward / reload, URL field) that unfolds from under
+//! it. Input over the page area is translated into Servo input events; the
+//! URL bar is a small hand-rolled line editor.
 
 mod downloads;
 mod instance;
@@ -29,6 +29,7 @@ use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, Win
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{DisplayList, PaintCtx};
 use cce_ui::widget::display::measure_text_width;
+use cce_ui::widget::plate_dock;
 use cce_ui::widget::{ElementState, Key, KeyEvent, MouseButton, MouseScrollDelta, NamedKey};
 
 #[cfg(all(not(feature = "wpe"), feature = "servo"))]
@@ -56,15 +57,12 @@ const BAR_MARGIN: f32 = 10.0;
 const BAR_H: f32 = BAR_PAD + TAB_H + ROW_GAP + BTN_H + BAR_PAD;
 const BAR_RADIUS: f32 = 10.0;
 const BAR_PAD: f32 = 7.0;
-/// Diameter of the collapsed chrome — the orb the bar folds down to. One
-/// control's height plus the bar padding, so the closed and open plates
-/// share an edge thickness.
-const ORB_D: f32 = BAR_PAD + BTN_H + BAR_PAD;
-/// Seconds for the orb to unfold into the bar (and back).
+/// Seconds for the bar to unfold from the corner control (and back).
 const CHROME_ANIM_S: f32 = 0.18;
-/// Hamburger glyph inside the orb: line length and spacing.
-const ORB_GLYPH_W: f32 = 14.0;
-const ORB_GLYPH_GAP: f32 = 4.5;
+/// Width reserved at the right end of the tab row for the corner control,
+/// which rides the bar's top-right at the DE's inset and would otherwise
+/// sit on the "+" button.
+const DOT_COL: f32 = 2.0 * plate_dock::CORNER_INSET;
 const TAB_H: f32 = 24.0;
 const TAB_GAP: f32 = 4.0;
 const TAB_MIN_W: f32 = 56.0;
@@ -274,11 +272,14 @@ struct BrowserApp {
     /// one the dialog fields use.
     url: lineedit::LineEdit,
     url_focused: bool,
-    /// The circle menu: closed is the orb, open is the full utility bar.
-    /// `chrome_t` is the unfold progress (0 = orb, 1 = bar), animated in
-    /// `tick` toward whichever state `chrome_open` names.
+    /// The circle menu: the DE's corner control toggles the utility bar,
+    /// which unfolds from under it. `chrome_t` is the unfold progress
+    /// (0 = closed, 1 = bar), animated in `tick` toward whichever state
+    /// `chrome_open` names.
     chrome_open: bool,
     chrome_t: f32,
+    /// Pointer over the corner control — its hover emphasis is a repaint.
+    dot_hover: bool,
     loading: bool,
     /// Page title; drives the toplevel title (the engine re-applies
     /// `settings().title` whenever it changes).
@@ -337,7 +338,7 @@ fn controls_y(bar: &Rect) -> f32 {
 
 fn plus_rect(bar: &Rect) -> Rect {
     Rect {
-        x: bar.x + bar.width - BAR_PAD - PLUS_W,
+        x: bar.x + bar.width - BAR_PAD - DOT_COL - PLUS_W,
         y: tabs_y(bar),
         width: PLUS_W,
         height: TAB_H,
@@ -345,7 +346,8 @@ fn plus_rect(bar: &Rect) -> Rect {
 }
 
 fn tab_rect(bar: &Rect, count: usize, i: usize) -> Rect {
-    let avail = bar.width - 2.0 * BAR_PAD - PLUS_W - TAB_GAP - (count.max(1) - 1) as f32 * TAB_GAP;
+    let avail =
+        bar.width - 2.0 * BAR_PAD - DOT_COL - PLUS_W - TAB_GAP - (count.max(1) - 1) as f32 * TAB_GAP;
     let w = (avail / count.max(1) as f32).clamp(TAB_MIN_W, TAB_MAX_W);
     Rect {
         x: bar.x + BAR_PAD + i as f32 * (w + TAB_GAP),
@@ -460,15 +462,17 @@ impl BrowserApp {
         bar_rect(self.win, self.settings.bar_position)
     }
 
-    /// The closed chrome: a circle in the bar's corner nearest the anchored
-    /// window edge, so the bar unfolds away from it and the orb never moves.
-    fn orb_rect(&self) -> Rect {
+    /// Centre of the corner control: the bar plate's top-right at the DE's
+    /// inset, exactly where a designer pane or the terminal wears its own.
+    /// It is there whether the bar is open or not — the bar unfolds from
+    /// under it, and it is what folds the bar back.
+    fn dot_center(&self) -> (f32, f32) {
         let bar = self.bar();
-        let y = match self.settings.bar_position {
-            settings::BarPosition::Top => bar.y,
-            settings::BarPosition::Bottom => bar.y + bar.height - ORB_D,
-        };
-        Rect { x: bar.x, y, width: ORB_D, height: ORB_D }
+        (bar.x + bar.width - plate_dock::CORNER_INSET, bar.y + plate_dock::CORNER_INSET)
+    }
+
+    fn dot_hit(&self, x: f32, y: f32) -> bool {
+        plate_dock::corner_hit(self.dot_center(), x, y)
     }
 
     /// Unfold progress with easing applied — what the plate is drawn from.
@@ -477,33 +481,29 @@ impl BrowserApp {
         t * t * (3.0 - 2.0 * t)
     }
 
-    /// The chrome plate as currently drawn — the orb, the bar, or the
-    /// in-between shape while it unfolds — and its corner radius.
+    /// The bar plate as currently drawn — the full bar, or the shape it is
+    /// unfolding through — and its corner radius. It grows out of a
+    /// dot-sized disc under the corner control, so the unfold reads as the
+    /// bar coming from the control that was clicked.
     fn chrome_plate(&self) -> (Rect, f32) {
         let e = self.chrome_ease();
-        let orb = self.orb_rect();
+        let (cx, cy) = self.dot_center();
+        let seed = plate_dock::CORNER_INSET;
         let bar = self.bar();
         let lerp = |a: f32, b: f32| a + (b - a) * e;
         let plate = Rect {
-            x: lerp(orb.x, bar.x),
-            y: lerp(orb.y, bar.y),
-            width: lerp(orb.width, bar.width),
-            height: lerp(orb.height, bar.height),
+            x: lerp(cx - seed, bar.x),
+            y: lerp(cy - seed, bar.y),
+            width: lerp(2.0 * seed, bar.width),
+            height: lerp(2.0 * seed, bar.height),
         };
-        (plate, lerp(ORB_D / 2.0, BAR_RADIUS))
+        (plate, lerp(seed, BAR_RADIUS))
     }
 
-    /// Whether a pointer position is over the chrome — the circle proper
-    /// when closed (its corners belong to the page), the plate otherwise.
+    /// Whether a pointer position is over the chrome: the corner control
+    /// always, the plate while any of it is showing.
     fn chrome_hit(&self, x: f32, y: f32) -> bool {
-        if self.chrome_t <= 0.0 {
-            let o = self.orb_rect();
-            let (cx, cy) = (o.x + o.width / 2.0, o.y + o.height / 2.0);
-            let r = o.width / 2.0;
-            (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r
-        } else {
-            hit(&self.chrome_plate().0, x, y)
-        }
+        self.dot_hit(x, y) || (self.chrome_t > 0.0 && hit(&self.chrome_plate().0, x, y))
     }
 
     fn open_chrome(&mut self) {
@@ -1064,6 +1064,7 @@ impl Application for BrowserApp {
             url_focused: false,
             chrome_open: false,
             chrome_t: 0.0,
+            dot_hover: false,
             loading: true,
             title: None,
             #[cfg(feature = "wpe")]
@@ -1228,6 +1229,11 @@ impl Application for BrowserApp {
             *_needs_rebuild = true;
             return;
         }
+        let over_dot = self.dot_hit(pos.x, pos.y);
+        if over_dot != self.dot_hover {
+            self.dot_hover = over_dot;
+            *_needs_rebuild = true;
+        }
         if !self.chrome_hit(pos.x, pos.y) {
             let s = self.scale as f32;
             self.host.mouse_move(pos.x * s, pos.y * s);
@@ -1291,12 +1297,19 @@ impl Application for BrowserApp {
                 return None;
             }
             *needs_rebuild = true;
-            // Closed (or still folding): the whole orb is the open control.
-            // Anything folding open is treated as the bar it is becoming.
-            if !self.chrome_open {
+            // The corner control toggles the bar, open or closed.
+            if self.dot_hit(pos.x, pos.y) {
                 if button == MouseButton::Left {
-                    self.open_chrome();
+                    if self.chrome_open {
+                        self.close_chrome();
+                    } else {
+                        self.open_chrome();
+                    }
                 }
+                return None;
+            }
+            // Still folding shut: nothing under the plate is live.
+            if !self.chrome_open {
                 return None;
             }
             // Tab strip: activate / close (x region or middle click) / new tab.
@@ -1562,47 +1575,22 @@ impl Application for BrowserApp {
             pc.text("Loading...", BAR_MARGIN + 6.0, y, 13.0, TEXT_DIM);
         }
 
-        // The chrome plate: the orb, the bar, or the shape between them
-        // while it unfolds. Blur-behind either way, frosting the page.
+        // The bar plate — or the shape it is unfolding through. Nothing but
+        // the corner control shows while closed. Blur-behind, frosting the
+        // page under it; the corner exponent eases from circular at the
+        // dot-sized seed to the DE's own once it is the bar.
         let e = self.chrome_ease();
         let (plate, radius) = self.chrome_plate();
-        // A circle when closed — exponent 2 with half-extent radii — easing
-        // into the DE's own corner shape as it becomes the bar, so the orb is
-        // round even in a squircle DE and the open bar matches its neighbours.
-        let shape = 2.0 + (cce_ui::layout::corner_shape() - 2.0) * e;
-        pc.plate_shaped(
-            plate,
-            (radius, radius, radius, radius),
-            BAR_FILL,
-            cce_ui::layout::bevel_width().min(4.0),
-            Some(shape),
-        );
         let (sans, ..) = cce_ui::layout::read_preferred_fonts();
-
-        // Closed: the orb carries a menu glyph and, while a page loads, an
-        // accent ring — the collapsed reading of the bar's loading strip.
-        // Both fade out as the bar unfolds over them.
-        if e < 1.0 {
-            let o = self.orb_rect();
-            let (cx, cy) = (o.x + o.width / 2.0, o.y + o.height / 2.0);
-            let fade = 1.0 - e;
-            let glyph = [0.86, 0.87, 0.90, 0.95 * fade];
-            for k in -1..=1 {
-                let y = cy + k as f32 * ORB_GLYPH_GAP;
-                pc.vector(
-                    cx - ORB_GLYPH_W / 2.0,
-                    y,
-                    cx + ORB_GLYPH_W / 2.0,
-                    y,
-                    1.6,
-                    glyph,
-                    cce_ui::scene::paint::Cap::Round,
-                );
-            }
-            if self.loading {
-                let ring = [ACCENT[0], ACCENT[1], ACCENT[2], fade];
-                pc.arc(cx, cy, ORB_D / 2.0 - 2.0, 2.0, 0.0, std::f32::consts::TAU, ring);
-            }
+        if e > 0.0 {
+            let shape = 2.0 + (cce_ui::layout::corner_shape() - 2.0) * e;
+            pc.plate_shaped(
+                plate,
+                (radius, radius, radius, radius),
+                BAR_FILL,
+                cce_ui::layout::bevel_width().min(4.0),
+                Some(shape),
+            );
         }
 
         // Open: the bar's contents, laid out at their final positions and
@@ -1744,6 +1732,10 @@ impl Application for BrowserApp {
 
             });
         }
+
+        // The corner control, over the bar: the DE's dot, emphasized while
+        // hovered or while the bar it opens is out.
+        plate_dock::draw_corner_dot(&mut pc, self.dot_center(), self.dot_hover || self.chrome_open);
 
         #[cfg(feature = "wpe")]
         self.paint_ctx_menu(&mut pc, &sans);
