@@ -59,10 +59,17 @@ const BAR_RADIUS: f32 = 10.0;
 const BAR_PAD: f32 = 7.0;
 /// Seconds for the bar to unfold from the corner control (and back).
 const CHROME_ANIM_S: f32 = 0.18;
-/// Width reserved at the right end of the tab row for the corner control:
-/// at the window's top-right it overlaps a top-anchored bar's "+" button
-/// otherwise. Reserved for a bottom bar too, so the two layouts agree.
+/// Width reserved at the right end of the row the corner control sits on
+/// (the tab row for a top bar, the controls row for a bottom one), so the
+/// "+" or the bookmark star clears the dot in the bar's corner.
 const DOT_COL: f32 = 2.0 * plate_dock::CORNER_INSET;
+
+/// The reservation a row makes for the corner control: `DOT_COL` on the
+/// row in the bar's anchored corner, nothing on the other.
+fn dot_col(position: settings::BarPosition, tabs_row: bool) -> f32 {
+    let dot_on_tabs = matches!(position, settings::BarPosition::Top);
+    if dot_on_tabs == tabs_row { DOT_COL } else { 0.0 }
+}
 const TAB_H: f32 = 24.0;
 const TAB_GAP: f32 = 4.0;
 const TAB_MIN_W: f32 = 56.0;
@@ -336,18 +343,22 @@ fn controls_y(bar: &Rect) -> f32 {
     bar.y + BAR_PAD + TAB_H + ROW_GAP
 }
 
-fn plus_rect(bar: &Rect) -> Rect {
+fn plus_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     Rect {
-        x: bar.x + bar.width - BAR_PAD - DOT_COL - PLUS_W,
+        x: bar.x + bar.width - BAR_PAD - dot_col(position, true) - PLUS_W,
         y: tabs_y(bar),
         width: PLUS_W,
         height: TAB_H,
     }
 }
 
-fn tab_rect(bar: &Rect, count: usize, i: usize) -> Rect {
-    let avail =
-        bar.width - 2.0 * BAR_PAD - DOT_COL - PLUS_W - TAB_GAP - (count.max(1) - 1) as f32 * TAB_GAP;
+fn tab_rect(bar: &Rect, position: settings::BarPosition, count: usize, i: usize) -> Rect {
+    let avail = bar.width
+        - 2.0 * BAR_PAD
+        - dot_col(position, true)
+        - PLUS_W
+        - TAB_GAP
+        - (count.max(1) - 1) as f32 * TAB_GAP;
     let w = (avail / count.max(1) as f32).clamp(TAB_MIN_W, TAB_MAX_W);
     Rect {
         x: bar.x + BAR_PAD + i as f32 * (w + TAB_GAP),
@@ -376,24 +387,21 @@ fn btn_rect(bar: &Rect, i: usize) -> Rect {
     }
 }
 
-/// The bookmark star, at the right end of the controls row.
-fn star_rect(bar: &Rect) -> Rect {
+/// The bookmark star, at the right end of the controls row — clear of the
+/// corner control when that row holds it.
+fn star_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     Rect {
-        x: bar.x + bar.width - BAR_PAD - BTN_W,
+        x: bar.x + bar.width - BAR_PAD - dot_col(position, false) - BTN_W,
         y: controls_y(bar),
         width: BTN_W,
         height: BTN_H,
     }
 }
 
-fn url_rect(bar: &Rect) -> Rect {
+fn url_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     let x = bar.x + BAR_PAD + 3.0 * (BTN_W + BTN_GAP) + 4.0;
-    Rect {
-        x,
-        y: controls_y(bar),
-        width: (bar.x + bar.width - BAR_PAD - BTN_W - BTN_GAP - x).max(60.0),
-        height: BTN_H,
-    }
+    let right = bar.x + bar.width - BAR_PAD - dot_col(position, false) - BTN_W - BTN_GAP;
+    Rect { x, y: controls_y(bar), width: (right - x).max(60.0), height: BTN_H }
 }
 
 /// Turn URL-bar input into something loadable: a real URL as-is, a bare
@@ -462,24 +470,19 @@ impl BrowserApp {
         bar_rect(self.win, self.settings.bar_position)
     }
 
-    /// Centre of the corner control: the WINDOW's top-right at the DE's
-    /// inset — the terminal's placement, the window being the plate the
-    /// control belongs to. It is there whether the bar is open or not, and
-    /// it is what folds the bar back.
+    /// Centre of the corner control: the bar's corner nearest the window
+    /// corner it is anchored to — top-right for a top bar, bottom-right for
+    /// a bottom one — at the DE's inset. A circle menu is the corner of the
+    /// thing it expands into, so it sits where the bar's corner will be and
+    /// stays there when the bar is out.
     fn dot_center(&self) -> (f32, f32) {
-        plate_dock::corner_center((0.0, 0.0, self.win.0, self.win.1), false).unwrap_or((
-            self.win.0 - plate_dock::CORNER_INSET,
-            plate_dock::CORNER_INSET,
-        ))
-    }
-
-    /// Where the bar grows from: its own top-right corner, the one nearest
-    /// the control. For a top-anchored bar that is a few px from the dot,
-    /// so the unfold still reads as coming from it; a bottom-anchored bar
-    /// grows from its own corner rather than flying down the window.
-    fn seed_center(&self) -> (f32, f32) {
         let bar = self.bar();
-        (bar.x + bar.width - plate_dock::CORNER_INSET, bar.y + plate_dock::CORNER_INSET)
+        let inset = plate_dock::CORNER_INSET;
+        let cy = match self.settings.bar_position {
+            settings::BarPosition::Top => bar.y + inset,
+            settings::BarPosition::Bottom => bar.y + bar.height - inset,
+        };
+        (bar.x + bar.width - inset, cy)
     }
 
     fn dot_hit(&self, x: f32, y: f32) -> bool {
@@ -493,12 +496,13 @@ impl BrowserApp {
     }
 
     /// The bar plate as currently drawn — the full bar, or the shape it is
-    /// unfolding through — and its corner radius. It grows out of a
-    /// dot-sized disc at its corner nearest the control.
+    /// unfolding through — and its corner radius. It grows out of the dot
+    /// itself: the seed is the dot's own disc, so the control expands as an
+    /// object into the bar and, open, is the bar's corner.
     fn chrome_plate(&self) -> (Rect, f32) {
         let e = self.chrome_ease();
-        let (cx, cy) = self.seed_center();
-        let seed = plate_dock::CORNER_INSET;
+        let (cx, cy) = self.dot_center();
+        let seed = plate_dock::CORNER_R;
         let bar = self.bar();
         let lerp = |a: f32, b: f32| a + (b - a) * e;
         let plate = Rect {
@@ -1302,6 +1306,7 @@ impl Application for BrowserApp {
         }
 
         let bar = self.bar();
+        let pos_edge = self.settings.bar_position;
         if self.chrome_hit(pos.x, pos.y) {
             if !pressed || !matches!(button, MouseButton::Left | MouseButton::Middle) {
                 return None;
@@ -1325,7 +1330,7 @@ impl Application for BrowserApp {
             // Tab strip: activate / close (x region or middle click) / new tab.
             let count = self.host.tab_count();
             for i in 0..count {
-                let pill = tab_rect(&bar, count, i);
+                let pill = tab_rect(&bar, pos_edge, count, i);
                 if !hit(&pill, pos.x, pos.y) {
                     continue;
                 }
@@ -1343,7 +1348,7 @@ impl Application for BrowserApp {
             if button != MouseButton::Left {
                 return None;
             }
-            if hit(&plus_rect(&bar), pos.x, pos.y) {
+            if hit(&plus_rect(&bar, pos_edge), pos.x, pos.y) {
                 self.new_tab();
             } else if hit(&btn_rect(&bar, 0), pos.x, pos.y) {
                 self.host.back();
@@ -1351,10 +1356,10 @@ impl Application for BrowserApp {
                 self.host.forward();
             } else if hit(&btn_rect(&bar, 2), pos.x, pos.y) {
                 self.host.reload();
-            } else if hit(&star_rect(&bar), pos.x, pos.y) {
+            } else if hit(&star_rect(&bar, pos_edge), pos.x, pos.y) {
                 self.host.toggle_bookmark();
             } else {
-                let field = url_rect(&bar);
+                let field = url_rect(&bar, pos_edge);
                 if hit(&field, pos.x, pos.y) {
                     if self.url_focused {
                         self.url.cursor = self.cursor_from_click(pos.x, &field);
@@ -1570,6 +1575,7 @@ impl Application for BrowserApp {
         let w = size.width;
 
         let bar = self.bar();
+        let pos_edge = self.settings.bar_position;
 
         // Page: full-bleed under the floating bar.
         let content = Rect { x: 0.0, y: 0.0, width: w, height: size.height };
@@ -1618,7 +1624,7 @@ impl Application for BrowserApp {
             let count = self.host.tab_count();
             let active = self.host.active_index();
             for i in 0..count {
-                let pill = tab_rect(&bar, count, i);
+                let pill = tab_rect(&bar, pos_edge, count, i);
                 let is_active = i == active;
                 pc.rounded_rect(
                     pill,
@@ -1660,7 +1666,7 @@ impl Application for BrowserApp {
                     );
                 }
             }
-            let plus = plus_rect(&bar);
+            let plus = plus_rect(&bar, pos_edge);
             pc.rounded_rect(plus, 7.0, (true, true, true, true), BTN_BG);
             let pw = measure_text_width("+", &sans, 14.0);
             pc.text(
@@ -1689,7 +1695,7 @@ impl Application for BrowserApp {
             }
 
             // Bookmark star: accent-lit when the page is bookmarked.
-            let star = star_rect(&bar);
+            let star = star_rect(&bar, pos_edge);
             pc.rounded_rect(star, 6.0, (true, true, true, true), BTN_BG);
             let starred = self.host.active_bookmarked();
             let star_color: [u8; 3] = if starred { [150, 190, 240] } else { TEXT_DIM };
@@ -1703,7 +1709,7 @@ impl Application for BrowserApp {
             );
 
             // URL field: rim + recess, brighter rim when focused.
-            let f = url_rect(&bar);
+            let f = url_rect(&bar, pos_edge);
             let rim = if self.url_focused { RIM_FOCUS } else { RIM };
             pc.rounded_rect(
                 Rect { x: f.x - 1.0, y: f.y - 1.0, width: f.width + 2.0, height: f.height + 2.0 },
