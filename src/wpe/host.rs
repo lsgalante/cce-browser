@@ -142,6 +142,10 @@ pub struct WebKitHost {
     download_started: Rc<Cell<bool>>,
     /// A page asked something and is blocked until we answer.
     prompts: Rc<RefCell<Prompts>>,
+    /// The injected account watcher, kept so the setting can take it away
+    /// again. `None` when account autocomplete is off, which is also when no
+    /// page carries the script at all.
+    watcher: Option<*mut WebKitUserScript>,
     /// Retained only so tests can assert on rendered output; the registry
     /// owns the copy that actually gets drawn.
     last_frame: Option<(Vec<u8>, u32, u32)>,
@@ -291,10 +295,142 @@ impl WebKitHost {
                 prompts,
                 last_frame: None,
                 ucm: webkit_user_content_manager_new(),
+                watcher: None,
                 spare: None,
             };
+            // The account watcher's channel, in its own script world. Both
+            // halves are registered here, once, on the shared content
+            // manager every tab is built against.
+            host.register_account_channel();
             host.open_tab(url);
             host
+        }
+    }
+
+    /// Listen for the account watcher's messages, in its private world.
+    ///
+    /// The world is the security boundary: page script cannot post on a
+    /// channel registered for another world, so a message arriving here came
+    /// from the injected watcher and not from the page pretending to be one.
+    fn register_account_channel(&self) {
+        use super::formwatch;
+        unsafe {
+            let name = cstr(formwatch::CHANNEL);
+            let world = cstr(formwatch::WORLD);
+            if webkit_user_content_manager_register_script_message_handler(
+                self.ucm,
+                name.as_ptr(),
+                world.as_ptr(),
+            ) == 0
+            {
+                log::warn!("could not register the account message channel");
+                return;
+            }
+            let signal = cstr(&format!("script-message-received::{}", formwatch::CHANNEL));
+            g_signal_connect_data(
+                self.ucm as *mut _,
+                signal.as_ptr(),
+                Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(
+                    on_account_message as *const () as usize,
+                )),
+                Rc::into_raw(self.prompts.clone()) as gpointer,
+                Some(drop_prompts_ref),
+                0,
+            );
+        }
+    }
+
+    /// Install or remove the login-field watcher — the whole page-side
+    /// footprint of the feature, so a browser with accounts turned off
+    /// injects nothing at all.
+    pub fn set_accounts_enabled(&mut self, on: bool) {
+        use super::formwatch;
+        unsafe {
+            match (on, self.watcher.take()) {
+                (true, None) => {
+                    let source = cstr(formwatch::WATCH_JS);
+                    let world = cstr(formwatch::WORLD);
+                    // Top frame only, and at document start so the listeners
+                    // are in place before a login page's own script runs.
+                    let script = webkit_user_script_new_for_world(
+                        source.as_ptr(),
+                        WebKitUserContentInjectedFrames::WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                        WebKitUserScriptInjectionTime::WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+                        world.as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    );
+                    webkit_user_content_manager_add_script(self.ucm, script);
+                    self.watcher = Some(script);
+                }
+                (false, Some(script)) => {
+                    webkit_user_content_manager_remove_script(self.ucm, script);
+                    webkit_user_script_unref(script);
+                }
+                // Already in the asked-for state; `take` above is why the
+                // enabled case has to put its handle back.
+                (true, Some(script)) => self.watcher = Some(script),
+                (false, None) => {}
+            }
+        }
+    }
+
+    /// Nudge the watcher into re-reporting the focused login field, for when
+    /// the chrome has something to offer that it did not have a moment ago.
+    pub fn request_form_state(&self) {
+        if self.watcher.is_none() {
+            return;
+        }
+        unsafe {
+            let source = cstr(super::formwatch::RESCAN_JS);
+            let world = cstr(super::formwatch::WORLD);
+            webkit_web_view_evaluate_javascript(
+                self.active_tab().webview,
+                source.as_ptr(),
+                -1,
+                world.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    /// The next login-field event the watcher reported.
+    pub fn take_form_event(&self) -> Option<super::formwatch::FormEvent> {
+        self.prompts.borrow_mut().form_events.pop_front()
+    }
+
+    /// Drop anything the watcher reported for a page that is going away, so a
+    /// stale focus cannot open a list over the next one.
+    pub fn clear_form_events(&self) {
+        self.prompts.borrow_mut().form_events.clear();
+    }
+
+    /// Put a picked account into the page's login fields.
+    ///
+    /// Runs in the watcher's world, where the elements it recorded live and
+    /// where the page cannot have replaced the setter being used. The script
+    /// carries the credential, so it is built here and dropped immediately;
+    /// it is never logged, and `source_uri` is left null so it cannot show up
+    /// named in a devtools listing either.
+    pub fn fill_credentials(&self, username: &str, password: &str) {
+        use super::formwatch;
+        let script = formwatch::fill_js(username, password);
+        unsafe {
+            let source = cstr(&script);
+            let world = cstr(formwatch::WORLD);
+            webkit_web_view_evaluate_javascript(
+                self.active_tab().webview,
+                source.as_ptr(),
+                -1,
+                world.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+            );
         }
     }
 
@@ -1195,6 +1331,10 @@ pub(super) struct Prompts {
     auth: Option<(*mut WebKitAuthenticationRequest, PendingAuth)>,
     /// The page asked for a context menu; the chrome draws its own.
     context_menu: Option<ContextMenuInfo>,
+    /// Login fields the account watcher reported, oldest first. A queue and
+    /// not a slot: a blur followed by a focus is two different states, and
+    /// collapsing them would leave the list open over the wrong field.
+    form_events: std::collections::VecDeque<crate::wpe::formwatch::FormEvent>,
 }
 
 /// What was under the pointer when the page asked for a context menu, read
@@ -1243,6 +1383,29 @@ unsafe fn connect_raw(
         Some(drop_prompts_ref),
         0,
     );
+}
+
+/// A message from the account watcher. Anything that does not parse as one of
+/// its events is dropped without comment — this is a channel the chrome acts
+/// on, so it accepts only what it recognizes.
+unsafe extern "C" fn on_account_message(
+    _ucm: *mut WebKitUserContentManager,
+    value: *mut JSCValue,
+    data: gpointer,
+) {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    let raw = jsc_value_to_string(value);
+    let Some(json) = from_cstr(raw) else { return };
+    g_free(raw as *mut _);
+    if let Some(event) = super::formwatch::parse_event(&json) {
+        let mut p = prompts.borrow_mut();
+        // A page that spins on scroll must not grow this without bound; the
+        // chrome only ever cares about the last few.
+        if p.form_events.len() > 8 {
+            p.form_events.pop_front();
+        }
+        p.form_events.push_back(event);
+    }
 }
 
 unsafe extern "C" fn drop_prompts_ref(data: gpointer, _c: *mut GClosure) {

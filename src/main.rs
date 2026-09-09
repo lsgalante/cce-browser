@@ -8,6 +8,7 @@
 //! unfolds from under it. Input over the page area is translated into Servo input events; the
 //! URL bar is a small hand-rolled line editor.
 
+mod accounts;
 mod downloads;
 mod instance;
 mod lineedit;
@@ -105,6 +106,16 @@ const BM_GAP: f32 = 6.0;
 const BM_RM_W: f32 = 24.0;
 const BM_FONT: f32 = 13.0;
 const BM_TEXT_PAD: f32 = 10.0;
+/// The account list: suggestions from cce-secrets, dropped at the login
+/// field they are for rather than at the bar, because that is where the
+/// person is looking.
+const AC_W: f32 = 300.0;
+const AC_ROW_H: f32 = 34.0;
+const AC_PAD: f32 = 5.0;
+/// Rows before the list scrolls with the selection.
+const AC_MAX_ROWS: usize = 6;
+const AC_FONT: f32 = 13.0;
+const AC_SUB_FONT: f32 = 11.0;
 /// Utility-bar fill; the negative alpha marks the plate as blur-behind.
 /// The blurred page is the base and this color tints it at |alpha|
 /// opacity — keep |alpha| low so the frosted content shows through.
@@ -310,6 +321,86 @@ enum BmHit {
     Manage,
 }
 
+/// The account list: what cce-secrets can offer the login field that is
+/// focused right now.
+///
+/// It belongs to a *field*, not to the bar — it opens when one takes focus,
+/// follows it when the page scrolls, and goes when focus does. Only the
+/// accounts matching the tab's own host are ever in it, and no password is
+/// fetched to build it: a pick is what asks the keyring for one.
+#[cfg(feature = "wpe")]
+struct AcMenu {
+    /// Matches for this host, before filtering.
+    all: Vec<accounts::Account>,
+    /// What survives what has been typed into the username field.
+    shown: Vec<accounts::Account>,
+    /// Keyboard selection, an index into `shown`.
+    selected: usize,
+    /// First visible row, when `shown` is longer than the list can show.
+    scroll: usize,
+    /// The field, in the chrome's own coordinates.
+    anchor: Rect,
+    /// The host this list was built for. A fetched password is checked
+    /// against it before it is filled: the keyring answers asynchronously,
+    /// and by then the tab could be somewhere else entirely.
+    host: String,
+    /// The page is not on a secure origin — worth saying before a password
+    /// goes into it.
+    insecure: bool,
+    /// Pointer-hovered row.
+    hover: Option<usize>,
+}
+
+#[cfg(feature = "wpe")]
+impl AcMenu {
+    /// Narrow the list to what has been typed. Matching is on the username
+    /// and the entry's title, case-insensitively and anywhere in either —
+    /// people type the middle of an address as readily as its start.
+    fn refilter(&mut self, typed: &str) {
+        let needle = typed.trim().to_lowercase();
+        self.shown = self
+            .all
+            .iter()
+            .filter(|a| {
+                needle.is_empty()
+                    || a.username.to_lowercase().contains(&needle)
+                    || a.label.to_lowercase().contains(&needle)
+            })
+            .cloned()
+            .collect();
+        self.selected = self.selected.min(self.shown.len().saturating_sub(1));
+        self.scroll = self.scroll.min(self.shown.len().saturating_sub(1));
+        self.keep_selected_visible();
+    }
+
+    fn first_row(&self) -> usize {
+        self.scroll
+            .min(self.shown.len().saturating_sub(self.shown.len().min(AC_MAX_ROWS)))
+    }
+
+    /// Move the keyboard selection, scrolling the window to follow it.
+    fn step(&mut self, delta: isize) {
+        if self.shown.is_empty() {
+            return;
+        }
+        let n = self.shown.len() as isize;
+        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+        self.keep_selected_visible();
+    }
+
+    fn keep_selected_visible(&mut self) {
+        let rows = self.shown.len().min(AC_MAX_ROWS);
+        if rows == 0 {
+            return;
+        }
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + rows {
+            self.scroll = self.selected + 1 - rows;
+        }
+    }
+}
+
 /// Every rect the menu draws and hit-tests, derived once — the same
 /// one-geometry rule the bar's own helpers follow.
 struct BmLayout {
@@ -326,6 +417,11 @@ struct BmLayout {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// The accounts worker answered a load: the index, or why it failed.
+    Accounts(Result<Vec<accounts::Account>, String>),
+    /// One entry's password arrived for the account at this object path.
+    /// The payload prints as `Secret(…)`; see `accounts::Secret`.
+    Credential(String, accounts::Secret),
     /// Servo requested an event-loop spin (waker or delegate signal).
     Spin,
     /// Last tab closed: exit the app.
@@ -388,6 +484,18 @@ struct BrowserApp {
     bookmarks: std::sync::Arc<pages::Bookmarks>,
     /// The open bookmarks menu, if any.
     bm_menu: Option<BmMenu>,
+    /// Accounts from cce-secrets, and the worker that reads them.
+    accounts: accounts::Accounts,
+    /// The open account list, if a login field is focused and something in
+    /// the keyring matches the page.
+    #[cfg(feature = "wpe")]
+    ac_menu: Option<AcMenu>,
+    /// The active tab's URL as of the last page-state sync, for spotting an
+    /// actual navigation. The engine's dirty flag is not that: it also fires
+    /// for a title, a loading transition, a favicon — and treating those as
+    /// navigations closed the account list in the same pump that opened it.
+    #[cfg(feature = "wpe")]
+    nav_url: Option<String>,
     /// Hovered pill in the favorites strip — a repaint, like the dot.
     fav_hover: Option<usize>,
 }
@@ -521,6 +629,18 @@ fn url_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     Rect { x, y: controls_y(bar), width: (right - x).max(60.0), height: BTN_H }
 }
 
+/// Whether a password filled into this page would leave it in the clear.
+///
+/// Loopback is not: nothing crosses a network. Everything else that is not
+/// https is, including a `file:` page, which has no origin to speak of.
+#[cfg(feature = "wpe")]
+fn insecure_origin(origin: &str, host: &str) -> bool {
+    let secure_scheme = origin.split(':').next() == Some("https");
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1")
+        || host.ends_with(".localhost");
+    !secure_scheme && !loopback
+}
+
 /// Turn URL-bar input into something loadable: a real URL as-is, a bare
 /// host gets https://, anything else becomes a search.
 fn parse_url_input(input: &str, search_prefix: &str) -> Option<Url> {
@@ -611,6 +731,185 @@ impl BrowserApp {
     fn toggle_favorite(&mut self) {
         self.host.toggle_favorite();
         self.refresh_favorites();
+    }
+
+    /// The tab's host, for matching accounts and for checking that a field
+    /// event came from the page the chrome thinks is on screen.
+    fn page_host(&self) -> Option<String> {
+        self.host.url().and_then(|u| u.host_str().map(str::to_string))
+    }
+
+    /// A login field was reported. Open, move or refill the account list.
+    ///
+    /// The origin check is the guard: the watcher runs in the top frame, so
+    /// its origin must be the tab's own. Anything else is dropped rather than
+    /// offered a credential.
+    #[cfg(feature = "wpe")]
+    fn on_form_event(&mut self, event: wpe::FormEvent) -> bool {
+        use wpe::FormEvent;
+        if !self.settings.accounts {
+            return false;
+        }
+        match event {
+            FormEvent::Blur => {
+                let was = self.ac_menu.is_some();
+                self.ac_menu = None;
+                was
+            }
+            FormEvent::Field { origin, password, rect, value, moved } => {
+                log::debug!(
+                    "login field: password={password} moved={moved} origin={origin} \
+                     page={:?} rect={rect:?}",
+                    self.page_host()
+                );
+                let Some(host) = self.page_host() else {
+                    self.ac_menu = None;
+                    return false;
+                };
+                let same_origin = url::Url::parse(&origin)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h == host))
+                    .unwrap_or(false);
+                if !same_origin {
+                    self.ac_menu = None;
+                    return false;
+                }
+                // The index is read the first time a login field appears —
+                // never at launch, so a browser that sees no login form never
+                // opens the keyring.
+                self.accounts.ensure_loaded();
+                let anchor = self.field_rect(rect);
+                let all = self.accounts.matching(&host);
+                log::debug!("{} accounts match {host}", all.len());
+                let insecure = insecure_origin(&origin, &host);
+                // A password field filters by nothing; a username field by
+                // what is in it.
+                let filter = if password { String::new() } else { value };
+                match self.ac_menu.as_mut() {
+                    Some(menu) if moved => {
+                        menu.anchor = anchor;
+                        menu.all = all;
+                        menu.host = host.clone();
+                        menu.insecure = insecure;
+                        menu.refilter(&filter);
+                    }
+                    _ => {
+                        let mut menu = AcMenu {
+                            all,
+                            shown: Vec::new(),
+                            selected: 0,
+                            scroll: 0,
+                            anchor,
+                            host: host.clone(),
+                            insecure,
+                            hover: None,
+                        };
+                        menu.refilter(&filter);
+                        self.ac_menu = Some(menu);
+                    }
+                }
+                // An empty list is no list: nothing matched, or the index is
+                // still loading and the next `Accounts` message will reopen.
+                if self.ac_menu.as_ref().is_some_and(|m| m.shown.is_empty()) {
+                    self.ac_menu = None;
+                }
+                true
+            }
+        }
+    }
+
+    /// A viewport rect from the page, in the chrome's coordinates.
+    ///
+    /// These are the same space, and that is worth stating rather than
+    /// rediscovering: `resize` gives WPE the **logical** size and sets the
+    /// scale separately (`logical_size`), so a CSS pixel in the page is a
+    /// logical pixel in the chrome at any output scale. Verified at scale 2.
+    #[cfg(feature = "wpe")]
+    fn field_rect(&self, rect: (f32, f32, f32, f32)) -> Rect {
+        Rect { x: rect.0, y: rect.1, width: rect.2, height: rect.3 }
+    }
+
+    /// Hand a picked account's credential to the page and close the list.
+    ///
+    /// The keyring answers on its own schedule — an unlock prompt can put
+    /// seconds between the pick and this — so everything is checked again
+    /// here: the list is still open, it still holds the account that was
+    /// picked, and the tab is still on the host it was opened for. If any of
+    /// that has changed the credential is dropped on the floor rather than
+    /// typed into whatever page is there now.
+    #[cfg(feature = "wpe")]
+    fn fill_account(&mut self, path: &str, secret: &accounts::Secret) {
+        let same_page = self
+            .ac_menu
+            .as_ref()
+            .zip(self.page_host())
+            .is_some_and(|(menu, host)| menu.host == host);
+        let username = self
+            .ac_menu
+            .as_ref()
+            .filter(|_| same_page)
+            .and_then(|m| m.shown.iter().find(|a| a.path == path))
+            .map(|a| a.username.clone());
+        match username {
+            Some(username) => self.host.fill_credentials(&username, secret.expose()),
+            None => log::warn!("dropped a credential: the page moved on before it arrived"),
+        }
+        self.ac_menu = None;
+    }
+
+    /// Ask for the password behind the selected row.
+    #[cfg(feature = "wpe")]
+    fn pick_account(&mut self, index: usize) {
+        let Some(account) = self.ac_menu.as_ref().and_then(|m| m.shown.get(index)) else {
+            return;
+        };
+        // The secret is fetched now, for this one entry, and arrives as
+        // `Message::Credential`. Nothing is held in the menu.
+        self.accounts.fetch(&account.path);
+    }
+
+    /// The account list's plate and rows, or `None` when it is closed. Draw
+    /// and hit-test read this, as everywhere else in this chrome.
+    #[cfg(feature = "wpe")]
+    fn ac_layout(&self) -> Option<(Rect, Vec<Rect>)> {
+        let menu = self.ac_menu.as_ref()?;
+        if menu.shown.is_empty() {
+            return None;
+        }
+        let rows = menu.shown.len().min(AC_MAX_ROWS);
+        let height = 2.0 * AC_PAD + rows as f32 * AC_ROW_H + if menu.insecure { 18.0 } else { 0.0 };
+        let width = AC_W.min(self.win.0 - 2.0 * BAR_MARGIN).max(180.0);
+        let x = menu
+            .anchor
+            .x
+            .clamp(0.0, (self.win.0 - width).max(0.0));
+        // Under the field, or above it when there is no room below — the
+        // list must never cover the field it is filling.
+        let below = menu.anchor.y + menu.anchor.height + 2.0;
+        let y = if below + height <= self.win.1 - BAR_MARGIN {
+            below
+        } else {
+            (menu.anchor.y - 2.0 - height).max(0.0)
+        };
+        let plate = Rect { x, y, width, height };
+        // Row *positions*; which account each shows is `first_row() + k`.
+        let rects = (0..rows)
+            .map(|k| Rect {
+                x: plate.x + 2.0,
+                y: plate.y + AC_PAD + (k as f32) * AC_ROW_H,
+                width: plate.width - 4.0,
+                height: AC_ROW_H,
+            })
+            .collect();
+        Some((plate, rects))
+    }
+
+    /// The account row at a pointer position, if any.
+    #[cfg(feature = "wpe")]
+    fn ac_hit(&self, x: f32, y: f32) -> Option<usize> {
+        let (_, rows) = self.ac_layout()?;
+        let first = self.ac_menu.as_ref()?.first_row();
+        rows.iter().position(|r| hit(r, x, y)).map(|k| first + k)
     }
 
     /// Whether the active page is one that can be saved at all: an internal
@@ -1049,6 +1348,13 @@ impl BrowserApp {
             return false;
         }
         downloads::set_download_dir(new.download_dir.clone());
+        #[cfg(feature = "wpe")]
+        if new.accounts != self.settings.accounts {
+            self.host.set_accounts_enabled(new.accounts);
+            if !new.accounts {
+                self.ac_menu = None;
+            }
+        }
         self.host.set_history_enabled(new.history);
         self.host.set_color_scheme_dark(new.color_scheme.is_dark());
         self.host.set_force_dark(new.color_scheme.forces_dark());
@@ -1144,6 +1450,12 @@ impl BrowserApp {
     }
 
     fn switch_tab(&mut self, index: usize) {
+        // The other tab has its own fields, and may have none.
+        #[cfg(feature = "wpe")]
+        {
+            self.ac_menu = None;
+            self.host.clear_form_events();
+        }
         self.host.activate(index);
         self.url_focused = false;
         self.sync_page_state();
@@ -1257,6 +1569,71 @@ impl BrowserApp {
                 cce_ui::layout::align_text_y(rect.y, rect.height, 13.0, 0.0),
                 13.0,
                 TEXT,
+            );
+        }
+    }
+
+    /// Draw the account list at the login field it belongs to.
+    ///
+    /// Two lines per row: the username that will be filled, and the entry's
+    /// own title under it, because a keyring holds several accounts on one
+    /// site and the title is how they were told apart when they were saved.
+    #[cfg(feature = "wpe")]
+    fn paint_ac_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
+        let Some((plate, rows)) = self.ac_layout() else { return };
+        let Some(menu) = self.ac_menu.as_ref() else { return };
+        let first = menu.first_row();
+        pc.plate(
+            plate,
+            (8.0, 8.0, 8.0, 8.0),
+            [0.13, 0.14, 0.16, 1.0],
+            cce_ui::layout::bevel_width().min(3.0),
+        );
+        for (k, r) in rows.iter().enumerate() {
+            let Some(account) = menu.shown.get(first + k) else { continue };
+            let picked = first + k == menu.selected || menu.hover == Some(first + k);
+            if picked {
+                pc.rounded_rect(*r, 5.0, (true, true, true, true), TAB_ACTIVE_BG);
+            }
+            let width = r.width - 2.0 * BM_TEXT_PAD;
+            let user = if account.username.is_empty() {
+                account.label.clone()
+            } else {
+                account.username.clone()
+            };
+            pc.text(
+                Self::fit_text(&user, sans, AC_FONT, width),
+                r.x + BM_TEXT_PAD,
+                r.y + 5.0,
+                AC_FONT,
+                TEXT,
+            );
+            // The second line names where the entry came from: its title, and
+            // the site it is stored against when that is not the title.
+            let mut sub = account.label.clone();
+            if let Some(host) = account.host() {
+                if !sub.to_lowercase().contains(&host) {
+                    sub = if sub.is_empty() { host } else { format!("{sub} — {host}") };
+                }
+            }
+            pc.text(
+                Self::fit_text(&sub, sans, AC_SUB_FONT, width),
+                r.x + BM_TEXT_PAD,
+                r.y + 5.0 + AC_FONT + 3.0,
+                AC_SUB_FONT,
+                TEXT_DIM,
+            );
+        }
+        // Say it plainly when the page is not https: the password is about to
+        // cross the network in the clear, and only the person can decide that
+        // is fine.
+        if menu.insecure {
+            pc.text(
+                "insecure page — this password would be sent unencrypted",
+                plate.x + BM_TEXT_PAD,
+                plate.y + plate.height - 15.0,
+                AC_SUB_FONT,
+                [212, 155, 155],
             );
         }
     }
@@ -1510,7 +1887,8 @@ impl Application for BrowserApp {
         let first = queue.remove(0);
 
         #[cfg(all(not(feature = "wpe"), feature = "servo"))]
-        let mut host = Host::new(sender, first, (1200, 800), settings.color_scheme.forces_dark());
+        let mut host =
+            Host::new(sender.clone(), first, (1200, 800), settings.color_scheme.forces_dark());
         #[cfg(feature = "wpe")]
         let mut host = {
             let _ = &sender; // WPE wakes through register_sources, not a waker
@@ -1535,6 +1913,9 @@ impl Application for BrowserApp {
         host.set_color_scheme_dark(settings.color_scheme.is_dark());
         #[cfg(feature = "wpe")]
         host.set_force_dark(settings.color_scheme.forces_dark());
+        #[cfg(feature = "wpe")]
+        host.set_accounts_enabled(settings.accounts);
+        let accounts = accounts::Accounts::spawn(sender.clone());
         let favorites = host.favorites();
         let favs = favorites.snapshot();
         let bookmarks = host.bookmarks();
@@ -1564,6 +1945,11 @@ impl Application for BrowserApp {
             fav_hover: None,
             bookmarks,
             bm_menu: None,
+            accounts,
+            #[cfg(feature = "wpe")]
+            ac_menu: None,
+            #[cfg(feature = "wpe")]
+            nav_url: None,
         }
     }
 
@@ -1641,13 +2027,59 @@ impl Application for BrowserApp {
                     self.open_internal_page("cce://downloads");
                 }
                 if dirty {
+                    // A navigation retires whatever field was focused. Only a
+                    // real one: the URL changing, not the dirty flag, which
+                    // also fires while the page that owns the field is still
+                    // settling.
+                    #[cfg(feature = "wpe")]
+                    {
+                        let now = self.host.url().map(|u| u.to_string());
+                        if now != self.nav_url {
+                            self.nav_url = now;
+                            self.ac_menu = None;
+                        }
+                    }
                     self.sync_page_state();
                     // Navigation reaches the tab set through these signals,
                     // so this is where an address change gets persisted.
                     self.persist_session();
                 }
+                // Drained after the navigation check, so a field reported in
+                // the same pump that finished the load is not thrown away
+                // with the page it arrived on.
+                #[cfg(feature = "wpe")]
+                while let Some(event) = self.host.take_form_event() {
+                    if self.on_form_event(event) {
+                        *needs_rebuild = true;
+                    }
+                }
                 if new_frame || dirty {
                     *needs_rebuild = true;
+                }
+            }
+            Message::Accounts(result) => {
+                match &result {
+                    Ok(list) => log::info!("accounts: {} entries from the keyring", list.len()),
+                    Err(e) => log::warn!("accounts unavailable: {e}"),
+                }
+                self.accounts.loaded(result);
+                // A field may have been focused while the index was still
+                // being read; this is when its list can finally open.
+                #[cfg(feature = "wpe")]
+                {
+                    self.host.request_form_state();
+                    *needs_rebuild = true;
+                }
+            }
+            Message::Credential(path, secret) => {
+                #[cfg(feature = "wpe")]
+                {
+                    self.fill_account(&path, &secret);
+                    *needs_rebuild = true;
+                }
+                #[cfg(not(feature = "wpe"))]
+                {
+                    let _ = (path, secret);
                 }
             }
             Message::Quit => *exit = true,
@@ -1718,6 +2150,22 @@ impl Application for BrowserApp {
             *_needs_rebuild = true;
             return;
         }
+        // The account list tracks hover the same way, and shields the page
+        // under it.
+        #[cfg(feature = "wpe")]
+        if self.ac_menu.is_some() {
+            let over = self.ac_hit(pos.x, pos.y);
+            if self.ac_menu.as_ref().is_some_and(|m| m.hover != over) {
+                if let Some(m) = self.ac_menu.as_mut() {
+                    m.hover = over;
+                }
+                *_needs_rebuild = true;
+            }
+            if over.is_some() {
+                return;
+            }
+        }
+
         // An open bookmarks menu tracks hover, and the page under it sees
         // no moves at all.
         if self.bm_menu.is_some() {
@@ -1801,6 +2249,25 @@ impl Application for BrowserApp {
                 }
             }
             return None;
+        }
+
+        // A click on an account row picks it. A click anywhere else closes
+        // the list and goes on to the page as usual — unlike the chrome's own
+        // menus, this one sits over the page's own controls, and swallowing
+        // the click that dismisses it would eat a button press.
+        #[cfg(feature = "wpe")]
+        if self.ac_menu.is_some() {
+            if let Some(index) = self.ac_hit(pos.x, pos.y) {
+                if pressed && button == MouseButton::Left {
+                    self.pick_account(index);
+                }
+                *needs_rebuild = true;
+                return None;
+            }
+            if pressed {
+                self.ac_menu = None;
+                *needs_rebuild = true;
+            }
         }
 
         // The bookmarks menu owns the next click while it is open: a row
@@ -1933,6 +2400,16 @@ impl Application for BrowserApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        // The account list moves with its field, so the page keeps the
+        // wheel — but not under the plate itself.
+        #[cfg(feature = "wpe")]
+        if self
+            .ac_layout()
+            .is_some_and(|(plate, _)| hit(&plate, pos.x, pos.y))
+        {
+            return;
+        }
+
         // An open menu takes the wheel: over its plate it scrolls the list,
         // anywhere else it is swallowed rather than scrolling the page
         // behind it.
@@ -2013,6 +2490,43 @@ impl Application for BrowserApp {
                 _ => {}
             }
             return None;
+        }
+
+        // An open account list takes the keys that drive it, and passes on
+        // everything else — the person is typing into the page's own field,
+        // and that typing is what filters the list.
+        #[cfg(feature = "wpe")]
+        if self.ac_menu.is_some() && event.state == ElementState::Pressed && !self.url_focused {
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowDown) => {
+                    if let Some(m) = self.ac_menu.as_mut() {
+                        m.step(1);
+                    }
+                    *needs_rebuild = true;
+                    return None;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    if let Some(m) = self.ac_menu.as_mut() {
+                        m.step(-1);
+                    }
+                    *needs_rebuild = true;
+                    return None;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    let selected = self.ac_menu.as_ref().map(|m| m.selected);
+                    if let Some(i) = selected {
+                        self.pick_account(i);
+                    }
+                    *needs_rebuild = true;
+                    return None;
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.ac_menu = None;
+                    *needs_rebuild = true;
+                    return None;
+                }
+                _ => {}
+            }
         }
 
         // An open bookmarks menu owns Escape, ahead of the URL bar and the
@@ -2364,6 +2878,8 @@ impl Application for BrowserApp {
 
         self.paint_bm_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
+        self.paint_ac_menu(&mut pc, &sans);
+        #[cfg(feature = "wpe")]
         self.paint_ctx_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_modal(&mut pc, &sans);
@@ -2415,6 +2931,19 @@ mod tests {
         assert_eq!(bar.scheme(), "https");
 
         std::fs::remove_file(&page).unwrap();
+    }
+
+    #[cfg(feature = "wpe")]
+    #[test]
+    fn only_loopback_escapes_the_insecure_warning() {
+        assert!(!insecure_origin("https://example.com", "example.com"));
+        assert!(insecure_origin("http://example.com", "example.com"));
+        assert!(!insecure_origin("http://localhost:8731", "localhost"));
+        assert!(!insecure_origin("http://127.0.0.1:8080", "127.0.0.1"));
+        assert!(!insecure_origin("http://dev.localhost", "dev.localhost"));
+        // A file: page has no transport to secure, and no origin worth the
+        // name; say so rather than stay quiet.
+        assert!(insecure_origin("null", ""));
     }
 
     #[test]

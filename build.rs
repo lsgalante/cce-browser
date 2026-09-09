@@ -29,7 +29,14 @@ fn main() {
         // The engine, the embedding layer, and just enough GObject to
         // register subclasses and turn a main loop.
         .allowlist_item("(wpe|WPE|webkit|WebKit)_?.*")
+        // JavaScriptCore: a script message from the page arrives as a
+        // JSCValue, so reading one needs `jsc_value_*`. webkit.h already
+        // pulls in jsc.h; only the allowlist kept these out.
+        .allowlist_item("(jsc|JSC)_?.*")
         .allowlist_item("g_(object|type|signal|bytes|timeout|free|error)_.*")
+        // `g_free` itself, with no trailing word, misses the pattern above —
+        // and a JSC string comes back owned, so it is needed to hand it back.
+        .allowlist_function("g_free")
         // The main loop AND the context: `pump` drains the context directly.
         .allowlist_item("g_main_(loop|context)_.*")
         .allowlist_item("G(Object|Type|Value|Bytes|Error|MainLoop|ParamSpec|Closure).*")

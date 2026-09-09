@@ -25,6 +25,8 @@ Eight files, ~3k lines:
 | `src/downloads.rs` | the chrome-side download pipeline (Servo has none) |
 | `src/session.rs` | open-tab persistence: the tab set survives a restart |
 | `src/settings.rs` | the per-app KDL config |
+| `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, and which entries a host earns |
+| `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher script, the fill script, and the events between them |
 
 ## Build
 
@@ -294,6 +296,80 @@ Wheel events pass **winit-signed deltas** (positive = up) with no separate scrol
 event: Servo hit-tests the wheel, gives the page its `preventDefault` chance, and
 applies the inverted delta itself.
 
+## Account autocomplete (cce-secrets)
+
+A login field on a page gets a list of the accounts the keyring holds for that
+site; picking one fills the username and password. There is no cce-secrets
+*protocol* — that app fronts the freedesktop **Secret Service** (gnome-keyring
+here) and so does this, reading the same entries: item label as the title,
+`UserName` and `URL` as attributes. `browser.accounts` (default true) is the
+one switch; with it off nothing is injected and the keyring is never opened.
+
+Three files meet: `accounts.rs` (which entries a host earns, and the worker
+that reads them), `wpe/formwatch.rs` (the page half), and `AcMenu` in
+`main.rs` (the list itself, drawn at the field like every other menu here).
+WPE only — the retired Servo backend has no user-script hooks — so the chrome
+side is `#[cfg(feature = "wpe")]`, while `accounts.rs` is not.
+
+The security shape is the design, not decoration:
+
+- **Everything runs in a private script world** (`formwatch::WORLD`). The page
+  cannot see or replace the watcher's helpers, so it cannot hook the moment a
+  credential is filled, and it cannot post on the chrome's message channel to
+  fake a focused field.
+- **Top frame only.** A password field in a cross-origin iframe gets no
+  suggestions: such a frame cannot report a position in the top document's
+  coordinates anyway, and an embedded frame asking for the embedder's
+  credentials is the attack this must not enable. The reported `location.origin`
+  is checked against the tab's own host on every event, on top of that.
+- **Matching is narrow** (`Account::matches`): exact host, or a *parent* domain
+  covering its subdomains — never upward, never sideways. An entry with no URL
+  falls back to its title against the site name (`GitHub` → `github.com`), the
+  one guess in here, made only when there is nothing better.
+- **No password is fetched to build a list.** Listing reads labels, usernames
+  and URLs; the pick is what asks the keyring for one secret, by object path.
+  `accounts::Secret` prints as `Secret(…)` so a derived `Debug` on `Message`
+  cannot spill it into a log.
+- **The fill is re-checked when it lands.** An unlock prompt can put seconds
+  between the pick and the answer, so `fill_account` drops the credential
+  unless the list is still open, still holds that account, and the tab is
+  still on the host it was opened for.
+- **Never automatic.** Nothing fills without a pick, nothing submits the form,
+  and a locked collection is skipped rather than unlocked — the browser asking
+  for the keyring password because a page happened to show a login field would
+  be its own phishing lesson. cce-secrets is where unlocking belongs.
+- The list says so when the page is not https and not loopback
+  (`insecure_origin`): the password would cross the network in the clear, and
+  only the person can decide that is fine.
+
+Things that were learned the hard way and are easy to undo:
+
+- **The keyring is read on the first login field, never at launch.** A browser
+  that never sees one never opens the store, which is what keeps this from
+  costing an unlock prompt at login.
+- **A field can be focused before the index has finished loading** — it always
+  is, on a page that autofocuses. The chrome answers the load by asking the
+  watcher to re-report (`request_form_state` → `RESCAN_JS`); without that
+  nudge the first login form of a session silently gets nothing.
+- **The engine's dirty flag is not a navigation.** Clearing the list on
+  `dirty` closed it in the same pump that opened it (title and loading
+  transitions set it too). It is keyed on the tab's URL actually changing
+  (`nav_url`), and form events are drained *after* that check so an event
+  arriving with the load survives it.
+- **A fill must not report itself.** The `input` and `change` events the fill
+  dispatches — which are the point, since frameworks ignore a plain assignment
+  — came back as "the user typed" and re-opened the list, filtered by the name
+  just filled in. The watcher holds a `filling` flag across the fill.
+- **CSS pixels are the chrome's logical pixels.** `resize` hands WPE the
+  *logical* size and sets the scale separately, so a viewport rect from the
+  page needs no conversion at any output scale (verified at scale 2).
+
+Testing it needs an isolated keyring, never the real one: `dbus-run-session`
+plus `gnome-keyring-daemon --unlock --components=secrets`, seeded with
+`secret-tool`, and the browser launched into that bus with
+`DBUS_SESSION_BUS_ADDRESS`. A `file:` page will not do — its origin is `null`,
+so serve the fixture over http on localhost.
+
 ## `cce://` pages
 
 `CceProtocol` registers the `cce` scheme with Servo's `ProtocolRegistry`, so
@@ -391,9 +467,11 @@ clipboard path as the rest of the DE.
 
 ## Not implemented yet
 
-Worth knowing before assuming a bug: no find-in-page, no zoom, no context menu, no
-favicons, no history/URL autocomplete, and no delegate hooks for JS dialogs
-(`alert`/`confirm`), permission prompts, or HTTP auth. Ctrl+Shift+O ("hand this page to
+Worth knowing before assuming a bug: no find-in-page, no zoom, no favicons, and no
+history/URL autocomplete. (The context menu, JS dialogs and HTTP auth landed with the
+WPE backend and are Servo-only gaps now.) Account autocomplete does not *save* a new
+login — cce-secrets is where entries are written — and it does not fill inside
+cross-origin iframes. Ctrl+Shift+O ("hand this page to
 another browser") is the deliberate escape hatch for pages Servo cannot follow, such as
 a Cloudflare challenge that never completes.
 

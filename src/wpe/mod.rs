@@ -13,7 +13,11 @@ mod subclass;
 mod input;
 mod glib_source;
 mod host;
+/// The page half of account autocomplete: the watcher script, the fill
+/// script, and the events they exchange with the chrome.
+pub mod formwatch;
 
 // Not consumed yet — main.rs still drives ServoHost.
 #[allow(unused_imports)]
+pub use formwatch::FormEvent;
 pub use host::{ContextMenuInfo, PendingAuth, PendingDialog, Tab, WebKitHost};

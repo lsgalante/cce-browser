@@ -88,6 +88,10 @@ pub struct Settings {
     pub download_dir: Option<PathBuf>,
     /// Record page visits to cce://history.
     pub history: bool,
+    /// Offer accounts from cce-secrets on login forms. On by default, and a
+    /// single switch for the whole feature: with it off the browser injects
+    /// no watcher script and never opens the keyring.
+    pub accounts: bool,
     /// Window edge the utility bar floats against.
     pub bar_position: BarPosition,
     /// What pages are told to prefer.
@@ -104,6 +108,7 @@ impl Default for Settings {
             search_prefix: search_prefix("duckduckgo").to_string(),
             download_dir: None,
             history: true,
+            accounts: true,
             bar_position: BarPosition::Top,
             color_scheme: ColorScheme::Dark,
             external_browser: None,
@@ -146,6 +151,7 @@ pub fn load() -> Settings {
         search_prefix: search_prefix(b["search"].as_str().unwrap_or("duckduckgo")).to_string(),
         download_dir,
         history: b["history"].as_bool().unwrap_or(true),
+        accounts: b["accounts"].as_bool().unwrap_or(true),
         bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
         color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("dark")),
         external_browser: b["external-browser"]

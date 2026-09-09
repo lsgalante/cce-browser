@@ -31,6 +31,18 @@ euclid = { version = "0.22", optional = true }
 rustls = { version = "0.23", features = ["aws-lc-rs"], optional = true }
 log = "0.4"
 env_logger = "0.11"
+# Accounts from cce-secrets: the same Secret Service store cce-secrets
+# fronts (gnome-keyring here), read over D-Bus. The *blocking* API on a
+# worker thread, deliberately — an unlock prompt can block for as long as it
+# takes and must never be on the frame path — so no async runtime is pulled
+# into the browser: async-io, not tokio.
+secret-service = { version = "5", features = ["rt-async-io-crypto-rust"] }
+# The account watcher's page messages are JSON, and cce-ui parses config
+# through serde_json already — this only names the parser directly.
+serde_json = "1"
+# Naming a Secret Service object path (the handle a picked account's secret is
+# fetched by). Already in the tree under secret-service; this only names it.
+zbus = "5"
 # Only used by the `wpe` backend, to hold GLib's changing pollfd set in one
 # epoll fd that calloop can watch. Optional so a default build skips it.
 rustix = { version = "0.38", features = ["event"], optional = true }
