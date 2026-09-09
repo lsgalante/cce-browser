@@ -680,6 +680,12 @@ impl WebKitHost {
         }
     }
 
+    /// The bookmarks store, shared with the `cce://bookmarks` page; the
+    /// chrome's bookmarks menu lists and edits it directly.
+    pub fn bookmarks(&self) -> std::sync::Arc<crate::pages::Bookmarks> {
+        self.bookmarks.clone()
+    }
+
     /// The favorites store, shared with the `cce://favorites` page; the
     /// chrome reads the strip from it.
     pub fn favorites(&self) -> std::sync::Arc<crate::pages::Favorites> {

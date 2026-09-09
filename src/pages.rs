@@ -229,6 +229,18 @@ impl Bookmarks {
         write_tsv(&self.path, &entries);
     }
 
+    /// The bookmarks as the chrome's menu lists them: newest first, the
+    /// same order the `cce://bookmarks` page renders.
+    pub fn snapshot(&self) -> Vec<Link> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|e| Link { url: e.url.clone(), label: default_label(&e.url, &e.title) })
+            .collect()
+    }
+
     /// The title a bookmark was saved with, for promoting it to a favorite
     /// from the bookmarks page without re-fetching anything.
     pub fn title_of(&self, url: &str) -> Option<String> {
@@ -281,9 +293,11 @@ fn url_encode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-/// A favorite as the chrome shows it: the pill's label and where it goes.
+/// One saved place as the chrome shows it: a label and where it goes.
+/// Shared by the favorites strip's pills and the bookmarks menu's rows —
+/// both want a display label, not a raw URL.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Favorite {
+pub struct Link {
     pub url: String,
     pub label: String,
 }
@@ -326,12 +340,12 @@ impl Favorites {
     }
 
     /// The strip, in order.
-    pub fn snapshot(&self) -> Vec<Favorite> {
+    pub fn snapshot(&self) -> Vec<Link> {
         self.entries
             .lock()
             .unwrap()
             .iter()
-            .map(|e| Favorite { url: e.url.clone(), label: default_label(&e.url, &e.title) })
+            .map(|e| Link { url: e.url.clone(), label: default_label(&e.url, &e.title) })
             .collect()
     }
 
@@ -602,6 +616,20 @@ mod tests {
         let back = Favorites { entries: Mutex::new(read_tsv(&f.path)), path: f.path.clone() };
         assert_eq!(back.snapshot(), f.snapshot());
         let _ = fs::remove_dir_all(f.path.parent().unwrap());
+    }
+
+    #[test]
+    fn bookmarks_list_newest_first_with_labelled_entries() {
+        let dir = std::env::temp_dir().join(format!("cce-browser-bm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let b = Bookmarks { entries: Mutex::new(Vec::new()), path: dir.join("bookmarks.tsv") };
+        b.toggle("https://www.first.example/a", "First");
+        b.toggle("https://second.example/b", "");
+        let seen: Vec<(String, String)> =
+            b.snapshot().into_iter().map(|l| (l.label, l.url)).collect();
+        assert_eq!(seen[0].0, "second.example", "newest first, host as the fallback label");
+        assert_eq!(seen[1].0, "First");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

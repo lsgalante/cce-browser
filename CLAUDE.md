@@ -183,6 +183,47 @@ leaves the bar out. Insertion order is strip order; the page reorders
 (▲/▼), renames (a GET form per row — form submissions reach the `cce:`
 handler like any other navigation) and removes.
 
+### The bookmarks menu
+
+The controls row's **"B" button** (immediately left of the star) drops the
+bookmarks menu: the star is *this* page's bookmark, the button beside it is
+all of them. Three sections — add/remove this page, the saved pages
+themselves (newest first, the `cce://bookmarks` order), and
+`Manage Bookmarks (n)` which hands the collection to that page. A row visits
+in the active tab and folds everything away, middle-click opens it in a new
+tab and leaves the menu up, and the **remove "x"** on the hovered row prunes
+in place. It closes on Escape (ahead of the URL bar and the page), on a
+click anywhere off its plate, and with the bar it hangs from.
+
+Points that are choices, not accidents:
+
+- **It snapshots the store when it opens.** A list a pointer is travelling
+  down must not reorder underneath it, so the two edits it offers re-read
+  explicitly (`refresh_bm_menu`) rather than the paint path reading the
+  store every frame.
+- **It is not gated on an engine backend**, unlike the right-click menu:
+  bookmarks are app state, so both hosts expose `bookmarks()` and the menu
+  works on either.
+- **`bm_layout()` is the one geometry** draw and hit-test both read — plate,
+  toggle row, visible entry rows, manage row. It hangs off the button
+  (**below** a top bar, **above** a bottom one), right-aligned to it and
+  clamped on screen, and never grows past the space it has: `cap` is how
+  many rows fit and the list **scrolls** past that, wheel included, rather
+  than the plate running off the window.
+- **An open menu owns the pointer**: clicks, moves and the wheel all stop at
+  it, exactly as the right-click menu already did, so the page behind never
+  sees a click that was meant to dismiss a menu.
+- Rows are drawn at **full brightness**. Dim means *unavailable* everywhere
+  else in this chrome (the disabled toggle on an internal page says so that
+  way), and hover is the highlight rect's job.
+- Opening drops URL-bar focus, for the same reason folding does: a field
+  behind a menu must not keep eating keystrokes.
+
+`Ctrl+B` still opens the `cce://bookmarks` page rather than this menu — the
+page is the fuller tool, and the menu is a pointer affordance.
+
+### Favorites geometry
+
 Geometry points that are choices: the bar has **no empty row** — with no
 favorites it is the two-row bar it always was (`bar_h(favorites)`), so
 `controls_y` is measured from the bar's *bottom* edge rather than counted
@@ -224,7 +265,8 @@ bar.
 Menu semantics, all in `handle_mouse_input` / `handle_key_input`:
 
 - **Open**: click the dot; `Ctrl+L` (then focuses the URL); `Ctrl+T` (a new
-  tab focuses the URL field, which must be on screen).
+  tab focuses the URL field, which must be on screen). The bookmarks menu
+  is a second layer inside the open bar, and folding takes it with it.
 - **Fold**: click the dot again; click the page; `Escape` with the URL
   unfocused (the first Escape in a focused field only drops focus, as
   before); submitting a URL; picking a tab. Closing a tab does *not* fold —

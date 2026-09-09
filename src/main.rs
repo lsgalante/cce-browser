@@ -92,6 +92,19 @@ const FAV_GAP: f32 = 4.0;
 const FAV_MAX_W: f32 = 150.0;
 const FAV_PAD_X: f32 = 9.0;
 const FAV_FONT: f32 = 12.0;
+/// The bookmarks menu: a plate of rows dropped from the controls row's "B"
+/// button — the bar's own way to visit and manage what the star saves.
+const BM_W: f32 = 320.0;
+const BM_ROW_H: f32 = 24.0;
+const BM_PAD: f32 = 6.0;
+/// Height of the rule between the menu's three sections.
+const BM_SEP_H: f32 = 9.0;
+/// Gap between the bar and the menu it drops (or raises).
+const BM_GAP: f32 = 6.0;
+/// The remove hit region at a bookmark row's right end.
+const BM_RM_W: f32 = 24.0;
+const BM_FONT: f32 = 13.0;
+const BM_TEXT_PAD: f32 = 10.0;
 /// Utility-bar fill; the negative alpha marks the plate as blur-behind.
 /// The blurred page is the base and this color tints it at |alpha|
 /// opacity — keep |alpha| low so the frosted content shows through.
@@ -270,6 +283,47 @@ impl CtxMenu {
     }
 }
 
+/// The bookmarks menu: the bar's list of saved pages, open under (or over)
+/// the "B" button in the controls row.
+///
+/// It holds a **snapshot** of the store rather than reading it per frame:
+/// the list a pointer is travelling down must not reorder underneath it,
+/// and the two edits it offers (bookmark this page, remove a row) re-read
+/// explicitly. Unlike the right-click menu this is not gated on an engine
+/// backend — bookmarks are app state, so the menu works on either.
+struct BmMenu {
+    items: Vec<pages::Link>,
+    /// First listed bookmark, when there are more than the plate can show.
+    scroll: usize,
+    hover: Option<BmHit>,
+}
+
+/// What a pointer position falls on inside the menu.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BmHit {
+    /// The add/remove row for the page in the active tab.
+    Toggle,
+    /// A bookmark row: its index, and whether the pointer is on the remove
+    /// region at the row's right end rather than on the row itself.
+    Entry(usize, bool),
+    /// Hands the whole collection to `cce://bookmarks`.
+    Manage,
+}
+
+/// Every rect the menu draws and hit-tests, derived once — the same
+/// one-geometry rule the bar's own helpers follow.
+struct BmLayout {
+    plate: Rect,
+    toggle: Rect,
+    /// `(rect, index into items)` for each row the plate can show.
+    rows: Vec<(Rect, usize)>,
+    /// The "nothing saved yet" row, in place of the list.
+    empty: Option<Rect>,
+    manage: Rect,
+    /// How many bookmarks fit; more than this and the list scrolls.
+    cap: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Servo requested an event-loop spin (waker or delegate signal).
@@ -328,7 +382,12 @@ struct BrowserApp {
     /// `cce://favorites` page, which edits it); `favs` is the strip as last
     /// read from it, refreshed with the rest of the page state.
     favorites: std::sync::Arc<pages::Favorites>,
-    favs: Vec<pages::Favorite>,
+    favs: Vec<pages::Link>,
+    /// The bookmarks store, shared with the host (and so with the
+    /// `cce://bookmarks` page); the menu below lists and edits it.
+    bookmarks: std::sync::Arc<pages::Bookmarks>,
+    /// The open bookmarks menu, if any.
+    bm_menu: Option<BmMenu>,
     /// Hovered pill in the favorites strip — a repaint, like the dot.
     fav_hover: Option<usize>,
 }
@@ -377,7 +436,7 @@ fn controls_y(bar: &Rect) -> f32 {
 /// order (index into the strip = index into the result). Widths follow the
 /// labels, which is why this takes the font: draw and hit-test both read it
 /// with the same font and get the same rects.
-fn fav_rects(bar: &Rect, favs: &[pages::Favorite], sans: &str) -> Vec<Rect> {
+fn fav_rects(bar: &Rect, favs: &[pages::Link], sans: &str) -> Vec<Rect> {
     let mut rects = Vec::with_capacity(favs.len());
     let right = bar.x + bar.width - BAR_PAD;
     let mut x = bar.x + BAR_PAD;
@@ -449,9 +508,16 @@ fn star_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     }
 }
 
+/// The bookmarks menu button, immediately left of the star: the star is
+/// this page's bookmark, this is all of them.
+fn bm_btn_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
+    let star = star_rect(bar, position);
+    Rect { x: star.x - BTN_GAP - BTN_W, ..star }
+}
+
 fn url_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     let x = bar.x + BAR_PAD + 3.0 * (BTN_W + BTN_GAP) + 4.0;
-    let right = bar.x + bar.width - BAR_PAD - dot_col(position, false) - BTN_W - BTN_GAP;
+    let right = bm_btn_rect(bar, position).x - BTN_GAP;
     Rect { x, y: controls_y(bar), width: (right - x).max(60.0), height: BTN_H }
 }
 
@@ -547,6 +613,190 @@ impl BrowserApp {
         self.refresh_favorites();
     }
 
+    /// Whether the active page is one that can be saved at all: an internal
+    /// page or a blank tab cannot.
+    fn saveable(&self) -> bool {
+        self.host
+            .url()
+            .is_some_and(|u| !matches!(u.scheme(), "cce" | "about"))
+    }
+
+    /// Drop the bookmarks menu from its button, taking a snapshot of the
+    /// store. Focus leaves the URL bar with it: a field behind an open menu
+    /// must not keep eating keystrokes, the same reason folding drops it.
+    fn open_bm_menu(&mut self) {
+        if self.url_focused {
+            self.url_focused = false;
+            self.url.selection = None;
+            self.sync_page_state();
+        }
+        self.bm_menu = Some(BmMenu {
+            items: self.bookmarks.snapshot(),
+            scroll: 0,
+            hover: None,
+        });
+    }
+
+    fn close_bm_menu(&mut self) {
+        self.bm_menu = None;
+    }
+
+    /// Re-read the store into the open menu after an edit made through it,
+    /// keeping the scroll inside the new range.
+    fn refresh_bm_menu(&mut self) {
+        let items = self.bookmarks.snapshot();
+        let cap = self.bm_layout().map_or(items.len(), |l| l.cap);
+        if let Some(m) = self.bm_menu.as_mut() {
+            m.scroll = m.scroll.min(items.len().saturating_sub(cap));
+            m.items = items;
+            m.hover = None;
+        }
+    }
+
+    /// The menu's geometry for the current window, bar edge and item count:
+    /// `None` when it is closed. Draw and hit-test both read this.
+    ///
+    /// It hangs off the button that opens it — below the bar on a top bar,
+    /// above it on a bottom one — right-aligned with that button and
+    /// clamped on screen, and it never grows past the space it has: the
+    /// list is capped to what fits and scrolls instead.
+    fn bm_layout(&self) -> Option<BmLayout> {
+        let menu = self.bm_menu.as_ref()?;
+        let bar = self.bar();
+        let btn = bm_btn_rect(&bar, self.settings.bar_position);
+        let width = BM_W.min(self.win.0 - 2.0 * BAR_MARGIN).max(160.0);
+        let x = (btn.x + btn.width - width)
+            .clamp(BAR_MARGIN, (self.win.0 - BAR_MARGIN - width).max(BAR_MARGIN));
+        // The furniture the list is fitted around: toggle row, two rules and
+        // the manage row.
+        let fixed = 2.0 * BM_PAD + 2.0 * BM_ROW_H + 2.0 * BM_SEP_H;
+        let avail = match self.settings.bar_position {
+            settings::BarPosition::Top => self.win.1 - (bar.y + bar.height + BM_GAP) - BAR_MARGIN,
+            settings::BarPosition::Bottom => bar.y - BM_GAP - BAR_MARGIN,
+        };
+        let cap = (((avail - fixed) / BM_ROW_H).floor().max(1.0)) as usize;
+        // An empty list still shows its one "nothing here" row.
+        let shown = menu.items.len().clamp(1, cap);
+        let height = fixed + shown as f32 * BM_ROW_H;
+        let y = match self.settings.bar_position {
+            settings::BarPosition::Top => bar.y + bar.height + BM_GAP,
+            settings::BarPosition::Bottom => bar.y - BM_GAP - height,
+        };
+        let plate = Rect { x, y, width, height };
+        let row = |dy: f32| Rect {
+            x: x + 2.0,
+            y: y + BM_PAD + dy,
+            width: width - 4.0,
+            height: BM_ROW_H,
+        };
+        let list_y = BM_ROW_H + BM_SEP_H;
+        let first = menu.scroll.min(menu.items.len().saturating_sub(shown));
+        let rows = (0..shown.min(menu.items.len()))
+            .map(|k| (row(list_y + k as f32 * BM_ROW_H), first + k))
+            .collect();
+        Some(BmLayout {
+            plate,
+            toggle: row(0.0),
+            rows,
+            empty: menu.items.is_empty().then(|| row(list_y)),
+            manage: row(list_y + shown as f32 * BM_ROW_H + BM_SEP_H),
+            cap,
+        })
+    }
+
+    /// What the pointer is on inside the menu — `None` for its padding and
+    /// rules as much as for the world outside it, so the caller checks the
+    /// plate itself before deciding a click was "outside".
+    fn bm_hit(&self, x: f32, y: f32) -> Option<BmHit> {
+        let l = self.bm_layout()?;
+        if hit(&l.toggle, x, y) {
+            return Some(BmHit::Toggle);
+        }
+        if hit(&l.manage, x, y) {
+            return Some(BmHit::Manage);
+        }
+        l.rows.iter().find(|(r, _)| hit(r, x, y)).map(|(r, i)| {
+            BmHit::Entry(*i, x >= r.x + r.width - BM_RM_W)
+        })
+    }
+
+    /// Visit a bookmark from the menu: in the active tab, which is a pick —
+    /// menu and bar fold away to show the page — or in a new tab, which
+    /// leaves the menu up so several can be opened in a row.
+    fn bm_open(&mut self, index: usize, new_tab: bool) {
+        let Some(url) = self
+            .bm_menu
+            .as_ref()
+            .and_then(|m| m.items.get(index))
+            .and_then(|i| Url::parse(&i.url).ok())
+        else {
+            return;
+        };
+        if new_tab {
+            self.host.open_tab(url);
+            self.url_focused = false;
+            self.sync_page_state();
+            self.persist_session();
+        } else {
+            self.host.load(url);
+            self.loading = true;
+            self.close_bm_menu();
+            self.close_chrome();
+            self.sync_page_state();
+        }
+    }
+
+    /// Drop one bookmark from inside the menu. The list stays open —
+    /// pruning is the one thing done several times in a row.
+    fn bm_remove(&mut self, index: usize) {
+        let Some(url) = self
+            .bm_menu
+            .as_ref()
+            .and_then(|m| m.items.get(index))
+            .map(|i| i.url.clone())
+        else {
+            return;
+        };
+        self.bookmarks.remove(&url);
+        self.refresh_bm_menu();
+    }
+
+    /// Wheel over the list: one bookmark per notch, clamped to the range
+    /// the plate cannot show.
+    fn bm_scroll(&mut self, dy: f64) {
+        let Some(l) = self.bm_layout() else { return };
+        let max = self
+            .bm_menu
+            .as_ref()
+            .map_or(0, |m| m.items.len().saturating_sub(l.cap));
+        if let Some(m) = self.bm_menu.as_mut() {
+            // Positive dy is up, cce-ui's winit convention.
+            let step: isize = if dy > 0.0 { -1 } else { 1 };
+            m.scroll = (m.scroll as isize + step).clamp(0, max as isize) as usize;
+        }
+    }
+
+    /// Act on a click inside the menu.
+    fn bm_click(&mut self, button: MouseButton, hit: Option<BmHit>) {
+        match (button, hit) {
+            (MouseButton::Left, Some(BmHit::Toggle)) => {
+                if self.saveable() || self.host.active_bookmarked() {
+                    self.host.toggle_bookmark();
+                    self.refresh_bm_menu();
+                }
+            }
+            (MouseButton::Left, Some(BmHit::Entry(i, true))) => self.bm_remove(i),
+            (MouseButton::Left, Some(BmHit::Entry(i, false))) => self.bm_open(i, false),
+            (MouseButton::Middle, Some(BmHit::Entry(i, _))) => self.bm_open(i, true),
+            (MouseButton::Left, Some(BmHit::Manage)) => {
+                self.close_bm_menu();
+                self.close_chrome();
+                self.open_internal_page("cce://bookmarks");
+            }
+            _ => {}
+        }
+    }
+
     /// Centre of the corner control: the bar's corner nearest the window
     /// corner it is anchored to — top-right for a top bar, bottom-right for
     /// a bottom one — at the DE's inset. A circle menu is the corner of the
@@ -605,6 +855,8 @@ impl BrowserApp {
     /// a field that is not on screen must not keep eating keystrokes.
     fn close_chrome(&mut self) {
         self.chrome_open = false;
+        // The menu hangs off a bar that is going away.
+        self.bm_menu = None;
         if self.url_focused {
             self.url_focused = false;
             self.url.selection = None;
@@ -735,14 +987,10 @@ impl BrowserApp {
         items.push(item("Forward", CtxAction::Forward, self.host.can_go_forward()));
         items.push(item("Reload", CtxAction::Reload, true));
         let favorited = self.host.active_favorited();
-        let on_page = self
-            .host
-            .url()
-            .is_some_and(|u| !matches!(u.scheme(), "cce" | "about"));
         items.push(item(
             if favorited { "Remove from Favorites" } else { "Add to Favorites" },
             CtxAction::ToggleFavorite,
-            favorited || on_page,
+            favorited || self.saveable(),
         ));
         items.push(item("Open in Other Browser", CtxAction::OpenExternal, true));
 
@@ -1013,6 +1261,136 @@ impl BrowserApp {
         }
     }
 
+    /// Draw the bookmarks menu: the same plate-and-rows vocabulary as the
+    /// right-click menu, in three sections — what to do with this page, the
+    /// pages already saved, and the way out to the full collection.
+    fn paint_bm_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
+        let Some(l) = self.bm_layout() else { return };
+        let (items, hover, scroll) = match self.bm_menu.as_ref() {
+            Some(m) => (m.items.clone(), m.hover, m.scroll),
+            None => return,
+        };
+        pc.plate(
+            l.plate,
+            (8.0, 8.0, 8.0, 8.0),
+            [0.13, 0.14, 0.16, 1.0],
+            cce_ui::layout::bevel_width().min(3.0),
+        );
+
+        let text_at = |pc: &mut PaintCtx, r: &Rect, s: String, color: [u8; 3]| {
+            pc.text(
+                s,
+                r.x + BM_TEXT_PAD,
+                cce_ui::layout::align_text_y(r.y, r.height, BM_FONT, 0.0),
+                BM_FONT,
+                color,
+            );
+        };
+        let highlight = |pc: &mut PaintCtx, r: &Rect| {
+            pc.rounded_rect(*r, 5.0, (true, true, true, true), TAB_ACTIVE_BG);
+        };
+
+        // What this page can do: the toggle names the state in words, where
+        // the star only lights up.
+        let saved = self.host.active_bookmarked();
+        let can_save = saved || self.saveable();
+        if hover == Some(BmHit::Toggle) && can_save {
+            highlight(pc, &l.toggle);
+        }
+        let label = if saved { "Remove Bookmark" } else { "Bookmark This Page" };
+        text_at(
+            pc,
+            &l.toggle,
+            Self::fit_text(label, sans, BM_FONT, l.toggle.width - 2.0 * BM_TEXT_PAD),
+            if can_save { TEXT } else { TEXT_DIM },
+        );
+
+        // The saved pages themselves, newest first.
+        for (r, i) in &l.rows {
+            let Some(item) = items.get(*i) else { continue };
+            let hovered = matches!(hover, Some(BmHit::Entry(h, _)) if h == *i);
+            if hovered {
+                highlight(pc, r);
+            }
+            text_at(
+                pc,
+                r,
+                Self::fit_text(
+                    &item.label,
+                    sans,
+                    BM_FONT,
+                    r.width - 2.0 * BM_TEXT_PAD - BM_RM_W,
+                ),
+                // Full brightness whether hovered or not: dim means
+                // *unavailable* everywhere else in this chrome, and every
+                // saved page is available. Hover is the highlight's job.
+                TEXT,
+            );
+            // The remove "x" shows on the hovered row only — always-on x's
+            // down a whole list read as clutter, and as a hazard.
+            if hovered {
+                let on_rm = hover == Some(BmHit::Entry(*i, true));
+                let xw = measure_text_width("x", sans, 11.0);
+                pc.text(
+                    "x",
+                    r.x + r.width - BM_RM_W / 2.0 - xw / 2.0,
+                    cce_ui::layout::align_text_y(r.y, r.height, 11.0, 0.0),
+                    11.0,
+                    if on_rm { [212, 155, 155] } else { TEXT_DIM },
+                );
+            }
+        }
+        if let Some(r) = l.empty {
+            text_at(pc, &r, "No bookmarks yet".to_string(), TEXT_DIM);
+        }
+
+        // Scroll position, when the list is longer than the plate.
+        if items.len() > l.rows.len() && !l.rows.is_empty() {
+            let first = l.rows[0].0;
+            let track = Rect {
+                x: l.plate.x + l.plate.width - 5.0,
+                y: first.y,
+                width: 2.0,
+                height: l.rows.len() as f32 * BM_ROW_H,
+            };
+            let frac = l.rows.len() as f32 / items.len() as f32;
+            let offset = scroll as f32 / items.len() as f32;
+            pc.rounded_rect(
+                Rect {
+                    y: track.y + offset * track.height,
+                    height: (frac * track.height).max(12.0),
+                    ..track
+                },
+                1.0,
+                (true, true, true, true),
+                RIM,
+            );
+        }
+
+        // The rules between the three sections.
+        for y in [l.toggle.y + BM_ROW_H + BM_SEP_H / 2.0, l.manage.y - BM_SEP_H / 2.0] {
+            pc.quad(
+                Rect {
+                    x: l.plate.x + BM_TEXT_PAD,
+                    y,
+                    width: l.plate.width - 2.0 * BM_TEXT_PAD,
+                    height: 1.0,
+                },
+                RIM,
+            );
+        }
+
+        if hover == Some(BmHit::Manage) {
+            highlight(pc, &l.manage);
+        }
+        text_at(
+            pc,
+            &l.manage,
+            format!("Manage Bookmarks ({})", items.len()),
+            TEXT,
+        );
+    }
+
     /// Draw the right-click menu: a small plate at the pointer, rows with a
     /// hover highlight, disabled rows dimmed. Same primitives as everything
     /// else in this chrome.
@@ -1159,6 +1537,7 @@ impl Application for BrowserApp {
         host.set_force_dark(settings.color_scheme.forces_dark());
         let favorites = host.favorites();
         let favs = favorites.snapshot();
+        let bookmarks = host.bookmarks();
         Self {
             host,
             settings,
@@ -1183,6 +1562,8 @@ impl Application for BrowserApp {
             favorites,
             favs,
             fav_hover: None,
+            bookmarks,
+            bm_menu: None,
         }
     }
 
@@ -1337,6 +1718,19 @@ impl Application for BrowserApp {
             *_needs_rebuild = true;
             return;
         }
+        // An open bookmarks menu tracks hover, and the page under it sees
+        // no moves at all.
+        if self.bm_menu.is_some() {
+            let h = self.bm_hit(pos.x, pos.y);
+            if self.bm_menu.as_ref().is_some_and(|m| m.hover != h) {
+                if let Some(m) = self.bm_menu.as_mut() {
+                    m.hover = h;
+                }
+                *_needs_rebuild = true;
+            }
+            return;
+        }
+
         let over_dot = self.dot_hit(pos.x, pos.y);
         if over_dot != self.dot_hover {
             self.dot_hover = over_dot;
@@ -1405,6 +1799,24 @@ impl Application for BrowserApp {
                     (MouseButton::Left, Some(i)) => self.dispatch_ctx_action(i),
                     _ => self.ctx_menu = None,
                 }
+            }
+            return None;
+        }
+
+        // The bookmarks menu owns the next click while it is open: a row
+        // acts, a click off the plate closes it, and either way the click
+        // goes no further — the rule the right-click menu already follows.
+        if self.bm_menu.is_some() {
+            if !pressed {
+                return None;
+            }
+            *needs_rebuild = true;
+            let target = self.bm_hit(pos.x, pos.y);
+            let inside = self.bm_layout().is_some_and(|l| hit(&l.plate, pos.x, pos.y));
+            if target.is_some() {
+                self.bm_click(button, target);
+            } else if !inside {
+                self.close_bm_menu();
             }
             return None;
         }
@@ -1480,6 +1892,8 @@ impl Application for BrowserApp {
                 self.host.reload();
             } else if hit(&star_rect(&bar, pos_edge), pos.x, pos.y) {
                 self.host.toggle_bookmark();
+            } else if hit(&bm_btn_rect(&bar, pos_edge), pos.x, pos.y) {
+                self.open_bm_menu();
             } else {
                 let field = url_rect(&bar, pos_edge);
                 if hit(&field, pos.x, pos.y) {
@@ -1518,7 +1932,21 @@ impl Application for BrowserApp {
         None
     }
 
-    fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, _needs_rebuild: &mut bool) {
+    fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        // An open menu takes the wheel: over its plate it scrolls the list,
+        // anywhere else it is swallowed rather than scrolling the page
+        // behind it.
+        if self.bm_menu.is_some() {
+            if self.bm_layout().is_some_and(|l| hit(&l.plate, pos.x, pos.y)) {
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y as f64,
+                    MouseScrollDelta::PixelDelta(p) => p.y,
+                };
+                self.bm_scroll(dy);
+                *needs_rebuild = true;
+            }
+            return;
+        }
         if self.chrome_hit(pos.x, pos.y) {
             return;
         }
@@ -1584,6 +2012,17 @@ impl Application for BrowserApp {
                 lineedit::EditOutcome::Cancel => self.close_modal(false),
                 _ => {}
             }
+            return None;
+        }
+
+        // An open bookmarks menu owns Escape, ahead of the URL bar and the
+        // page both.
+        if self.bm_menu.is_some()
+            && event.state == ElementState::Pressed
+            && event.logical_key == Key::Named(NamedKey::Escape)
+        {
+            self.close_bm_menu();
+            *needs_rebuild = true;
             return None;
         }
 
@@ -1865,6 +2304,19 @@ impl Application for BrowserApp {
                 star_color,
             );
 
+            // Bookmarks menu button: all the saved pages, where the star
+            // beside it is only this one. Lit while its menu is open.
+            let bmb = bm_btn_rect(&bar, pos_edge);
+            pc.rounded_rect(bmb, 6.0, (true, true, true, true), BTN_BG);
+            let bw = measure_text_width("B", &sans, 14.0);
+            pc.text(
+                "B",
+                bmb.x + (bmb.width - bw) / 2.0,
+                cce_ui::layout::align_text_y(bmb.y, bmb.height, 14.0, 0.0),
+                14.0,
+                if self.bm_menu.is_some() { [150, 190, 240] } else { TEXT },
+            );
+
             // URL field: rim + recess, brighter rim when focused.
             let f = url_rect(&bar, pos_edge);
             let rim = if self.url_focused { RIM_FOCUS } else { RIM };
@@ -1910,6 +2362,7 @@ impl Application for BrowserApp {
         // hovered or while the bar it opens is out.
         plate_dock::draw_corner_dot(&mut pc, self.dot_center(), self.dot_hover || self.chrome_open);
 
+        self.paint_bm_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_ctx_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
