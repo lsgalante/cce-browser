@@ -4,8 +4,8 @@
 //! finished frame is read back and uploaded to cce-ui's image registry,
 //! then drawn as a single quad under the chrome: the DE's circular corner
 //! control (`cce_ui::widget::plate_dock`), which here toggles the utility
-//! bar (tabs, back / forward / reload, URL field) that unfolds from under
-//! it. Input over the page area is translated into Servo input events; the
+//! bar (tabs, the favorites strip, back / forward / reload, URL field) that
+//! unfolds from under it. Input over the page area is translated into Servo input events; the
 //! URL bar is a small hand-rolled line editor.
 
 mod downloads;
@@ -53,8 +53,13 @@ pub enum EditingCommand {
 }
 
 const BAR_MARGIN: f32 = 10.0;
-/// Two rows: tab strip on top, nav controls + URL field below.
-const BAR_H: f32 = BAR_PAD + TAB_H + ROW_GAP + BTN_H + BAR_PAD;
+/// Two rows — tab strip on top, nav controls + URL field below — with the
+/// favorites strip between them whenever there is one to show. The bar
+/// does not carry an empty row: no favorites, no strip, two-row bar.
+fn bar_h(favorites: bool) -> f32 {
+    let favs = if favorites { FAV_H + ROW_GAP } else { 0.0 };
+    BAR_PAD + TAB_H + ROW_GAP + favs + BTN_H + BAR_PAD
+}
 const BAR_RADIUS: f32 = 10.0;
 const BAR_PAD: f32 = 7.0;
 /// Seconds for the bar to unfold from the corner control (and back).
@@ -79,6 +84,14 @@ const TAB_CLOSE_MIN_W: f32 = 72.0;
 const TAB_CLOSE_W: f32 = 18.0;
 const PLUS_W: f32 = 26.0;
 const ROW_GAP: f32 = 6.0;
+/// The favorites strip: a row of pills, each one page. Pills take their
+/// label's width up to `FAV_MAX_W`, and the strip simply stops at the bar's
+/// edge — favorites are a handful by design, not a scrolling list.
+const FAV_H: f32 = 22.0;
+const FAV_GAP: f32 = 4.0;
+const FAV_MAX_W: f32 = 150.0;
+const FAV_PAD_X: f32 = 9.0;
+const FAV_FONT: f32 = 12.0;
 /// Utility-bar fill; the negative alpha marks the plate as blur-behind.
 /// The blurred page is the base and this color tints it at |alpha|
 /// opacity — keep |alpha| low so the frosted content shows through.
@@ -221,6 +234,8 @@ enum CtxAction {
     /// Fetch through WebKit's download pipeline.
     Download(String),
     OpenExternal,
+    /// Add the page to the favorites strip, or take it out.
+    ToggleFavorite,
 }
 
 #[cfg(feature = "wpe")]
@@ -309,6 +324,13 @@ struct BrowserApp {
     font_system: cce_ui::cosmic_text::FontSystem,
     /// The open-tab set, persisted across restarts (see `session.rs`).
     session: session::Session,
+    /// The favorites store, shared with the host (and so with the
+    /// `cce://favorites` page, which edits it); `favs` is the strip as last
+    /// read from it, refreshed with the rest of the page state.
+    favorites: std::sync::Arc<pages::Favorites>,
+    favs: Vec<pages::Favorite>,
+    /// Hovered pill in the favorites strip — a repaint, like the dot.
+    fav_hover: Option<usize>,
 }
 
 fn hit(r: &Rect, x: f32, y: f32) -> bool {
@@ -320,16 +342,17 @@ fn hit(r: &Rect, x: f32, y: f32) -> bool {
 /// way, so nothing but the chrome geometry depends on this. Every other
 /// bar-relative rect below is derived from this one — never from
 /// `BAR_MARGIN` directly, or it would stay pinned to the top.
-fn bar_rect(win: (f32, f32), position: settings::BarPosition) -> Rect {
+fn bar_rect(win: (f32, f32), position: settings::BarPosition, favorites: bool) -> Rect {
+    let h = bar_h(favorites);
     let y = match position {
         settings::BarPosition::Top => BAR_MARGIN,
-        settings::BarPosition::Bottom => (win.1 - BAR_MARGIN - BAR_H).max(BAR_MARGIN),
+        settings::BarPosition::Bottom => (win.1 - BAR_MARGIN - h).max(BAR_MARGIN),
     };
     Rect {
         x: BAR_MARGIN,
         y,
         width: (win.0 - 2.0 * BAR_MARGIN).max(120.0),
-        height: BAR_H,
+        height: h,
     }
 }
 
@@ -338,9 +361,37 @@ fn tabs_y(bar: &Rect) -> f32 {
     bar.y + BAR_PAD
 }
 
-/// Y of the nav-controls row.
-fn controls_y(bar: &Rect) -> f32 {
+/// Y of the favorites strip — under the tabs, where it only exists when
+/// the bar was sized for it.
+fn favs_y(bar: &Rect) -> f32 {
     bar.y + BAR_PAD + TAB_H + ROW_GAP
+}
+
+/// Y of the nav-controls row: the bar's bottom row, whether or not the
+/// favorites strip sits above it, so it is measured from the bottom edge.
+fn controls_y(bar: &Rect) -> f32 {
+    bar.y + bar.height - BAR_PAD - BTN_H
+}
+
+/// The favorites strip's pills, one rect per favorite that fits, in strip
+/// order (index into the strip = index into the result). Widths follow the
+/// labels, which is why this takes the font: draw and hit-test both read it
+/// with the same font and get the same rects.
+fn fav_rects(bar: &Rect, favs: &[pages::Favorite], sans: &str) -> Vec<Rect> {
+    let mut rects = Vec::with_capacity(favs.len());
+    let right = bar.x + bar.width - BAR_PAD;
+    let mut x = bar.x + BAR_PAD;
+    for f in favs {
+        let w = (measure_text_width(&f.label, sans, FAV_FONT) + 2.0 * FAV_PAD_X)
+            .min(FAV_MAX_W)
+            .max(FAV_H);
+        if x + w > right {
+            break;
+        }
+        rects.push(Rect { x, y: favs_y(bar), width: w, height: FAV_H });
+        x += w + FAV_GAP;
+    }
+    rects
 }
 
 fn plus_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
@@ -417,6 +468,9 @@ fn parse_url_input(input: &str, search_prefix: &str) -> Option<Url> {
     if s.eq_ignore_ascii_case("about:bookmarks") {
         return Url::parse("cce://bookmarks").ok();
     }
+    if s.eq_ignore_ascii_case("about:favorites") {
+        return Url::parse("cce://favorites").ok();
+    }
     if s.eq_ignore_ascii_case("about:downloads") {
         return Url::parse("cce://downloads").ok();
     }
@@ -467,7 +521,30 @@ impl BrowserApp {
     /// The utility bar's rect for the current window size and configured
     /// edge — the single source every chrome hit-test and draw reads.
     fn bar(&self) -> Rect {
-        bar_rect(self.win, self.settings.bar_position)
+        bar_rect(self.win, self.settings.bar_position, !self.favs.is_empty())
+    }
+
+    /// The favorites strip's pills for the current bar.
+    fn fav_rects(&self, bar: &Rect) -> Vec<Rect> {
+        let (sans, ..) = cce_ui::layout::read_preferred_fonts();
+        fav_rects(bar, &self.favs, &sans)
+    }
+
+    /// Re-read the strip from the store. Called with the rest of the page
+    /// state, which is also when the `cce://favorites` page's edits — made
+    /// on the way into a navigation — become visible.
+    fn refresh_favorites(&mut self) {
+        let favs = self.favorites.snapshot();
+        if favs != self.favs {
+            self.favs = favs;
+            self.fav_hover = None;
+        }
+    }
+
+    /// Add or remove the active page from the favorites strip.
+    fn toggle_favorite(&mut self) {
+        self.host.toggle_favorite();
+        self.refresh_favorites();
     }
 
     /// Centre of the corner control: the bar's corner nearest the window
@@ -545,6 +622,7 @@ impl BrowserApp {
 
     /// Pull delegate-observed page state into the chrome.
     fn sync_page_state(&mut self) {
+        self.refresh_favorites();
         self.loading = self.host.loading();
         self.title = self.host.title().filter(|t| !t.is_empty());
         if !self.url_focused {
@@ -656,6 +734,16 @@ impl BrowserApp {
         items.push(item("Back", CtxAction::Back, self.host.can_go_back()));
         items.push(item("Forward", CtxAction::Forward, self.host.can_go_forward()));
         items.push(item("Reload", CtxAction::Reload, true));
+        let favorited = self.host.active_favorited();
+        let on_page = self
+            .host
+            .url()
+            .is_some_and(|u| !matches!(u.scheme(), "cce" | "about"));
+        items.push(item(
+            if favorited { "Remove from Favorites" } else { "Add to Favorites" },
+            CtxAction::ToggleFavorite,
+            favorited || on_page,
+        ));
         items.push(item("Open in Other Browser", CtxAction::OpenExternal, true));
 
         let h = CTX_PAD * 2.0 + items.len() as f32 * CTX_ROW_H;
@@ -690,6 +778,7 @@ impl BrowserApp {
             }
             CtxAction::Download(uri) => self.host.download_uri(uri),
             CtxAction::OpenExternal => self.open_external(),
+            CtxAction::ToggleFavorite => self.toggle_favorite(),
         }
     }
 
@@ -1068,6 +1157,8 @@ impl Application for BrowserApp {
         host.set_color_scheme_dark(settings.color_scheme.is_dark());
         #[cfg(feature = "wpe")]
         host.set_force_dark(settings.color_scheme.forces_dark());
+        let favorites = host.favorites();
+        let favs = favorites.snapshot();
         Self {
             host,
             settings,
@@ -1089,6 +1180,9 @@ impl Application for BrowserApp {
             sender,
             font_system: cce_ui::create_font_system(),
             session,
+            favorites,
+            favs,
+            fav_hover: None,
         }
     }
 
@@ -1248,6 +1342,16 @@ impl Application for BrowserApp {
             self.dot_hover = over_dot;
             *_needs_rebuild = true;
         }
+        let over_fav = if self.chrome_open && !self.favs.is_empty() {
+            let bar = self.bar();
+            self.fav_rects(&bar).iter().position(|r| hit(r, pos.x, pos.y))
+        } else {
+            None
+        };
+        if over_fav != self.fav_hover {
+            self.fav_hover = over_fav;
+            *_needs_rebuild = true;
+        }
         if !self.chrome_hit(pos.x, pos.y) {
             let s = self.scale as f32;
             self.host.mouse_move(pos.x * s, pos.y * s);
@@ -1343,6 +1447,24 @@ impl Application for BrowserApp {
                 // Picking a tab is a menu choice: the bar folds away. Closing
                 // one is not — several may go in a row.
                 self.close_chrome();
+                return None;
+            }
+            // Favorites strip: a pill is a menu pick — load it here and fold
+            // — or, middle-clicked, a new tab, with the bar left out so
+            // several can be opened in a row.
+            if let Some(i) = self.fav_rects(&bar).iter().position(|r| hit(r, pos.x, pos.y)) {
+                let Ok(url) = Url::parse(&self.favs[i].url) else { return None };
+                if button == MouseButton::Middle {
+                    self.host.open_tab(url);
+                    self.url_focused = false;
+                    self.sync_page_state();
+                    self.persist_session();
+                } else {
+                    self.host.load(url);
+                    self.loading = true;
+                    self.close_chrome();
+                    self.sync_page_state();
+                }
                 return None;
             }
             if button != MouseButton::Left {
@@ -1482,6 +1604,19 @@ impl Application for BrowserApp {
                 // clearing outright; the page asks first.
                 Key::Named(NamedKey::Delete) if event.shift => {
                     self.open_internal_page("cce://cookies");
+                    *needs_rebuild = true;
+                    return None;
+                }
+                // The favorites pair sits a Shift above the bookmarks pair:
+                // Ctrl+Shift+D toggles the page in the strip, Ctrl+Shift+B
+                // opens the page that manages it.
+                Key::Character(c) if event.shift && c.eq_ignore_ascii_case("d") => {
+                    self.toggle_favorite();
+                    *needs_rebuild = true;
+                    return None;
+                }
+                Key::Character(c) if event.shift && c.eq_ignore_ascii_case("b") => {
+                    self.open_internal_page("cce://favorites");
                     *needs_rebuild = true;
                     return None;
                 }
@@ -1676,6 +1811,28 @@ impl Application for BrowserApp {
                 14.0,
                 TEXT,
             );
+
+            // Favorites strip: label pills, the hovered one lifted like an
+            // active tab. Labels are cut to the pill, never the other way.
+            let fav_rects = self.fav_rects(&bar);
+            for (i, r) in fav_rects.iter().enumerate() {
+                let hovered = self.fav_hover == Some(i);
+                pc.rounded_rect(
+                    *r,
+                    7.0,
+                    (true, true, true, true),
+                    if hovered { TAB_ACTIVE_BG } else { TAB_BG },
+                );
+                let label =
+                    Self::fit_text(&self.favs[i].label, &sans, FAV_FONT, r.width - 2.0 * FAV_PAD_X);
+                pc.text(
+                    label,
+                    r.x + FAV_PAD_X,
+                    cce_ui::layout::align_text_y(r.y, r.height, FAV_FONT, 0.0),
+                    FAV_FONT,
+                    if hovered { TEXT } else { TEXT_DIM },
+                );
+            }
 
             let labels = ["<", ">", "R"];
             let enabled = [self.host.can_go_back(), self.host.can_go_forward(), true];

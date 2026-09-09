@@ -130,6 +130,7 @@ pub struct WebKitHost {
     /// the backend swap unchanged.
     history: std::sync::Arc<crate::pages::History>,
     bookmarks: std::sync::Arc<crate::pages::Bookmarks>,
+    favorites: std::sync::Arc<crate::pages::Favorites>,
     history_enabled: bool,
     force_dark: bool,
     /// Serves the `cce:` pages. Boxed and leaked into the scheme callback,
@@ -203,12 +204,14 @@ impl WebKitHost {
 
             let history = std::sync::Arc::new(crate::pages::History::load());
             let bookmarks = std::sync::Arc::new(crate::pages::Bookmarks::load());
+            let favorites = std::sync::Arc::new(crate::pages::Favorites::load());
             let downloads = std::sync::Arc::new(crate::downloads::Downloads::default());
             let clear_cookies =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let protocol = Rc::new(crate::pages::CceProtocol {
                 history: history.clone(),
                 bookmarks: bookmarks.clone(),
+                favorites: favorites.clone(),
                 downloads: downloads.clone(),
                 clear_cookies: clear_cookies.clone(),
             });
@@ -277,6 +280,7 @@ impl WebKitHost {
                     .ok(),
                 history: history.clone(),
                 bookmarks: bookmarks.clone(),
+                favorites,
                 history_enabled: true,
                 force_dark: false,
                 protocol,
@@ -672,6 +676,27 @@ impl WebKitHost {
         let tab = self.active_tab();
         if let Some(url) = &tab.url {
             self.bookmarks
+                .toggle(url.as_str(), tab.title.as_deref().unwrap_or(""));
+        }
+    }
+
+    /// The favorites store, shared with the `cce://favorites` page; the
+    /// chrome reads the strip from it.
+    pub fn favorites(&self) -> std::sync::Arc<crate::pages::Favorites> {
+        self.favorites.clone()
+    }
+
+    pub fn active_favorited(&self) -> bool {
+        self.active_tab()
+            .url
+            .as_ref()
+            .is_some_and(|u| self.favorites.contains(u.as_str()))
+    }
+
+    pub fn toggle_favorite(&self) {
+        let tab = self.active_tab();
+        if let Some(url) = &tab.url {
+            self.favorites
                 .toggle(url.as_str(), tab.title.as_deref().unwrap_or(""));
         }
     }

@@ -30,7 +30,7 @@ use servo::protocol_handler::ProtocolRegistry;
 use url::Url;
 
 use crate::downloads::{is_download_url, Downloads};
-use crate::pages::{Bookmarks, CceProtocol, History};
+use crate::pages::{Bookmarks, CceProtocol, Favorites, History};
 use crate::Message;
 
 /// Delegate-observed signals for one webview, polled by the app after each
@@ -225,6 +225,7 @@ pub struct ServoHost {
     delegate: Rc<Delegate>,
     history: std::sync::Arc<History>,
     bookmarks: std::sync::Arc<Bookmarks>,
+    favorites: std::sync::Arc<Favorites>,
     tabs: Vec<Tab>,
     active: usize,
     size_px: (u32, u32),
@@ -317,12 +318,14 @@ impl ServoHost {
 
         let history = std::sync::Arc::new(History::load());
         let bookmarks = std::sync::Arc::new(Bookmarks::load());
+        let favorites = std::sync::Arc::new(Favorites::load());
         let downloads = std::sync::Arc::new(Downloads::default());
         let clear_cookies = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut protocols = ProtocolRegistry::default();
         let handler = CceProtocol {
             history: history.clone(),
             bookmarks: bookmarks.clone(),
+            favorites: favorites.clone(),
             downloads: downloads.clone(),
             clear_cookies: clear_cookies.clone(),
         };
@@ -390,6 +393,7 @@ impl ServoHost {
             delegate,
             history,
             bookmarks,
+            favorites,
             tabs: Vec::new(),
             // Sentinel so the first open_tab's activate() does the full
             // show/focus/resize dance instead of early-returning on 0 == 0.
@@ -643,6 +647,29 @@ impl ServoHost {
         let tab = self.active_tab();
         if let Some(url) = &tab.url {
             self.bookmarks
+                .toggle(url.as_str(), tab.title.as_deref().unwrap_or(""));
+        }
+    }
+
+    /// The favorites store, shared with the `cce://favorites` page; the
+    /// chrome reads the strip from it.
+    pub fn favorites(&self) -> std::sync::Arc<Favorites> {
+        self.favorites.clone()
+    }
+
+    /// Whether the active tab's page is in the favorites strip.
+    pub fn active_favorited(&self) -> bool {
+        self.active_tab()
+            .url
+            .as_ref()
+            .is_some_and(|u| self.favorites.contains(u.as_str()))
+    }
+
+    /// Toggle the favorite for the active tab's page.
+    pub fn toggle_favorite(&self) {
+        let tab = self.active_tab();
+        if let Some(url) = &tab.url {
+            self.favorites
                 .toggle(url.as_str(), tab.title.as_deref().unwrap_or(""));
         }
     }

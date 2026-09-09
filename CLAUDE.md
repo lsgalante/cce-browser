@@ -21,7 +21,7 @@ Eight files, ~3k lines:
 | `src/instance.rs` | single-instance forwarding: a later launch hands its argument to the running instance's socket and exits |
 | `src/bin/open.rs` | `cce-browser-open`, the desktop entry's `Exec` target: a ~500KB forwarder linking only libc (~4ms vs ~22ms through the full binary), exec'ing `cce-browser` when no instance answers |
 | `src/webview.rs` | `ServoHost` — Servo boot, the delegate, one `WebView` per tab, the frame pipeline |
-| `src/pages.rs` | the `cce:` protocol handler and its History / Bookmarks stores |
+| `src/pages.rs` | the `cce:` protocol handler and its History / Bookmarks / Favorites stores |
 | `src/downloads.rs` | the chrome-side download pipeline (Servo has none) |
 | `src/session.rs` | open-tab persistence: the tab set survives a restart |
 | `src/settings.rs` | the per-app KDL config |
@@ -166,8 +166,33 @@ are choices, not accidents:
 There are **no `cce-ui` widgets in this app**. The whole utility bar is emitted as
 `PaintCtx` primitives in `display_list` (`display_list_text()` returns `true`), and
 every hit test in `handle_mouse_input` re-derives the same rects from the same
-`bar_rect`/`tab_rect`/`btn_rect`/`url_rect` helpers. **Draw and hit-test are two
+`bar_rect`/`tab_rect`/`btn_rect`/`url_rect`/`fav_rects` helpers. **Draw and hit-test are two
 readings of one geometry** — change a rect helper, not one call site.
+
+### Favorites are not bookmarks
+
+Two stores, two meanings. The **star** (`Ctrl+D`, `cce://bookmarks`) is the
+archive: everything worth finding again, newest first. **Favorites**
+(`Ctrl+Shift+D`, the right-click menu's "Add to Favorites", or the
+`favorite` link on a bookmark row; managed at `cce://favorites` /
+`about:favorites`, `Ctrl+Shift+B`) are the handful of places worth a
+permanent one-click spot: a **strip of label pills inside the bar**, between
+the tab row and the controls row. Click loads the favorite in the active tab
+and folds the bar (a menu pick); middle-click opens it in a new tab and
+leaves the bar out. Insertion order is strip order; the page reorders
+(▲/▼), renames (a GET form per row — form submissions reach the `cce:`
+handler like any other navigation) and removes.
+
+Geometry points that are choices: the bar has **no empty row** — with no
+favorites it is the two-row bar it always was (`bar_h(favorites)`), so
+`controls_y` is measured from the bar's *bottom* edge rather than counted
+down from the top. The strip does not scroll or wrap: pills take their
+label's width up to `FAV_MAX_W`, and `fav_rects` simply stops at the bar's
+edge, so a too-long strip loses its tail. The chrome keeps a snapshot
+(`favs`) refreshed with the rest of the page state, which is also how edits
+made on the `cce://favorites` page — on the way into a navigation — reach
+the strip. A label defaults to the page title, else the host (`www.`
+stripped), else the file name; internal pages are refused.
 
 ### The bar is a circle menu
 
@@ -230,10 +255,11 @@ applies the inverted delta itself.
 ## `cce://` pages
 
 `CceProtocol` registers the `cce` scheme with Servo's `ProtocolRegistry`, so
-`cce://history`, `cce://bookmarks`, `cce://downloads` and `cce://cookies` are **real
-pages fetched through Servo's network stack** and rendered like any other. That is why
-every mutating action is an ordinary link (`cce://history/clear`,
-`cce://bookmarks/remove?url=…`) — no chrome plumbing needed.
+`cce://history`, `cce://bookmarks`, `cce://favorites`, `cce://downloads` and
+`cce://cookies` are **real pages fetched through Servo's network stack** and rendered
+like any other. That is why every mutating action is an ordinary link
+(`cce://history/clear`, `cce://bookmarks/remove?url=…`,
+`cce://favorites/up?url=…`) — no chrome plumbing needed.
 
 ### Servo leaks a document per load — the biggest live hazard
 
@@ -262,9 +288,11 @@ therefore *cannot reach Servo itself*: `cce://cookies/clear` sets an `AtomicBool
 the next `pump` acts on via `site_data_manager()`. Anything else needing engine access
 from a page has to take the same route.
 
-History and bookmarks are TSV under `~/.local/state/cce/browser/`; `sanitize()` strips
-tabs and newlines because the format has no escaping. All four pages share the `page()`
-skeleton — restyle there, not per page.
+History, bookmarks and favorites are TSV under `~/.local/state/cce/browser/`;
+`sanitize()` strips tabs and newlines because the format has no escaping. All the
+pages share the `page()` skeleton — restyle there, not per page. A page's own
+`<style>` goes in through `head_extra`, which lands *before* the skeleton's, so
+an override has to out-specify it (`.e .w`, not `.w`).
 
 Clearing cookies is a **confirm-then-act page**, and Ctrl+Shift+Delete opens it rather
 than clearing outright: sessions persist now, so an accidental chord would sign the
