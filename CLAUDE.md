@@ -115,6 +115,43 @@ Two consequences worth holding onto:
   time-based (see the force-dark reload deadlines) has to spawn a thread that sends
   `Message::Spin` when the deadline passes, or it simply never fires.
 
+## The frame pipeline on WPE
+
+WebKit renders into a **mappable SHM buffer** (`toplevel_formats` asks for
+one; DMABuf import is still the Phase 2 in WPE-PORT.md), `read_shm` copies it
+out, and the pixels are drawn as one full-bleed quad. What that path costs is
+worth knowing, because it is paid on **every frame of every scroll** and this
+display is 3840x2400 — 35 MB a frame fullscreen.
+
+Three things it deliberately does *not* do any more, each measured at that
+size before it went:
+
+- **No CPU swizzle.** `WPE_PIXEL_FORMAT_ARGB8888` is BGRA in memory and is
+  handed over as `PixelFormat::Bgra`; the sampler reads either channel order
+  at no cost. Rearranging the bytes cost **7.4 ms a frame**.
+- **No per-frame allocation.** The destination comes from
+  `cce_ui::vk::recycle_buffer`, and the sink refills the *superseded* frame's
+  buffer rather than dropping it — when the engine outruns `pump`, which is
+  exactly when frames are being thrown away, allocating a new buffer each time
+  would be the most expensive possible way to discard work. A fresh Vec per
+  frame was **4.5 ms**, nearly all zeroing and page faults.
+- **No copy for `sample_pixel`.** It used to clone the whole frame to answer a
+  three-byte question (only `examples/wpe_dark.rs` asks); `last_pixel` keeps
+  the three bytes instead. That clone was **7 ms a frame**.
+
+And on the GPU side `pump` calls `update_pixels` when the tab already has an
+image of the same size, so the frame replaces the contents of one texture
+instead of creating an image and freeing last frame's — that free took
+`device_wait_idle`, once per frame. Only a resize (or a tab's first frame)
+takes the create path.
+
+What is left per frame: one memcpy out of SHM (whole-buffer when the stride is
+tight, per row otherwise), one memcpy into the shared staging buffer, and the
+transfer. The remaining `queue_wait_idle` inside the toolkit's update is
+explained there. **Do not reintroduce a `Vec` allocation, a swizzle, or a
+second copy on this path without measuring** — the numbers above are what each
+one costs.
+
 ## Tabs
 
 One `WebView` per tab, all sharing the single rendering context; only the active one

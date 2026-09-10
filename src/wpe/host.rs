@@ -148,7 +148,8 @@ pub struct WebKitHost {
     watcher: Option<*mut WebKitUserScript>,
     /// Retained only so tests can assert on rendered output; the registry
     /// owns the copy that actually gets drawn.
-    last_frame: Option<(Vec<u8>, u32, u32)>,
+    /// Top-left pixel of the last frame — three bytes, not the frame.
+    last_pixel: Option<(u8, u8, u8)>,
     /// Installed on every webview when force-dark is on.
     ucm: *mut WebKitUserContentManager,
     /// A pre-built hidden webview parked on about:blank, WebProcess already
@@ -260,9 +261,15 @@ impl WebKitHost {
             let pending = Rc::new(std::cell::RefCell::new(Pending::default()));
             let sink = pending.clone();
             FRAME_SINK = Some(Box::new(move |buffer: *mut WPEBuffer| {
-                if let Some(f) = read_shm(buffer) {
-                    // Replace, never accumulate: the newest frame wins.
-                    sink.borrow_mut().frame = Some(f);
+                let mut slot = sink.borrow_mut();
+                // Replace, never accumulate: the newest frame wins. The
+                // superseded frame's buffer is refilled rather than dropped —
+                // when the engine outruns `pump`, which is exactly when frames
+                // are being thrown away, allocating a new one each time would
+                // be the most expensive possible way to discard work.
+                let previous = slot.frame.take().map(|(px, ..)| px);
+                if let Some(f) = read_shm(buffer, previous) {
+                    slot.frame = Some(f);
                 }
             }));
 
@@ -293,7 +300,7 @@ impl WebKitHost {
                 session,
                 download_started,
                 prompts,
-                last_frame: None,
+                last_pixel: None,
                 ucm: webkit_user_content_manager_new(),
                 watcher: None,
                 spare: None,
@@ -667,11 +674,26 @@ impl WebKitHost {
         let Some((px, w, h)) = frame else {
             return (false, dirty);
         };
-        self.last_frame = Some((px.clone(), w, h));
-        let id = cce_ui::vk::upload_rgba(px, w, h);
+        // The one pixel anything actually reads back (see `sample_pixel`),
+        // kept instead of a copy of the whole frame. Cloning 35 MB per frame
+        // to serve a three-byte question cost 7 ms of every frame.
+        self.last_pixel = (px.len() >= 4).then(|| (px[2], px[1], px[0]));
         let tab = &mut self.tabs[self.active];
-        if let Some((old, ..)) = tab.image.replace((id, w, h)) {
-            cce_ui::vk::free_image(old);
+        match tab.image {
+            // Same tab, same size: replace the contents of the image that is
+            // already there. No allocation, no descriptor, and above all no
+            // image freed — freeing one waits for the whole device to go idle,
+            // which on this path meant once per frame.
+            Some((id, iw, ih)) if (iw, ih) == (w, h) => {
+                cce_ui::vk::update_pixels(id, px, w, h, cce_ui::vk::PixelFormat::Bgra);
+            }
+            _ => {
+                let id = cce_ui::vk::upload_pixels(px, w, h, cce_ui::vk::PixelFormat::Bgra);
+                if let Some((old, ..)) = tab.image.replace((id, w, h)) {
+                    cce_ui::vk::free_image(old);
+                }
+                tab.image = Some((id, w, h));
+            }
         }
         (true, true)
     }
@@ -700,8 +722,7 @@ impl WebKitHost {
     /// Top-left pixel of the last frame, for tests that need to assert on
     /// what was actually rendered rather than on what was configured.
     pub fn sample_pixel(&self) -> Option<(u8, u8, u8)> {
-        let (px, ..) = self.last_frame.as_ref()?;
-        Some((px[0], px[1], px[2]))
+        self.last_pixel
     }
 
     pub fn image(&self) -> Option<(u32, u32, u32)> {
@@ -1129,11 +1150,25 @@ impl WebKitHost {
     }
 }
 
-/// Copy an SHM buffer's pixels out as RGBA for `upload_rgba`.
+/// Copy an SHM buffer's pixels out for the image registry.
 ///
-/// `WPE_PIXEL_FORMAT_ARGB8888` is B,G,R,A in memory on little-endian, and the
-/// stride is not assumed to equal `width * 4`.
-unsafe fn read_shm(buffer: *mut WPEBuffer) -> Option<(Vec<u8>, u32, u32)> {
+/// `WPE_PIXEL_FORMAT_ARGB8888` is B,G,R,A in memory on little-endian, which
+/// is handed over **as BGRA** rather than swizzled: the sampler reads either
+/// channel order at no cost, and rearranging 35 MB of bytes per frame on the
+/// CPU cost 7.4 ms at this display's fullscreen size — most of a frame budget,
+/// spent on nothing.
+///
+/// The destination comes from `cce_ui::vk::recycle_buffer`, so in the steady
+/// state this allocates nothing: a fresh frame-sized `Vec` per frame was
+/// another 4.5 ms, almost all of it zeroing and page faults rather than
+/// copying. What remains is one memcpy per row, and only when the stride
+/// forces it — a tight stride is copied whole.
+///
+/// The stride is not assumed to equal `width * 4`.
+unsafe fn read_shm(
+    buffer: *mut WPEBuffer,
+    reuse: Option<Vec<u8>>,
+) -> Option<(Vec<u8>, u32, u32)> {
     if g_type_check_instance_is_a(buffer as *mut GTypeInstance, wpe_buffer_shm_get_type()) == 0 {
         return None;
     }
@@ -1148,15 +1183,24 @@ unsafe fn read_shm(buffer: *mut WPEBuffer) -> Option<(Vec<u8>, u32, u32)> {
         return None;
     }
     let stride = wpe_buffer_shm_get_stride(shm) as usize;
-    let mut out = vec![0u8; (w * h * 4) as usize];
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let s = src.add(y * stride + x * 4);
-            let d = (y * w as usize + x) * 4;
-            out[d] = *s.add(2);
-            out[d + 1] = *s.add(1);
-            out[d + 2] = *s;
-            out[d + 3] = *s.add(3);
+    let row = w as usize * 4;
+    let need = row * h as usize;
+    if (len as usize) < stride * (h as usize - 1) + row {
+        return None;
+    }
+    let mut out = match reuse {
+        Some(mut buf) if buf.len() == need => {
+            // Every byte below is overwritten, so nothing has to be cleared.
+            buf.truncate(need);
+            buf
+        }
+        _ => cce_ui::vk::recycle_buffer(need),
+    };
+    if stride == row {
+        std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), need);
+    } else {
+        for y in 0..h as usize {
+            std::ptr::copy_nonoverlapping(src.add(y * stride), out.as_mut_ptr().add(y * row), row);
         }
     }
     Some((out, w, h))
