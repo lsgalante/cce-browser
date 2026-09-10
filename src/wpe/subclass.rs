@@ -85,7 +85,12 @@ pub(super) unsafe fn types() -> &'static Types {
 
 /// Set by the host before it creates a webview; `render_buffer` hands frames
 /// here. One host per process for now (see `WebKitHost::new`).
-pub(super) static mut FRAME_SINK: Option<Box<dyn FnMut(*mut WPEBuffer)>> = None;
+///
+/// Returns whether the sink is **keeping** the buffer. If it is, releasing it
+/// is the sink's job — it reads the pixels out at the next pump and hands the
+/// memory back then.
+pub(super) static mut FRAME_SINK: Option<Box<dyn FnMut(*mut WPEView, *mut WPEBuffer) -> bool>> =
+    None;
 
 unsafe extern "C" fn view_render_buffer(
     view: *mut WPEView,
@@ -94,16 +99,23 @@ unsafe extern "C" fn view_render_buffer(
     _n_damage: u32,
     _error: *mut *mut GError,
 ) -> gboolean {
-    #[allow(static_mut_refs)]
-    if let Some(sink) = FRAME_SINK.as_mut() {
-        sink(buffer);
-    }
-    // BOTH halves. `rendered` means displayed, `released` means the memory is
-    // yours again; with only the first the engine produces exactly one frame
-    // and then stalls forever. This is also the backpressure that makes an
-    // unbounded upload queue impossible here.
+    // The two halves mean different things and are no longer said together.
+    // `rendered` means *displayed*: said at once, so the engine's own frame
+    // pacing never waits on our readback. `released` means *the memory is
+    // yours again*, and that has to wait until the pixels have been copied
+    // out of it — so the sink says it, at the pump that reads the buffer.
+    // (Saying neither is what stalls the engine after exactly one frame.)
+    //
+    // Holding the buffer until then is also the backpressure: the engine
+    // cannot run arbitrarily far ahead of a browser that is not keeping up,
+    // and a frame superseded before anyone read it is handed back unread
+    // rather than copied.
     wpe_view_buffer_rendered(view, buffer);
-    wpe_view_buffer_released(view, buffer);
+    #[allow(static_mut_refs)]
+    let held = FRAME_SINK.as_mut().is_some_and(|sink| sink(view, buffer));
+    if !held {
+        wpe_view_buffer_released(view, buffer);
+    }
     1
 }
 

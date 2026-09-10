@@ -107,12 +107,34 @@ unsafe fn connect_notify(wv: *mut WebKitWebView, signal: &str, state: &Rc<TabSta
     );
 }
 
-/// Frames handed over by `render_buffer`, drained by `pump`. A slot, not a
-/// queue: only the newest frame is worth uploading, and WPE will not produce
-/// another until we release the current one anyway.
+/// The frame handed over by `render_buffer`, drained by `pump`. A slot, not a
+/// queue: only the newest frame is ever shown, and the engine will not run far
+/// ahead of a browser that has not released the one it is holding.
+/// Counters behind `CCE_BROWSER_FRAME_DEBUG=1`: how many frames the engine
+/// finished against how many were actually read back. The gap between them is
+/// what pacing saves, and it is invisible from the outside — a browser that
+/// skips nine frames in ten looks exactly like one that copies all ten.
+#[derive(Default)]
+struct FrameCounts {
+    produced: u64,
+    read: u64,
+}
+
+fn frame_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CCE_BROWSER_FRAME_DEBUG").is_some())
+}
+
 #[derive(Default)]
 struct Pending {
-    frame: Option<(Vec<u8>, u32, u32)>,
+    /// The newest finished buffer the engine has handed over, still unread.
+    /// Read and released at the next `pump`; superseded by a newer one, which
+    /// hands this one back **unread** — that skipped copy is the whole point
+    /// of holding it rather than copying in the callback.
+    held: Option<(*mut WPEView, *mut WPEBuffer)>,
+    counts: FrameCounts,
+    /// When the counters were last reported.
+    reported: Option<std::time::Instant>,
 }
 
 pub struct WebKitHost {
@@ -142,6 +164,14 @@ pub struct WebKitHost {
     download_started: Rc<Cell<bool>>,
     /// A page asked something and is blocked until we answer.
     prompts: Rc<RefCell<Prompts>>,
+    /// A frame has been uploaded that nothing has drawn yet.
+    ///
+    /// The readback is paced by this: while it is set, a finished buffer is
+    /// left *held* instead of being copied, and the next engine frame hands it
+    /// back unread. An animating page in a window nobody is drawing — occluded,
+    /// on another desktop — therefore costs nothing, where before it copied
+    /// its full window size sixty times a second into a picture no one saw.
+    pending_draw: Cell<bool>,
     /// The injected account watcher, kept so the setting can take it away
     /// again. `None` when account autocomplete is off, which is also when no
     /// page carries the script at all.
@@ -260,17 +290,20 @@ impl WebKitHost {
             let prompts = Rc::new(RefCell::new(Prompts::default()));
             let pending = Rc::new(std::cell::RefCell::new(Pending::default()));
             let sink = pending.clone();
-            FRAME_SINK = Some(Box::new(move |buffer: *mut WPEBuffer| {
+            FRAME_SINK = Some(Box::new(move |view: *mut WPEView, buffer: *mut WPEBuffer| {
                 let mut slot = sink.borrow_mut();
-                // Replace, never accumulate: the newest frame wins. The
-                // superseded frame's buffer is refilled rather than dropped —
-                // when the engine outruns `pump`, which is exactly when frames
-                // are being thrown away, allocating a new one each time would
-                // be the most expensive possible way to discard work.
-                let previous = slot.frame.take().map(|(px, ..)| px);
-                if let Some(f) = read_shm(buffer, previous) {
-                    slot.frame = Some(f);
+                // Replace, never accumulate: the newest frame wins. The one it
+                // supersedes goes back to the engine **without being read** —
+                // several frames can be dispatched inside a single pump's
+                // drain, and only the last of them will ever be shown, so the
+                // rest are not worth 35 MB of copying each.
+                if let Some((old_view, old_buffer)) = slot.held.replace((view, buffer)) {
+                    wpe_view_buffer_released(old_view, old_buffer);
                 }
+                if frame_debug() {
+                    slot.counts.produced += 1;
+                }
+                true
             }));
 
             let toplevel = wpe_display_create_toplevel(display, 1);
@@ -299,6 +332,7 @@ impl WebKitHost {
                 clear_cookies,
                 session,
                 download_started,
+                pending_draw: Cell::new(false),
                 prompts,
                 last_pixel: None,
                 ucm: webkit_user_content_manager_new(),
@@ -558,6 +592,10 @@ impl WebKitHost {
         }
         let was_active = index == self.active;
         let old_active = self.active;
+        // Anything still held belongs to a view that may be the one about to
+        // be destroyed; hand it back while it is still safe to. Losing that
+        // frame costs a repaint, which the tab change causes anyway.
+        self.release_held();
         // Dropping the Tab unrefs the webview and frees its registry image.
         drop(self.tabs.remove(index));
         if self.tabs.is_empty() {
@@ -573,6 +611,13 @@ impl WebKitHost {
         self.active = usize::MAX; // force activate() to do the work
         self.activate(next);
         true
+    }
+
+    /// Give back an unread buffer, if one is being held.
+    fn release_held(&self) {
+        if let Some((view, buffer)) = self.pending.borrow_mut().held.take() {
+            unsafe { wpe_view_buffer_released(view, buffer) };
+        }
     }
 
     /// Make tab `index` visible and focused. Mirrors `ServoHost::activate`,
@@ -669,8 +714,41 @@ impl WebKitHost {
         if let Some(p) = &mut self.poll {
             p.sync();
         }
-        let frame = self.pending.borrow_mut().frame.take();
+        // Nothing has drawn the last frame yet, so reading another would be
+        // copying over a picture that was never shown. Leave the buffer held:
+        // the engine's next frame supersedes it and hands it back unread.
+        if self.pending_draw.get() {
+            return (false, self.sync_page_state());
+        }
+        // One readback per pump, of the newest buffer only: everything the
+        // engine rendered in between was handed back unread.
+        let held = self.pending.borrow_mut().held.take();
         let dirty = self.sync_page_state();
+        let Some((view, buffer)) = held else {
+            return (false, dirty);
+        };
+        let frame = unsafe {
+            let f = read_shm(buffer);
+            // The pixels are ours now; the memory can go back.
+            wpe_view_buffer_released(view, buffer);
+            f
+        };
+        if frame_debug() {
+            let mut p = self.pending.borrow_mut();
+            p.counts.read += 1;
+            let now = std::time::Instant::now();
+            let due = p.reported.is_none_or(|t| now.duration_since(t).as_secs_f32() >= 1.0);
+            if due {
+                p.reported = Some(now);
+                let (produced, read) = (p.counts.produced, p.counts.read);
+                p.counts = FrameCounts::default();
+                log::info!(
+                    "frames: engine produced {produced}, read back {read} \
+                     ({} handed back unread)",
+                    produced.saturating_sub(read)
+                );
+            }
+        }
         let Some((px, w, h)) = frame else {
             return (false, dirty);
         };
@@ -695,7 +773,14 @@ impl WebKitHost {
                 tab.image = Some((id, w, h));
             }
         }
+        self.pending_draw.set(true);
         (true, true)
+    }
+
+    /// The chrome drew: whatever was uploaded is on screen, so the next
+    /// engine frame is worth reading. Called from `display_list`.
+    pub fn frame_drawn(&self) {
+        self.pending_draw.set(false);
     }
 
     /// Fold each tab's signal-written state into the fields the chrome reads.
@@ -1164,11 +1249,11 @@ impl WebKitHost {
 /// copying. What remains is one memcpy per row, and only when the stride
 /// forces it — a tight stride is copied whole.
 ///
+/// Called from `pump`, never from the frame callback: a buffer superseded
+/// before the next pump is never read at all.
+///
 /// The stride is not assumed to equal `width * 4`.
-unsafe fn read_shm(
-    buffer: *mut WPEBuffer,
-    reuse: Option<Vec<u8>>,
-) -> Option<(Vec<u8>, u32, u32)> {
+unsafe fn read_shm(buffer: *mut WPEBuffer) -> Option<(Vec<u8>, u32, u32)> {
     if g_type_check_instance_is_a(buffer as *mut GTypeInstance, wpe_buffer_shm_get_type()) == 0 {
         return None;
     }
@@ -1188,14 +1273,7 @@ unsafe fn read_shm(
     if (len as usize) < stride * (h as usize - 1) + row {
         return None;
     }
-    let mut out = match reuse {
-        Some(mut buf) if buf.len() == need => {
-            // Every byte below is overwritten, so nothing has to be cleared.
-            buf.truncate(need);
-            buf
-        }
-        _ => cce_ui::vk::recycle_buffer(need),
-    };
+    let mut out = cce_ui::vk::recycle_buffer(need);
     if stride == row {
         std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), need);
     } else {

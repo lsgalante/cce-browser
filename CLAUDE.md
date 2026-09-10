@@ -152,6 +152,36 @@ explained there. **Do not reintroduce a `Vec` allocation, a swizzle, or a
 second copy on this path without measuring** — the numbers above are what each
 one costs.
 
+### The readback is paced to draws
+
+`render_buffer` says the two halves of the buffer protocol at different times,
+and that is the pacing. `wpe_view_buffer_rendered` — *displayed* — is said at
+once, so the engine's own frame pacing never waits on us.
+`wpe_view_buffer_released` — *the memory is yours again* — waits until the
+pixels have been copied out, which happens in `pump`, not in the callback.
+(Saying neither is what stalls the engine after exactly one frame; that is what
+the old comment here warned about.)
+
+Holding the buffer buys two things. A frame superseded before anyone read it is
+handed back **unread**, so several frames dispatched inside one pump's drain
+cost one copy rather than N. And `pending_draw` gates the readback on the
+chrome having actually drawn (`frame_drawn`, called from `display_list`): while
+nothing has drawn the last frame, the next one is left held rather than copied
+over a picture nobody saw.
+
+That second half is where the win is, and it is not the one first expected.
+Measured in a shadow against a page animating at 63 fps: **visible and drawing,
+62 of 63 frames are read — the pacing changes nothing**, because `pump` is what
+dispatches the engine's frames and it dispatches them promptly, so the engine
+never gets ahead. **Minimized, 4 of 64 are read** — 60 handed back unread, a
+page that used to cost its full window size sixty times a second while nobody
+was looking. Restoring recovers the full rate within a second, with live
+content.
+
+`CCE_BROWSER_FRAME_DEBUG=1` logs the two counts once a second; the gap between
+them is invisible from the outside, since a browser that skips nine frames in
+ten looks exactly like one that copies all ten.
+
 ## Tabs
 
 One `WebView` per tab, all sharing the single rendering context; only the active one

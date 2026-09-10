@@ -2759,6 +2759,11 @@ impl Application for BrowserApp {
     }
 
     fn display_list(&mut self, size: LogicalSize, _scale: f64) -> Option<DisplayList> {
+        // Whatever the engine last handed over is about to be on screen. That
+        // is what lets the next one be read: until a frame is drawn, reading
+        // another would be copying over a picture nobody saw.
+        #[cfg(feature = "wpe")]
+        self.host.frame_drawn();
         self.win = (size.width, size.height);
         let mut pc = PaintCtx::new();
         let w = size.width;
