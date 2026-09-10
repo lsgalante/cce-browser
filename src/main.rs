@@ -484,6 +484,16 @@ struct BrowserApp {
     bookmarks: std::sync::Arc<pages::Bookmarks>,
     /// The open bookmarks menu, if any.
     bm_menu: Option<BmMenu>,
+    /// Wheel easing for the page, through the DE's shared scroll model.
+    ///
+    /// The browser does not own the page's offset — WebKit does — so this
+    /// runs as a *virtual* one: notches move its target, `tick` walks the
+    /// eased position, and what the engine receives each frame is the
+    /// difference since the last one. It is rebased to zero whenever the
+    /// glide settles, so nothing accumulates across a session.
+    scroll: cce_ui::widget::scroll_motion::ScrollMotion,
+    /// The virtual offset already handed to the engine.
+    scroll_sent: (f32, f32),
     /// Accounts from cce-secrets, and the worker that reads them.
     accounts: accounts::Accounts,
     /// The open account list, if a login field is focused and something in
@@ -493,8 +503,9 @@ struct BrowserApp {
     /// The active tab's URL as of the last page-state sync, for spotting an
     /// actual navigation. The engine's dirty flag is not that: it also fires
     /// for a title, a loading transition, a favicon — and treating those as
-    /// navigations closed the account list in the same pump that opened it.
-    #[cfg(feature = "wpe")]
+    /// navigations closed the account list in the same pump that opened it,
+    /// and would cut every wheel glide short the moment the page it was
+    /// scrolling said anything about itself.
     nav_url: Option<String>,
     /// Hovered pill in the favorites strip — a repaint, like the dot.
     fav_hover: Option<usize>,
@@ -731,6 +742,54 @@ impl BrowserApp {
     fn toggle_favorite(&mut self) {
         self.host.toggle_favorite();
         self.refresh_favorites();
+    }
+
+    /// Drop any glide in flight and rebase the virtual offset.
+    ///
+    /// Called wherever the deltas would land somewhere they were not aimed:
+    /// another tab, another page.
+    fn stop_scroll(&mut self) {
+        self.scroll.x.jump_to(0.0);
+        self.scroll.y.jump_to(0.0);
+        self.scroll_sent = (0.0, 0.0);
+    }
+
+    /// Hand the engine what the glide moved since the last frame.
+    ///
+    /// Deltas, not an offset: WebKit keeps the real scroll position (and
+    /// clamps it at the ends of the page), so the model here only has to say
+    /// how far to move. Sign flips back on the way out — the shared model
+    /// counts an offset that grows as content moves up, the engine takes the
+    /// winit convention the rest of this file passes it.
+    fn advance_scroll(&mut self, dt: f32) -> bool {
+        use cce_ui::widget::scroll_motion::Bounds;
+        if !self.scroll.is_animating() {
+            // Settled: rebase, so a long session never walks the accumulator
+            // out into the far reaches of f32.
+            if self.scroll_sent != (0.0, 0.0) {
+                self.stop_scroll();
+            }
+            return false;
+        }
+        self.scroll.tick(dt, Bounds::UNBOUNDED, Bounds::UNBOUNDED);
+        let (x, y) = (self.scroll.x.pos(), self.scroll.y.pos());
+        let (dx, dy) = (x - self.scroll_sent.0, y - self.scroll_sent.1);
+        self.scroll_sent = (x, y);
+        if dx == 0.0 && dy == 0.0 {
+            return true;
+        }
+        // Say which gesture these belong to rather than inheriting whatever
+        // the last real event set: a glide is a wheel, and a stale FingerEnd
+        // would tell the engine every frame that a gesture had just ended.
+        cce_ui::widget::scroll_motion::set_scroll_phase(cce_ui::widget::ScrollPhase::Wheel);
+        let s = self.scale;
+        self.host.wheel(
+            -(dx as f64) * s,
+            -(dy as f64) * s,
+            self.pointer.0 * s as f32,
+            self.pointer.1 * s as f32,
+        );
+        true
     }
 
     /// The tab's host, for matching accounts and for checking that a field
@@ -1450,6 +1509,8 @@ impl BrowserApp {
     }
 
     fn switch_tab(&mut self, index: usize) {
+        // A glide aimed at this page must not land on the next one.
+        self.stop_scroll();
         // The other tab has its own fields, and may have none.
         #[cfg(feature = "wpe")]
         {
@@ -1945,10 +2006,11 @@ impl Application for BrowserApp {
             fav_hover: None,
             bookmarks,
             bm_menu: None,
+            scroll: cce_ui::widget::scroll_motion::ScrollMotion::new(),
+            scroll_sent: (0.0, 0.0),
             accounts,
             #[cfg(feature = "wpe")]
             ac_menu: None,
-            #[cfg(feature = "wpe")]
             nav_url: None,
         }
     }
@@ -2027,15 +2089,16 @@ impl Application for BrowserApp {
                     self.open_internal_page("cce://downloads");
                 }
                 if dirty {
-                    // A navigation retires whatever field was focused. Only a
-                    // real one: the URL changing, not the dirty flag, which
-                    // also fires while the page that owns the field is still
-                    // settling.
-                    #[cfg(feature = "wpe")]
-                    {
-                        let now = self.host.url().map(|u| u.to_string());
-                        if now != self.nav_url {
-                            self.nav_url = now;
+                    // A navigation retires whatever field was focused and
+                    // whatever glide was in flight. Only a real one: the URL
+                    // changing, not the dirty flag, which also fires while the
+                    // page that owns them is still settling.
+                    let now = self.host.url().map(|u| u.to_string());
+                    if now != self.nav_url {
+                        self.nav_url = now;
+                        self.stop_scroll();
+                        #[cfg(feature = "wpe")]
+                        {
                             self.ac_menu = None;
                         }
                     }
@@ -2113,6 +2176,12 @@ impl Application for BrowserApp {
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
+        // The page's wheel glide, one frame's worth. It feeds the engine, so
+        // the frame it produces is what actually redraws; asking for a
+        // rebuild here is what keeps the loop turning until it lands.
+        if self.advance_scroll(dt) {
+            *needs_rebuild = true;
+        }
         let target = if self.chrome_open { 1.0 } else { 0.0 };
         if self.chrome_t != target {
             let step = dt / CHROME_ANIM_S;
@@ -2427,9 +2496,41 @@ impl Application for BrowserApp {
         if self.chrome_hit(pos.x, pos.y) {
             return;
         }
+        // A wheel notch eases instead of jumping, through the same model
+        // every other cce app scrolls by (`smooth_scroll` / `scroll_ease` in
+        // input.kdl, this app's domain then `cce-ui`'s). Without it a notch
+        // moved the page LINE_PX in one step, which is the browser feeling
+        // unlike the rest of the desktop.
+        //
+        // Only a *notch* takes this path. A trackpad's pixel deltas already
+        // follow the finger, and the engine runs its own kinetic scrolling off
+        // the gesture phases this passes it — two coast models fighting over
+        // one page would be worse than either.
+        let discrete = matches!(delta, MouseScrollDelta::LineDelta(..));
+        let phase = cce_ui::widget::scroll_motion::current_scroll_phase();
+        if discrete
+            && phase == cce_ui::widget::ScrollPhase::Wheel
+            && cce_ui::widget::scroll_motion::scroll_settings().smooth
+        {
+            use cce_ui::widget::scroll_motion::Bounds;
+            // Unbounded: the page's real limits are WebKit's business, and it
+            // clamps. Notches arriving mid-glide accumulate into one movement
+            // rather than a staircase.
+            self.scroll.apply(
+                delta,
+                (LINE_PX as f32, LINE_PX as f32),
+                Bounds::UNBOUNDED,
+                Bounds::UNBOUNDED,
+            );
+            // Keeps the runner's loop warm until the glide lands, the same
+            // way the chrome's unfold does.
+            *needs_rebuild = true;
+            return;
+        }
+
         // WheelDelta keeps cce-ui's winit sign convention (positive = scroll
-        // up); Servo inverts it into the scroll offset internally, after the
-        // page has had its preventDefault chance.
+        // up); the engine inverts it into the scroll offset internally, after
+        // the page has had its preventDefault chance.
         let (dx, dy) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (*x as f64 * LINE_PX, *y as f64 * LINE_PX),
             MouseScrollDelta::PixelDelta(p) => (p.x, p.y),

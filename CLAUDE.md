@@ -330,8 +330,45 @@ Two page-directed cases are not plain key forwarding:
   literal "a" into a focused textarea instead of selecting it.
 
 Wheel events pass **winit-signed deltas** (positive = up) with no separate scroll
-event: Servo hit-tests the wheel, gives the page its `preventDefault` chance, and
+event: the engine hit-tests the wheel, gives the page its `preventDefault` chance, and
 applies the inverted delta itself.
+
+### The wheel eases; the trackpad does not
+
+A notch used to move the page `LINE_PX` in one step, which is the browser
+feeling unlike every other cce app. It now goes through
+`cce_ui::widget::scroll_motion` — the DE's shared model, tuned by
+`smooth_scroll` / `scroll_ease` in `input.kdl` (this app's domain, then
+`cce-ui`'s) — so notches glide and several in a row accumulate into one
+movement instead of a staircase.
+
+The browser does not own the page's offset, so the model runs as a **virtual**
+one: `apply` moves its target, `tick` walks the eased position, and
+`advance_scroll` hands the engine the *difference* since the last frame. WebKit
+keeps the real position and clamps it at the page's ends, which is why the
+bounds here are `UNBOUNDED`. The accumulator is rebased to zero whenever the
+glide settles, and dropped on a tab switch or a real navigation, so deltas
+aimed at one page never land on the next.
+
+Points that are choices:
+
+- **Only a notch eases.** A trackpad's pixel deltas already follow the finger,
+  and the engine runs its own kinetic scrolling off the gesture phases
+  `host.wheel` passes it. Two coast models fighting over one page would be
+  worse than either, so `Finger` and `FingerEnd` keep the direct path.
+- **The phase is set explicitly before each glide frame** rather than
+  inherited: a stale `FingerEnd` would tell the engine every frame that a
+  gesture had just ended.
+- **`tick` asks for a rebuild while the glide is in flight**, the same way the
+  chrome's unfold does — that is what keeps the runner's loop turning.
+- Settings are read once per process (`scroll_settings` is a `OnceLock`), so a
+  change to `input.kdl` needs a restart.
+
+Measured in a headless shadow at scale 2, one notch: eased it walks
+92 → 123 → 145 → 159 → … → 190; direct it lands on 190 immediately. Three
+notches in quick succession land exactly three notches on (190 → 760), so the
+distance a notch travels is unchanged — only its timing. (The 190 is WebKit's
+own multiplier on a precise delta; the direct path has always moved that far.)
 
 ## Account autocomplete (cce-secrets)
 
