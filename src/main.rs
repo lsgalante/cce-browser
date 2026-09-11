@@ -439,6 +439,12 @@ struct BrowserApp {
     win: (f32, f32),
     scale: f64,
     pointer: (f32, f32),
+    /// Buttons whose press was handed to the page and whose release it is
+    /// therefore still owed. The chrome opens menus on a press — a
+    /// right-click opens the context menu — and every menu branch below
+    /// swallows the clicks that follow, so without this the engine never
+    /// sees the button come back up.
+    page_buttons: Vec<MouseButton>,
     /// URL bar contents; mirrors the page URL unless the bar is focused.
     /// Text, caret and selection all live in the shared editor — the same
     /// one the dialog fields use.
@@ -1388,6 +1394,44 @@ impl BrowserApp {
         }
     }
 
+    /// Hand a page-area press to the engine, remembering it so the matching
+    /// release can always follow.
+    ///
+    /// Releases do not come through here: `drain_page_release` has already
+    /// sent them from the top of `handle_mouse_input`, before any of the
+    /// branches that swallow a click.
+    fn page_press(&mut self, button: MouseButton, pressed: bool, pos: LogicalPosition) {
+        if !pressed {
+            return;
+        }
+        if !self.page_buttons.contains(&button) {
+            self.page_buttons.push(button);
+        }
+        let s = self.scale as f32;
+        self.host.mouse_button_ui(button, true, pos.x * s, pos.y * s);
+    }
+
+    /// Give the page the release it is owed, wherever the pointer ended up
+    /// and whatever the chrome is about to do with this click.
+    ///
+    /// A release only means anything to whoever received the press, and the
+    /// two are not routed alike: the press goes to the page, then the chrome
+    /// may put a menu up — the right-click menu does exactly that, from the
+    /// press — and every menu branch below swallows the clicks that arrive
+    /// while it is open. A release swallowed there leaves WebKit holding the
+    /// button down for good, which is how right-click quietly stops working
+    /// until the app is restarted. A release nobody is owed (the one that
+    /// dismissed the menu, say) is dropped rather than reaching the page
+    /// unpaired.
+    fn drain_page_release(&mut self, button: MouseButton, pos: LogicalPosition) {
+        let Some(i) = self.page_buttons.iter().position(|b| *b == button) else {
+            return;
+        };
+        self.page_buttons.remove(i);
+        let s = self.scale as f32;
+        self.host.mouse_button_ui(button, false, pos.x * s, pos.y * s);
+    }
+
     fn navigate(&mut self) {
         if let Some(url) = parse_url_input(&self.url.text, &self.settings.search_prefix) {
             self.host.load(url);
@@ -1986,6 +2030,7 @@ impl Application for BrowserApp {
             win: (1200.0, 800.0),
             scale: 1.0,
             pointer: (0.0, 0.0),
+            page_buttons: Vec::new(),
             url: lineedit::LineEdit::with_text(url_text),
             url_focused: false,
             chrome_open: false,
@@ -2278,6 +2323,13 @@ impl Application for BrowserApp {
     ) -> Option<Self::Message> {
         let pressed = state == ElementState::Pressed;
 
+        // Before any of the branches that swallow a click: a button the page
+        // is holding gets its release no matter where it was let go, or the
+        // engine goes on believing it is still down.
+        if !pressed {
+            self.drain_page_release(button, pos);
+        }
+
         #[cfg(feature = "wpe")]
         if self.modal.is_some() {
             if !pressed || button != MouseButton::Left {
@@ -2459,11 +2511,7 @@ impl Application for BrowserApp {
         match button {
             MouseButton::Back if pressed => self.host.back(),
             MouseButton::Forward if pressed => self.host.forward(),
-            _ => {
-                let s = self.scale as f32;
-                self.host
-                    .mouse_button_ui(button, pressed, pos.x * s, pos.y * s);
-            }
+            _ => self.page_press(button, pressed, pos),
         }
         None
     }
