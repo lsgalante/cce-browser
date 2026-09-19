@@ -553,6 +553,25 @@ impl ServoHost {
         }
     }
 
+    /// Re-paint the page into a renderer that has just replaced the one the
+    /// tab images were uploaded to.
+    ///
+    /// An image id belongs to a **renderer**, not to the process: `cce-ui`'s
+    /// `window_runner` repairs a lost Wayland transport by opening a new
+    /// session around the same `Application`, which rebuilds the renderer and
+    /// with it the image table, and a draw for an unknown id is skipped
+    /// silently. `paint_active` is the repaint primitive here — the same one
+    /// `activate` uses to show a switched-to tab immediately — so the page
+    /// comes back without a reload.
+    pub fn renderer_replaced(&mut self) {
+        for tab in &mut self.tabs {
+            if let Some((id, ..)) = tab.image.take() {
+                cce_ui::vk::free_image(id);
+            }
+        }
+        self.paint_active();
+    }
+
     /// Spin Servo, sync delegate signals into tabs, and repaint the active
     /// tab if it produced a frame. Returns (new frame, any state change).
     pub fn pump(&mut self) -> (bool, bool) {

@@ -777,6 +777,43 @@ impl WebKitHost {
         (true, true)
     }
 
+    /// Re-paint the page into a renderer that has just replaced the one the
+    /// tab images were uploaded to.
+    ///
+    /// An image id belongs to a **renderer**, not to the process: `cce-ui`'s
+    /// `window_runner` repairs a lost Wayland transport by opening a new
+    /// session around the same `Application`, which rebuilds the renderer and
+    /// with it the image table. A draw for an unknown id is skipped rather
+    /// than reported, so the chrome came back over an empty page.
+    ///
+    /// Two halves. Dropping the ids is the easy one. The hard one is that
+    /// nothing would otherwise provoke a new frame: a page that has finished
+    /// loading renders once and then only on damage, so `pump` would find no
+    /// buffer held and the window would sit blank until the user scrolled or
+    /// navigated. Remapping the active view is the nudge — it is what
+    /// `activate` already relies on to get a frame out of a tab being
+    /// switched to.
+    ///
+    /// A buffer still held from the old session is deliberately kept: its
+    /// pixels are fine, and the next `pump` uploads them under a fresh id.
+    pub fn renderer_replaced(&mut self) {
+        for tab in &mut self.tabs {
+            if let Some((id, ..)) = tab.image.take() {
+                // A free for an id the new renderer never had is a no-op, and
+                // ids are process-unique, so this cannot reach a live image.
+                cce_ui::vk::free_image(id);
+            }
+        }
+        unsafe {
+            let view = self.active_tab().view;
+            wpe_view_unmap(view);
+            wpe_view_set_visible(view, 1);
+            wpe_view_map(view);
+            let (lw, lh) = self.logical_size();
+            wpe_view_resized(view, lw, lh);
+        }
+    }
+
     /// The chrome drew: whatever was uploaded is on screen, so the next
     /// engine frame is worth reading. Called from `display_list`.
     pub fn frame_drawn(&self) {

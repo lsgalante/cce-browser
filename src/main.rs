@@ -434,6 +434,10 @@ pub enum Message {
 
 struct BrowserApp {
     host: Host,
+    /// Whether a renderer has been handed over yet — the first one is the
+    /// process's own, any later one is a replacement after a reconnect. See
+    /// `renderer_init`.
+    seen_renderer: bool,
     /// Loaded from the app config; re-read when the window regains focus.
     settings: settings::Settings,
     win: (f32, f32),
@@ -2026,6 +2030,7 @@ impl Application for BrowserApp {
         let bookmarks = host.bookmarks();
         Self {
             host,
+            seen_renderer: false,
             settings,
             win: (1200.0, 800.0),
             scale: 1.0,
@@ -2253,6 +2258,23 @@ impl Application for BrowserApp {
         self.scale = scale;
         let (w, h) = self.content_px();
         self.host.resize(w, h, scale as f32);
+    }
+
+    /// Re-paint the page when the renderer is replaced.
+    ///
+    /// The tab images are **renderer** ids, and a renderer does not outlive
+    /// its session — `window_runner` rebuilds it around the same
+    /// `Application` after a lost Wayland transport, and a draw for an
+    /// unknown id is skipped rather than reported. See
+    /// `Host::renderer_replaced` for why dropping the ids is only half of it.
+    ///
+    /// Not on the first renderer: no page has rendered yet, and remapping the
+    /// view before the first frame would only make the engine repeat work.
+    fn renderer_init(&mut self, _renderer: &mut cce_ui::vk::VkRenderer) {
+        if std::mem::replace(&mut self.seen_renderer, true) {
+            log::info!("[browser] renderer replaced; re-painting the page");
+            self.host.renderer_replaced();
+        }
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, _needs_rebuild: &mut bool) {
