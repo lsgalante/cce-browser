@@ -14,14 +14,14 @@ fetch-only static mirror now kept as the `published` remote). Read the workspace
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
-Eight files, ~3k lines:
+Sixteen files, ~8.8k lines. The ten that carry the design:
 
 | file | what it owns |
 | --- | --- |
 | `src/main.rs` | `BrowserApp` — the `cce-ui` `Application`: chrome layout, hit-testing, the URL line editor, key/pointer routing |
 | `src/instance.rs` | single-instance forwarding: a later launch hands its argument to the running instance's socket and exits |
 | `src/bin/open.rs` | `cce-browser-open`, the desktop entry's `Exec` target: a ~500KB forwarder linking only libc (~4ms vs ~22ms through the full binary), exec'ing `cce-browser` when no instance answers |
-| `src/webview.rs` | `ServoHost` — Servo boot, the delegate, one `WebView` per tab, the frame pipeline |
+| `src/webview.rs` | **retired backend, behind the non-default `servo` feature** — `ServoHost`: Servo boot, the delegate, one `WebView` per tab, the frame pipeline. Not built by `cargo build`; see WPE-PORT.md |
 | `src/pages.rs` | the `cce:` protocol handler and its History / Bookmarks / Favorites stores |
 | `src/downloads.rs` | the chrome-side download pipeline (Servo has none) |
 | `src/session.rs` | open-tab persistence: the tab set survives a restart |
