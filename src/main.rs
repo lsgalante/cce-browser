@@ -1622,7 +1622,7 @@ impl BrowserApp {
             [0.0, 0.0, 0.0, 0.45],
         );
         let radii = (BAR_RADIUS, BAR_RADIUS, BAR_RADIUS, BAR_RADIUS);
-        pc.plate(r, radii, [0.13, 0.14, 0.16, 1.0], cce_ui::layout::bevel_width().min(4.0));
+        pc.plate(r, radii, &cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]), cce_ui::layout::bevel_width().min(4.0));
 
         pc.text(
             m.title.clone(),
@@ -1695,7 +1695,7 @@ impl BrowserApp {
         pc.plate(
             plate,
             (8.0, 8.0, 8.0, 8.0),
-            [0.13, 0.14, 0.16, 1.0],
+            &cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]),
             cce_ui::layout::bevel_width().min(3.0),
         );
         for (k, r) in rows.iter().enumerate() {
@@ -1759,7 +1759,7 @@ impl BrowserApp {
         pc.plate(
             l.plate,
             (8.0, 8.0, 8.0, 8.0),
-            [0.13, 0.14, 0.16, 1.0],
+            &cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]),
             cce_ui::layout::bevel_width().min(3.0),
         );
 
@@ -1887,7 +1887,7 @@ impl BrowserApp {
         pc.plate(
             r,
             (8.0, 8.0, 8.0, 8.0),
-            [0.13, 0.14, 0.16, 1.0],
+            &cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]),
             cce_ui::layout::bevel_width().min(3.0),
         );
         let hovered = menu.item_at(self.pointer.0, self.pointer.1);
@@ -2867,7 +2867,7 @@ impl Application for BrowserApp {
             pc.plate_shaped(
                 plate,
                 (radius, radius, radius, radius),
-                BAR_FILL,
+                &cce_ui::scene::Material::from_fill(BAR_FILL),
                 cce_ui::layout::bevel_width().min(4.0),
                 Some(shape),
             );
