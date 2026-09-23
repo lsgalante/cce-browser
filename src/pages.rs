@@ -579,8 +579,26 @@ impl CceProtocol {
 mod tests {
     use super::*;
 
-    fn store() -> Favorites {
-        let dir = std::env::temp_dir().join(format!("cce-browser-favs-{}", std::process::id()));
+    /// A favorites store in a scratch directory of this TEST's own.
+    ///
+    /// Named per test rather than shared. The tests run in parallel threads
+    /// of one process, so with a single directory between them each call's
+    /// `remove_dir_all` could take the other's file out from under it
+    /// mid-run — and both wrote the same `favorites.tsv` besides, so the
+    /// round-trip read at the end of `strip_order_...` could have been
+    /// reading the other test's writes.
+    ///
+    /// It does not surface on its own — 40 runs at 8 threads, zero failures,
+    /// so the window is narrow. It is not theoretical either: steering the
+    /// second test's wipe into the first's write-then-read window with a
+    /// 50 ms delay failed it 10 times out of 10, the round-trip read coming
+    /// back empty because the file had been deleted under it. Narrow is the
+    /// argument for fixing it rather than against — a race this rare surfaces
+    /// as one unreproducible CI failure, in a test that failed for a reason
+    /// nowhere in its own body.
+    fn store(name: &str) -> Favorites {
+        let dir = std::env::temp_dir()
+            .join(format!("cce-browser-favs-{}-{}", std::process::id(), name));
         let _ = fs::remove_dir_all(&dir);
         Favorites { entries: Mutex::new(Vec::new()), path: dir.join("favorites.tsv") }
     }
@@ -595,7 +613,7 @@ mod tests {
 
     #[test]
     fn strip_order_is_insertion_order_and_shifts_move_one_place() {
-        let f = store();
+        let f = store("strip-order");
         f.add("https://a.example/", "A");
         f.add("https://b.example/", "B");
         f.add("https://c.example/", "C");
@@ -634,10 +652,11 @@ mod tests {
 
     #[test]
     fn internal_pages_are_refused() {
-        let f = store();
+        let f = store("internal-pages");
         f.add("cce://history", "History");
         f.add("about:blank", "");
         assert!(f.snapshot().is_empty());
+        let _ = fs::remove_dir_all(f.path.parent().unwrap());
     }
 }
 
