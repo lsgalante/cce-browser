@@ -76,8 +76,23 @@ impl Session {
 mod tests {
     use super::*;
 
+    /// A session file in a scratch directory of this PROCESS's own.
+    ///
+    /// The name was fixed — `/tmp/cce-browser-session-test` — where the
+    /// sibling helpers in `pages.rs` already scope theirs by pid. /tmp is one
+    /// namespace shared by every user of the machine, so a fixed name belongs
+    /// to whoever ran first and the sticky bit denies it to everyone else;
+    /// nearer to hand, two checkouts running their suites at once shared one
+    /// directory.
+    ///
+    /// The directory is deliberately NOT removed wholesale, here or at the
+    /// end of a test: the three tests run in parallel threads of one process
+    /// and so share this one pid-scoped directory, and a `remove_dir_all`
+    /// would take a sibling's file out from under it. Each test owns a
+    /// distinct file name and clears just that.
     fn temp_session(name: &str) -> Session {
-        let dir = std::env::temp_dir().join("cce-browser-session-test");
+        let dir = std::env::temp_dir()
+            .join(format!("cce-browser-session-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         let _ = std::fs::remove_file(&path);

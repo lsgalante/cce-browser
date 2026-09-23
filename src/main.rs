@@ -3092,7 +3092,10 @@ mod tests {
 
     #[test]
     fn startup_arg_resolves_an_existing_path_to_a_file_url() {
-        let dir = std::env::temp_dir().join("cce-browser-argv-test");
+        // Scoped to this process, like every other scratch directory in the
+        // crate: /tmp is one namespace shared by every user of the machine.
+        let dir = std::env::temp_dir()
+            .join(format!("cce-browser-argv-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let page = dir.join("page.html");
         std::fs::write(&page, "<html></html>").unwrap();
@@ -3106,7 +3109,8 @@ mod tests {
         let bar = parse_url_input(page.to_str().unwrap(), SEARCH).unwrap();
         assert_eq!(bar.scheme(), "https");
 
-        std::fs::remove_file(&page).unwrap();
+        // Sole user of this directory, so it can go whole.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(feature = "wpe")]
