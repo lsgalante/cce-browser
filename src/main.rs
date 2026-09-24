@@ -53,16 +53,46 @@ pub enum EditingCommand {
     Paste,
 }
 
-const BAR_MARGIN: f32 = 10.0;
+// Spacing is the DE's ladder (cce-ui `layout.rs`), never a number of this
+// app's own. Five readings of it cover the whole chrome:
+
+/// The bar's inset from the window edge: it stands on the root plate.
+fn bar_margin() -> f32 {
+    cce_ui::layout::root_plate_inset()
+}
+
+/// Inset from a plate's rim to its content — the bar's, and every popover's
+/// (bookmarks, accounts, the context menu, a modal).
+fn plate_pad() -> f32 {
+    cce_ui::layout::plate_padding()
+}
+
+/// Gap between items next to each other in a row of the bar (tabs, pills,
+/// buttons), and between the bar and a menu it drops: siblings on the root
+/// plate.
+fn item_gap() -> f32 {
+    cce_ui::layout::root_plate_gap()
+}
+
+/// Gap between siblings inside a plate: the bar's rows, a modal's fields
+/// and its button pair.
+fn inner_gap() -> f32 {
+    cce_ui::layout::plate_gap()
+}
+
+/// Inset from a control's rim to its label — a pill, a field, a menu row —
+/// the DE's own button padding.
+fn text_pad() -> f32 {
+    cce_ui::layout::button_padding()
+}
 /// Two rows — tab strip on top, nav controls + URL field below — with the
 /// favorites strip between them whenever there is one to show. The bar
 /// does not carry an empty row: no favorites, no strip, two-row bar.
 fn bar_h(favorites: bool) -> f32 {
-    let favs = if favorites { FAV_H + ROW_GAP } else { 0.0 };
-    BAR_PAD + TAB_H + ROW_GAP + favs + BTN_H + BAR_PAD
+    let favs = if favorites { FAV_H + inner_gap() } else { 0.0 };
+    plate_pad() + TAB_H + inner_gap() + favs + BTN_H + plate_pad()
 }
 const BAR_RADIUS: f32 = 10.0;
-const BAR_PAD: f32 = 7.0;
 /// Seconds for the bar to unfold from the corner control (and back).
 const CHROME_ANIM_S: f32 = 0.18;
 /// Width reserved at the right end of the row the corner control sits on
@@ -77,41 +107,32 @@ fn dot_col(position: settings::BarPosition, tabs_row: bool) -> f32 {
     if dot_on_tabs == tabs_row { DOT_COL } else { 0.0 }
 }
 const TAB_H: f32 = 24.0;
-const TAB_GAP: f32 = 4.0;
 const TAB_MIN_W: f32 = 56.0;
 const TAB_MAX_W: f32 = 200.0;
 /// Tabs at least this wide get a close "x" region on their right edge.
 const TAB_CLOSE_MIN_W: f32 = 72.0;
 const TAB_CLOSE_W: f32 = 18.0;
 const PLUS_W: f32 = 26.0;
-const ROW_GAP: f32 = 6.0;
 /// The favorites strip: a row of pills, each one page. Pills take their
 /// label's width up to `FAV_MAX_W`, and the strip simply stops at the bar's
 /// edge — favorites are a handful by design, not a scrolling list.
 const FAV_H: f32 = 22.0;
-const FAV_GAP: f32 = 4.0;
 const FAV_MAX_W: f32 = 150.0;
-const FAV_PAD_X: f32 = 9.0;
 const FAV_FONT: f32 = 12.0;
 /// The bookmarks menu: a plate of rows dropped from the controls row's "B"
 /// button — the bar's own way to visit and manage what the star saves.
 const BM_W: f32 = 320.0;
 const BM_ROW_H: f32 = 24.0;
-const BM_PAD: f32 = 6.0;
 /// Height of the rule between the menu's three sections.
 const BM_SEP_H: f32 = 9.0;
-/// Gap between the bar and the menu it drops (or raises).
-const BM_GAP: f32 = 6.0;
 /// The remove hit region at a bookmark row's right end.
 const BM_RM_W: f32 = 24.0;
 const BM_FONT: f32 = 13.0;
-const BM_TEXT_PAD: f32 = 10.0;
 /// The account list: suggestions from cce-secrets, dropped at the login
 /// field they are for rather than at the bar, because that is where the
 /// person is looking.
 const AC_W: f32 = 300.0;
 const AC_ROW_H: f32 = 34.0;
-const AC_PAD: f32 = 5.0;
 /// Rows before the list scrolls with the selection.
 const AC_MAX_ROWS: usize = 6;
 const AC_FONT: f32 = 13.0;
@@ -122,9 +143,7 @@ const AC_SUB_FONT: f32 = 11.0;
 const BAR_FILL: [f32; 4] = [0.11, 0.12, 0.13, -0.28];
 const BTN_W: f32 = 30.0;
 const BTN_H: f32 = 26.0;
-const BTN_GAP: f32 = 6.0;
 const URL_FONT: f32 = 14.0;
-const URL_PAD_X: f32 = 9.0;
 /// Pixels per wheel notch when the DE reports discrete line deltas.
 const LINE_PX: f64 = 76.0;
 
@@ -169,8 +188,6 @@ enum ModalKind {
 #[cfg(feature = "wpe")]
 const MODAL_W: f32 = 420.0;
 #[cfg(feature = "wpe")]
-const MODAL_PAD: f32 = 18.0;
-#[cfg(feature = "wpe")]
 const MODAL_FIELD_H: f32 = 26.0;
 #[cfg(feature = "wpe")]
 const MODAL_BTN_W: f32 = 84.0;
@@ -178,17 +195,17 @@ const MODAL_BTN_W: f32 = 84.0;
 #[cfg(feature = "wpe")]
 impl Modal {
     fn height(&self) -> f32 {
-        MODAL_PAD * 2.0
+        plate_pad() * 2.0
             + 20.0
             + 22.0
-            + self.fields.len() as f32 * (MODAL_FIELD_H + 8.0)
-            + 12.0
+            + self.fields.len() as f32 * (MODAL_FIELD_H + inner_gap())
+            + inner_gap()
             + BTN_H
     }
 
     /// Centred, and clamped so it stays on screen on a small window.
     fn rect(&self, win: (f32, f32)) -> Rect {
-        let w = MODAL_W.min(win.0 - 40.0).max(240.0);
+        let w = MODAL_W.min(win.0 - 2.0 * bar_margin()).max(240.0);
         let h = self.height();
         Rect {
             x: ((win.0 - w) / 2.0).max(0.0),
@@ -200,24 +217,24 @@ impl Modal {
 
     fn field_rect(&self, r: &Rect, i: usize) -> Rect {
         Rect {
-            x: r.x + MODAL_PAD,
-            y: r.y + MODAL_PAD + 42.0 + i as f32 * (MODAL_FIELD_H + 8.0),
-            width: r.width - MODAL_PAD * 2.0,
+            x: r.x + plate_pad(),
+            y: r.y + plate_pad() + 42.0 + i as f32 * (MODAL_FIELD_H + inner_gap()),
+            width: r.width - plate_pad() * 2.0,
             height: MODAL_FIELD_H,
         }
     }
 
     /// (ok, cancel) — cancel is `None` for a bare alert.
     fn button_rects(&self, r: &Rect) -> (Rect, Option<Rect>) {
-        let y = r.y + r.height - MODAL_PAD - BTN_H;
+        let y = r.y + r.height - plate_pad() - BTN_H;
         let ok = Rect {
-            x: r.x + r.width - MODAL_PAD - MODAL_BTN_W,
+            x: r.x + r.width - plate_pad() - MODAL_BTN_W,
             y,
             width: MODAL_BTN_W,
             height: BTN_H,
         };
         let cancel = self.has_cancel.then(|| Rect {
-            x: ok.x - MODAL_BTN_W - BTN_GAP,
+            x: ok.x - MODAL_BTN_W - inner_gap(),
             ..ok
         });
         (ok, cancel)
@@ -266,8 +283,6 @@ enum CtxAction {
 const CTX_ROW_H: f32 = 24.0;
 #[cfg(feature = "wpe")]
 const CTX_W: f32 = 200.0;
-#[cfg(feature = "wpe")]
-const CTX_PAD: f32 = 6.0;
 
 #[cfg(feature = "wpe")]
 impl CtxMenu {
@@ -276,14 +291,16 @@ impl CtxMenu {
             x: self.pos.0,
             y: self.pos.1,
             width: CTX_W,
-            height: CTX_PAD * 2.0 + self.items.len() as f32 * CTX_ROW_H,
+            height: plate_pad() * 2.0 + self.items.len() as f32 * CTX_ROW_H,
         }
     }
 
     fn row_rect(&self, i: usize) -> Rect {
+        // style: deliberate — a 2px hairline keeps the row highlight off the
+        // plate's roll; the rung padding is the vertical one.
         Rect {
             x: self.pos.0 + 2.0,
-            y: self.pos.1 + CTX_PAD + i as f32 * CTX_ROW_H,
+            y: self.pos.1 + plate_pad() + i as f32 * CTX_ROW_H,
             width: CTX_W - 4.0,
             height: CTX_ROW_H,
         }
@@ -529,36 +546,36 @@ fn hit(r: &Rect, x: f32, y: f32) -> bool {
 /// top or bottom window edge per the config; the page is full-bleed either
 /// way, so nothing but the chrome geometry depends on this. Every other
 /// bar-relative rect below is derived from this one — never from
-/// `BAR_MARGIN` directly, or it would stay pinned to the top.
+/// `bar_margin()` directly, or it would stay pinned to the top.
 fn bar_rect(win: (f32, f32), position: settings::BarPosition, favorites: bool) -> Rect {
     let h = bar_h(favorites);
     let y = match position {
-        settings::BarPosition::Top => BAR_MARGIN,
-        settings::BarPosition::Bottom => (win.1 - BAR_MARGIN - h).max(BAR_MARGIN),
+        settings::BarPosition::Top => bar_margin(),
+        settings::BarPosition::Bottom => (win.1 - bar_margin() - h).max(bar_margin()),
     };
     Rect {
-        x: BAR_MARGIN,
+        x: bar_margin(),
         y,
-        width: (win.0 - 2.0 * BAR_MARGIN).max(120.0),
+        width: (win.0 - 2.0 * bar_margin()).max(120.0),
         height: h,
     }
 }
 
 /// Y of the tab-strip row.
 fn tabs_y(bar: &Rect) -> f32 {
-    bar.y + BAR_PAD
+    bar.y + plate_pad()
 }
 
 /// Y of the favorites strip — under the tabs, where it only exists when
 /// the bar was sized for it.
 fn favs_y(bar: &Rect) -> f32 {
-    bar.y + BAR_PAD + TAB_H + ROW_GAP
+    bar.y + plate_pad() + TAB_H + inner_gap()
 }
 
 /// Y of the nav-controls row: the bar's bottom row, whether or not the
 /// favorites strip sits above it, so it is measured from the bottom edge.
 fn controls_y(bar: &Rect) -> f32 {
-    bar.y + bar.height - BAR_PAD - BTN_H
+    bar.y + bar.height - plate_pad() - BTN_H
 }
 
 /// The favorites strip's pills, one rect per favorite that fits, in strip
@@ -567,24 +584,24 @@ fn controls_y(bar: &Rect) -> f32 {
 /// with the same font and get the same rects.
 fn fav_rects(bar: &Rect, favs: &[pages::Link], sans: &str) -> Vec<Rect> {
     let mut rects = Vec::with_capacity(favs.len());
-    let right = bar.x + bar.width - BAR_PAD;
-    let mut x = bar.x + BAR_PAD;
+    let right = bar.x + bar.width - plate_pad();
+    let mut x = bar.x + plate_pad();
     for f in favs {
-        let w = (measure_text_width(&f.label, sans, FAV_FONT) + 2.0 * FAV_PAD_X)
+        let w = (measure_text_width(&f.label, sans, FAV_FONT) + 2.0 * text_pad())
             .min(FAV_MAX_W)
             .max(FAV_H);
         if x + w > right {
             break;
         }
         rects.push(Rect { x, y: favs_y(bar), width: w, height: FAV_H });
-        x += w + FAV_GAP;
+        x += w + item_gap();
     }
     rects
 }
 
 fn plus_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     Rect {
-        x: bar.x + bar.width - BAR_PAD - dot_col(position, true) - PLUS_W,
+        x: bar.x + bar.width - plate_pad() - dot_col(position, true) - PLUS_W,
         y: tabs_y(bar),
         width: PLUS_W,
         height: TAB_H,
@@ -593,14 +610,14 @@ fn plus_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
 
 fn tab_rect(bar: &Rect, position: settings::BarPosition, count: usize, i: usize) -> Rect {
     let avail = bar.width
-        - 2.0 * BAR_PAD
+        - 2.0 * plate_pad()
         - dot_col(position, true)
         - PLUS_W
-        - TAB_GAP
-        - (count.max(1) - 1) as f32 * TAB_GAP;
+        - item_gap()
+        - (count.max(1) - 1) as f32 * item_gap();
     let w = (avail / count.max(1) as f32).clamp(TAB_MIN_W, TAB_MAX_W);
     Rect {
-        x: bar.x + BAR_PAD + i as f32 * (w + TAB_GAP),
+        x: bar.x + plate_pad() + i as f32 * (w + item_gap()),
         y: tabs_y(bar),
         width: w,
         height: TAB_H,
@@ -619,7 +636,7 @@ fn tab_close_rect(pill: &Rect) -> Option<Rect> {
 
 fn btn_rect(bar: &Rect, i: usize) -> Rect {
     Rect {
-        x: bar.x + BAR_PAD + i as f32 * (BTN_W + BTN_GAP),
+        x: bar.x + plate_pad() + i as f32 * (BTN_W + item_gap()),
         y: controls_y(bar),
         width: BTN_W,
         height: BTN_H,
@@ -630,7 +647,7 @@ fn btn_rect(bar: &Rect, i: usize) -> Rect {
 /// corner control when that row holds it.
 fn star_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     Rect {
-        x: bar.x + bar.width - BAR_PAD - dot_col(position, false) - BTN_W,
+        x: bar.x + bar.width - plate_pad() - dot_col(position, false) - BTN_W,
         y: controls_y(bar),
         width: BTN_W,
         height: BTN_H,
@@ -641,12 +658,12 @@ fn star_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
 /// this page's bookmark, this is all of them.
 fn bm_btn_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     let star = star_rect(bar, position);
-    Rect { x: star.x - BTN_GAP - BTN_W, ..star }
+    Rect { x: star.x - item_gap() - BTN_W, ..star }
 }
 
 fn url_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
-    let x = bar.x + BAR_PAD + 3.0 * (BTN_W + BTN_GAP) + 4.0;
-    let right = bm_btn_rect(bar, position).x - BTN_GAP;
+    let x = bar.x + plate_pad() + 3.0 * (BTN_W + item_gap());
+    let right = bm_btn_rect(bar, position).x - item_gap();
     Rect { x, y: controls_y(bar), width: (right - x).max(60.0), height: BTN_H }
 }
 
@@ -946,26 +963,30 @@ impl BrowserApp {
             return None;
         }
         let rows = menu.shown.len().min(AC_MAX_ROWS);
-        let height = 2.0 * AC_PAD + rows as f32 * AC_ROW_H + if menu.insecure { 18.0 } else { 0.0 };
-        let width = AC_W.min(self.win.0 - 2.0 * BAR_MARGIN).max(180.0);
+        let height = 2.0 * plate_pad() + rows as f32 * AC_ROW_H + if menu.insecure { 18.0 } else { 0.0 };
+        let width = AC_W.min(self.win.0 - 2.0 * bar_margin()).max(180.0);
         let x = menu
             .anchor
             .x
             .clamp(0.0, (self.win.0 - width).max(0.0));
         // Under the field, or above it when there is no room below — the
         // list must never cover the field it is filling.
+        // style: deliberate — 2px off the field, so the list reads as
+        // attached to it; the field is page content, not a plate sibling.
         let below = menu.anchor.y + menu.anchor.height + 2.0;
-        let y = if below + height <= self.win.1 - BAR_MARGIN {
+        let y = if below + height <= self.win.1 - bar_margin() {
             below
         } else {
             (menu.anchor.y - 2.0 - height).max(0.0)
         };
         let plate = Rect { x, y, width, height };
         // Row *positions*; which account each shows is `first_row() + k`.
+        // style: deliberate — the 2px hairline keeps a row's highlight off
+        // the plate's roll.
         let rects = (0..rows)
             .map(|k| Rect {
                 x: plate.x + 2.0,
-                y: plate.y + AC_PAD + (k as f32) * AC_ROW_H,
+                y: plate.y + plate_pad() + (k as f32) * AC_ROW_H,
                 width: plate.width - 4.0,
                 height: AC_ROW_H,
             })
@@ -1032,28 +1053,30 @@ impl BrowserApp {
         let menu = self.bm_menu.as_ref()?;
         let bar = self.bar();
         let btn = bm_btn_rect(&bar, self.settings.bar_position);
-        let width = BM_W.min(self.win.0 - 2.0 * BAR_MARGIN).max(160.0);
+        let width = BM_W.min(self.win.0 - 2.0 * bar_margin()).max(160.0);
         let x = (btn.x + btn.width - width)
-            .clamp(BAR_MARGIN, (self.win.0 - BAR_MARGIN - width).max(BAR_MARGIN));
+            .clamp(bar_margin(), (self.win.0 - bar_margin() - width).max(bar_margin()));
         // The furniture the list is fitted around: toggle row, two rules and
         // the manage row.
-        let fixed = 2.0 * BM_PAD + 2.0 * BM_ROW_H + 2.0 * BM_SEP_H;
+        let fixed = 2.0 * plate_pad() + 2.0 * BM_ROW_H + 2.0 * BM_SEP_H;
         let avail = match self.settings.bar_position {
-            settings::BarPosition::Top => self.win.1 - (bar.y + bar.height + BM_GAP) - BAR_MARGIN,
-            settings::BarPosition::Bottom => bar.y - BM_GAP - BAR_MARGIN,
+            settings::BarPosition::Top => self.win.1 - (bar.y + bar.height + item_gap()) - bar_margin(),
+            settings::BarPosition::Bottom => bar.y - item_gap() - bar_margin(),
         };
         let cap = (((avail - fixed) / BM_ROW_H).floor().max(1.0)) as usize;
         // An empty list still shows its one "nothing here" row.
         let shown = menu.items.len().clamp(1, cap);
         let height = fixed + shown as f32 * BM_ROW_H;
         let y = match self.settings.bar_position {
-            settings::BarPosition::Top => bar.y + bar.height + BM_GAP,
-            settings::BarPosition::Bottom => bar.y - BM_GAP - height,
+            settings::BarPosition::Top => bar.y + bar.height + item_gap(),
+            settings::BarPosition::Bottom => bar.y - item_gap() - height,
         };
         let plate = Rect { x, y, width, height };
+        // style: deliberate — the 2px hairline keeps a row's highlight off
+        // the plate's roll.
         let row = |dy: f32| Rect {
             x: x + 2.0,
-            y: y + BM_PAD + dy,
+            y: y + plate_pad() + dy,
             width: width - 4.0,
             height: BM_ROW_H,
         };
@@ -1362,10 +1385,10 @@ impl BrowserApp {
         ));
         items.push(item("Open in Other Browser", CtxAction::OpenExternal, true));
 
-        let h = CTX_PAD * 2.0 + items.len() as f32 * CTX_ROW_H;
+        let h = plate_pad() * 2.0 + items.len() as f32 * CTX_ROW_H;
         let pos = (
-            self.pointer.0.min(self.win.0 - CTX_W - 4.0).max(0.0),
-            self.pointer.1.min(self.win.1 - h - 4.0).max(0.0),
+            self.pointer.0.min(self.win.0 - CTX_W - bar_margin()).max(0.0),
+            self.pointer.1.min(self.win.1 - h - bar_margin()).max(0.0),
         );
         self.ctx_menu = Some(CtxMenu { items, pos });
     }
@@ -1626,15 +1649,15 @@ impl BrowserApp {
 
         pc.text(
             m.title.clone(),
-            r.x + MODAL_PAD,
-            r.y + MODAL_PAD,
+            r.x + plate_pad(),
+            r.y + plate_pad(),
             14.0,
             TEXT,
         );
         pc.text(
-            Self::fit_text(&m.message, sans, 13.0, r.width - MODAL_PAD * 2.0),
-            r.x + MODAL_PAD,
-            r.y + MODAL_PAD + 22.0,
+            Self::fit_text(&m.message, sans, 13.0, r.width - plate_pad() * 2.0),
+            r.x + plate_pad(),
+            r.y + plate_pad() + 22.0,
             13.0,
             TEXT_DIM,
         );
@@ -1654,9 +1677,9 @@ impl BrowserApp {
             // reaches the paint list.
             let shown = edit.display();
             if shown.is_empty() && !label.is_empty() {
-                pc.text(*label, f.x + URL_PAD_X, ty, URL_FONT, TEXT_DIM);
+                pc.text(*label, f.x + text_pad(), ty, URL_FONT, TEXT_DIM);
             } else {
-                pc.text(shown, f.x + URL_PAD_X, ty, URL_FONT, TEXT);
+                pc.text(shown, f.x + text_pad(), ty, URL_FONT, TEXT);
             }
         }
 
@@ -1704,7 +1727,7 @@ impl BrowserApp {
             if picked {
                 pc.rounded_rect(*r, 5.0, (true, true, true, true), TAB_ACTIVE_BG);
             }
-            let width = r.width - 2.0 * BM_TEXT_PAD;
+            let width = r.width - 2.0 * text_pad();
             let user = if account.username.is_empty() {
                 account.label.clone()
             } else {
@@ -1712,7 +1735,7 @@ impl BrowserApp {
             };
             pc.text(
                 Self::fit_text(&user, sans, AC_FONT, width),
-                r.x + BM_TEXT_PAD,
+                r.x + text_pad(),
                 r.y + 5.0,
                 AC_FONT,
                 TEXT,
@@ -1727,7 +1750,7 @@ impl BrowserApp {
             }
             pc.text(
                 Self::fit_text(&sub, sans, AC_SUB_FONT, width),
-                r.x + BM_TEXT_PAD,
+                r.x + text_pad(),
                 r.y + 5.0 + AC_FONT + 3.0,
                 AC_SUB_FONT,
                 TEXT_DIM,
@@ -1739,7 +1762,7 @@ impl BrowserApp {
         if menu.insecure {
             pc.text(
                 "insecure page — this password would be sent unencrypted",
-                plate.x + BM_TEXT_PAD,
+                plate.x + text_pad(),
                 plate.y + plate.height - 15.0,
                 AC_SUB_FONT,
                 [212, 155, 155],
@@ -1766,7 +1789,7 @@ impl BrowserApp {
         let text_at = |pc: &mut PaintCtx, r: &Rect, s: String, color: [u8; 3]| {
             pc.text(
                 s,
-                r.x + BM_TEXT_PAD,
+                r.x + text_pad(),
                 cce_ui::layout::align_text_y(r.y, r.height, BM_FONT, 0.0),
                 BM_FONT,
                 color,
@@ -1787,7 +1810,7 @@ impl BrowserApp {
         text_at(
             pc,
             &l.toggle,
-            Self::fit_text(label, sans, BM_FONT, l.toggle.width - 2.0 * BM_TEXT_PAD),
+            Self::fit_text(label, sans, BM_FONT, l.toggle.width - 2.0 * text_pad()),
             if can_save { TEXT } else { TEXT_DIM },
         );
 
@@ -1805,7 +1828,7 @@ impl BrowserApp {
                     &item.label,
                     sans,
                     BM_FONT,
-                    r.width - 2.0 * BM_TEXT_PAD - BM_RM_W,
+                    r.width - 2.0 * text_pad() - BM_RM_W,
                 ),
                 // Full brightness whether hovered or not: dim means
                 // *unavailable* everywhere else in this chrome, and every
@@ -1857,9 +1880,9 @@ impl BrowserApp {
         for y in [l.toggle.y + BM_ROW_H + BM_SEP_H / 2.0, l.manage.y - BM_SEP_H / 2.0] {
             pc.quad(
                 Rect {
-                    x: l.plate.x + BM_TEXT_PAD,
+                    x: l.plate.x + text_pad(),
                     y,
-                    width: l.plate.width - 2.0 * BM_TEXT_PAD,
+                    width: l.plate.width - 2.0 * text_pad(),
                     height: 1.0,
                 },
                 RIM,
@@ -1898,8 +1921,8 @@ impl BrowserApp {
             }
             let color = if it.enabled { TEXT } else { TEXT_DIM };
             pc.text(
-                Self::fit_text(&it.label, sans, 13.0, row.width - 20.0),
-                row.x + 10.0,
+                Self::fit_text(&it.label, sans, 13.0, row.width - 2.0 * text_pad()),
+                row.x + text_pad(),
                 cce_ui::layout::align_text_y(row.y, row.height, 13.0, 0.0),
                 13.0,
                 color,
@@ -1908,7 +1931,7 @@ impl BrowserApp {
     }
 
     fn cursor_from_click(&mut self, click_x: f32, field: &Rect) -> usize {
-        let rel = click_x - field.x - URL_PAD_X;
+        let rel = click_x - field.x - text_pad();
         // Boundary x offsets from the same shaped buffer the bar draws (font=None,
         // matching `pc.text`), then the closest boundary to the click.
         let text = self.url.text.clone();
@@ -2841,18 +2864,19 @@ impl Application for BrowserApp {
         let bar = self.bar();
         let pos_edge = self.settings.bar_position;
 
+        // The standard root plate (cce-ui PlateSpec::window); the page is full-bleed content drawn on it.
+        pc.root_plate(w, size.height);
         // Page: full-bleed under the floating bar.
         let content = Rect { x: 0.0, y: 0.0, width: w, height: size.height };
-        pc.quad(content, PAGE_BG);
         if let Some((id, ..)) = self.host.image() {
             pc.image(id, content, 1.0);
         } else {
             // Just clear of the bar, whichever edge it is on.
             let y = match self.settings.bar_position {
-                settings::BarPosition::Top => bar.y + bar.height + 22.0,
-                settings::BarPosition::Bottom => BAR_MARGIN + 22.0,
+                settings::BarPosition::Top => bar.y + bar.height + item_gap(),
+                settings::BarPosition::Bottom => bar_margin(),
             };
-            pc.text("Loading...", BAR_MARGIN + 6.0, y, 13.0, TEXT_DIM);
+            pc.text("Loading...", bar_margin(), y, 13.0, TEXT_DIM);
         }
 
         // The bar plate — or the shape it is unfolding through. Nothing but
@@ -2903,12 +2927,12 @@ impl Application for BrowserApp {
                     .filter(|s| s != "about:blank")
                     .unwrap_or_else(|| "New Tab".to_string());
                 let close = tab_close_rect(&pill);
-                let text_avail = pill.width - 16.0 - close.map_or(0.0, |_| TAB_CLOSE_W - 4.0);
+                let text_avail = pill.width - 2.0 * text_pad() - close.map_or(0.0, |_| TAB_CLOSE_W - 4.0);
                 let label = Self::fit_text(&title, &sans, 12.0, text_avail);
                 let color = if is_active { TEXT } else { TEXT_DIM };
                 pc.text(
                     label,
-                    pill.x + 8.0,
+                    pill.x + text_pad(),
                     cce_ui::layout::align_text_y(pill.y, pill.height, 12.0, 0.0),
                     12.0,
                     color,
@@ -2953,10 +2977,10 @@ impl Application for BrowserApp {
                     if hovered { TAB_ACTIVE_BG } else { TAB_BG },
                 );
                 let label =
-                    Self::fit_text(&self.favs[i].label, &sans, FAV_FONT, r.width - 2.0 * FAV_PAD_X);
+                    Self::fit_text(&self.favs[i].label, &sans, FAV_FONT, r.width - 2.0 * text_pad());
                 pc.text(
                     label,
-                    r.x + FAV_PAD_X,
+                    r.x + text_pad(),
                     cce_ui::layout::align_text_y(r.y, r.height, FAV_FONT, 0.0),
                     FAV_FONT,
                     if hovered { TEXT } else { TEXT_DIM },
@@ -3024,11 +3048,13 @@ impl Application for BrowserApp {
                 .selection
                 .filter(|&(a, b)| a < b)
                 .map(|(a, b)| (self.x_offset(a), self.x_offset(b)));
+            // style: deliberate — the caret and selection stand 4px inside
+            // the field's rim: the glyph box's inset, not a gap.
             pc.clip(f, |pc| {
                 if let Some((x0, x1)) = sel_x {
                     pc.quad(
                         Rect {
-                            x: f.x + URL_PAD_X + x0,
+                            x: f.x + text_pad() + x0,
                             y: f.y + 4.0,
                             width: x1 - x0,
                             height: f.height - 8.0,
@@ -3036,10 +3062,10 @@ impl Application for BrowserApp {
                         SEL_BG,
                     );
                 }
-                pc.text(self.url.text.clone(), f.x + URL_PAD_X, ty, URL_FONT, TEXT);
+                pc.text(self.url.text.clone(), f.x + text_pad(), ty, URL_FONT, TEXT);
                 if let Some(offset) = caret_x {
                     pc.quad(
-                        Rect { x: f.x + URL_PAD_X + offset, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
+                        Rect { x: f.x + text_pad() + offset, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
                         [0.85, 0.87, 0.92, 1.0],
                     );
                 }
