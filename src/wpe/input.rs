@@ -32,7 +32,18 @@ mod keysym {
     pub const PAGE_DOWN: u32 = 0xff56;
     pub const END: u32 = 0xff57;
     pub const DELETE: u32 = 0xffff;
+    pub const F1: u32 = 0xffbe;
+    pub const F2: u32 = 0xffbf;
+    pub const F3: u32 = 0xffc0;
+    pub const F4: u32 = 0xffc1;
     pub const F5: u32 = 0xffc2;
+    pub const F6: u32 = 0xffc3;
+    pub const F7: u32 = 0xffc4;
+    pub const F8: u32 = 0xffc5;
+    pub const F9: u32 = 0xffc6;
+    pub const F10: u32 = 0xffc7;
+    pub const F11: u32 = 0xffc8;
+    pub const F12: u32 = 0xffc9;
     pub const SHIFT_L: u32 = 0xffe1;
     pub const CONTROL_L: u32 = 0xffe3;
     pub const ALT_L: u32 = 0xffe9;
@@ -71,7 +82,18 @@ pub(super) fn keyval(key: &Key) -> Option<u32> {
             NamedKey::Shift => keysym::SHIFT_L,
             NamedKey::Alt => keysym::ALT_L,
             NamedKey::Super => keysym::SUPER_L,
+            NamedKey::F1 => keysym::F1,
+            NamedKey::F2 => keysym::F2,
+            NamedKey::F3 => keysym::F3,
+            NamedKey::F4 => keysym::F4,
             NamedKey::F5 => keysym::F5,
+            NamedKey::F6 => keysym::F6,
+            NamedKey::F7 => keysym::F7,
+            NamedKey::F8 => keysym::F8,
+            NamedKey::F9 => keysym::F9,
+            NamedKey::F10 => keysym::F10,
+            NamedKey::F11 => keysym::F11,
+            NamedKey::F12 => keysym::F12,
         },
     })
 }
