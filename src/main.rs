@@ -2022,6 +2022,20 @@ impl BrowserApp {
             TEXT_DIM,
         );
 
+        // The focused field's caret and selection, measured on what it draws
+        // (bullets for a password) before the fields are borrowed to paint.
+        let focus_marks = m.fields.get(m.focused).map(|(_, edit)| {
+            let shown = edit.display();
+            let sel = edit.selection.filter(|&(a, b)| a < b);
+            (m.focused, shown, edit.display_index(edit.cursor), sel.map(|(a, b)| (edit.display_index(a), edit.display_index(b))))
+        });
+        let focus_marks = focus_marks.map(|(i, shown, caret, sel)| {
+            let caret_x = self.x_of_boundary(&shown, caret);
+            let sel_x = sel.map(|(a, b)| (self.x_of_boundary(&shown, a), self.x_of_boundary(&shown, b)));
+            (i, caret_x, sel_x)
+        });
+        let Some(m) = self.modal.as_ref() else { return };
+
         for (i, (label, edit)) in m.fields.iter().enumerate() {
             let f = m.field_rect(&r, i);
             let focused = i == m.focused;
@@ -2036,11 +2050,28 @@ impl BrowserApp {
             // `display()` masks a password field; the text itself never
             // reaches the paint list.
             let shown = edit.display();
-            if shown.is_empty() && !label.is_empty() {
-                pc.text(*label, f.x + text_pad(), ty, URL_FONT, TEXT_DIM);
-            } else {
-                pc.text(shown, f.x + text_pad(), ty, URL_FONT, TEXT);
-            }
+            let marks = focus_marks.filter(|&(fi, ..)| fi == i);
+            // style: deliberate — caret and selection 4px inside the rim, as
+            // the URL bar draws them.
+            pc.clip(f, |pc| {
+                if let Some((_, _, Some((x0, x1)))) = marks {
+                    pc.quad(
+                        Rect { x: f.x + text_pad() + x0, y: f.y + 4.0, width: x1 - x0, height: f.height - 8.0 },
+                        SEL_BG,
+                    );
+                }
+                if shown.is_empty() && !label.is_empty() {
+                    pc.text(*label, f.x + text_pad(), ty, URL_FONT, TEXT_DIM);
+                } else {
+                    pc.text(shown, f.x + text_pad(), ty, URL_FONT, TEXT);
+                }
+                if let Some((_, caret_x, _)) = marks {
+                    pc.quad(
+                        Rect { x: f.x + text_pad() + caret_x, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
+                        [0.85, 0.87, 0.92, 1.0],
+                    );
+                }
+            });
         }
 
         let (ok, cancel) = m.button_rects(&r);
@@ -2353,31 +2384,53 @@ impl BrowserApp {
     }
 
     fn cursor_from_click(&mut self, click_x: f32, field: &Rect) -> usize {
-        let rel = click_x - field.x - text_pad();
-        // Boundary x offsets from the same shaped buffer the bar draws (font=None,
-        // matching `pc.text`), then the closest boundary to the click.
         let text = self.url.text.clone();
+        self.boundary_at_x(&text, click_x - field.x - text_pad())
+    }
+
+    /// X offset (text-origin relative) of a byte index in the URL.
+    fn x_offset(&mut self, byte: usize) -> f32 {
+        let text = self.url.text.clone();
+        self.x_of_boundary(&text, byte)
+    }
+
+    /// The char boundary of `text` nearest `rel_x` (text-origin relative),
+    /// off the same shaped run a field draws (`URL_FONT`, font=None,
+    /// matching `pc.text`). The URL bar and the dialog fields both read it,
+    /// so a click lands where the glyphs are.
+    fn boundary_at_x(&mut self, text: &str, rel_x: f32) -> usize {
         let offsets =
-            cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, &text, URL_FONT, None);
+            cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, text, URL_FONT, None);
         offsets
             .iter()
-            .min_by(|a, b| (a.1 - rel).abs().total_cmp(&(b.1 - rel).abs()))
+            .min_by(|a, b| (a.1 - rel_x).abs().total_cmp(&(b.1 - rel_x).abs()))
             .map(|&(b, _)| b)
             .unwrap_or(text.len())
     }
 
-    /// X offset (text-origin relative) of a byte index, off the same shaped
-    /// buffer as `cursor_from_click`.
-    fn x_offset(&mut self, byte: usize) -> f32 {
-        let text = self.url.text.clone();
+    /// X offset (text-origin relative) of byte `byte` of `text`, off the same
+    /// shaped run as `boundary_at_x`.
+    fn x_of_boundary(&mut self, text: &str, byte: usize) -> f32 {
         let offsets =
-            cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, &text, URL_FONT, None);
+            cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, text, URL_FONT, None);
         offsets
             .iter()
             .rev()
             .find(|&&(b, _)| b <= byte)
             .map(|&(_, x)| x)
             .unwrap_or(0.0)
+    }
+
+    /// The byte of dialog field `i`'s text under pointer x `x`. The field
+    /// draws `display()` — bullets, for a password — so the hit lands in
+    /// that and `text_index` carries it back to the text.
+    #[cfg(feature = "wpe")]
+    fn modal_index_at(&mut self, i: usize, x: f32) -> Option<usize> {
+        let m = self.modal.as_ref()?;
+        let f = m.field_rect(&m.rect(self.win), i);
+        let shown = m.fields.get(i)?.1.display();
+        let at = self.boundary_at_x(&shown, x - f.x - text_pad());
+        Some(self.modal.as_ref()?.fields[i].1.text_index(at))
     }
 
     /// Caret x offset for the current byte cursor.
@@ -2751,6 +2804,12 @@ impl Application for BrowserApp {
                 self.url.release();
                 self.url_entry_press = false;
             }
+            #[cfg(feature = "wpe")]
+            if let Some(m) = self.modal.as_mut() {
+                for (_, edit) in m.fields.iter_mut() {
+                    edit.release();
+                }
+            }
         }
         // A settings change can move the bar to the other edge, so a reload
         // that changed anything has to redraw the chrome.
@@ -2788,6 +2847,21 @@ impl Application for BrowserApp {
         // A drag that began in the URL field owns the pointer until the
         // release, wherever it goes: past either end of the field it selects
         // to that end, and the page never sees the motion.
+        #[cfg(feature = "wpe")]
+        if let Some(i) = self
+            .modal
+            .as_ref()
+            .and_then(|m| m.fields.iter().position(|(_, e)| e.dragging()))
+        {
+            if let Some(at) = self.modal_index_at(i, pos.x) {
+                if let Some(m) = self.modal.as_mut() {
+                    if m.fields[i].1.drag_to(at) {
+                        *_needs_rebuild = true;
+                    }
+                }
+            }
+            return;
+        }
         if self.url.dragging() {
             let field = url_rect(&self.bar(), self.settings.bar_position);
             let at = self.cursor_from_click(pos.x, &field);
@@ -2883,6 +2957,15 @@ impl Application for BrowserApp {
 
         #[cfg(feature = "wpe")]
         if self.modal.is_some() {
+            // The end of a drag in a dialog field, wherever the pointer is.
+            if !pressed && button == MouseButton::Left {
+                if let Some(m) = self.modal.as_mut() {
+                    for (_, edit) in m.fields.iter_mut() {
+                        edit.release();
+                    }
+                }
+                return None;
+            }
             if !pressed || button != MouseButton::Left {
                 return None;
             }
@@ -2901,8 +2984,16 @@ impl Application for BrowserApp {
                 self.close_modal(true);
             } else if hit_cancel {
                 self.close_modal(false);
-            } else if let (Some(i), Some(m)) = (field, self.modal.as_mut()) {
-                m.focused = i;
+            } else if let Some(i) = field {
+                // A press places the caret and starts a drag; Shift extends
+                // the selection — in the field that already had focus.
+                let at = self.modal_index_at(i, pos.x);
+                let shift = self.shift_held;
+                if let (Some(at), Some(m)) = (at, self.modal.as_mut()) {
+                    let extend = shift && m.focused == i;
+                    m.focused = i;
+                    m.fields[i].1.press(at, extend);
+                }
             }
             // Anything else is swallowed: the page must not receive clicks
             // while it is blocked waiting on this.
