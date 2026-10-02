@@ -19,7 +19,7 @@ wpe = ["dep:rustix"]
 servo = ["dep:servo", "dep:dpi", "dep:euclid", "dep:rustls", "dep:http"]
 
 [dependencies]
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "b28d1e46f3657fe1fa81fe221203382061bf5c70" }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "c6b8b454f3504a5aa56896b6d5907be7cc5dfb6e" }
 calloop = "0.13.0"
 wayland-client = { version = "0.31", features = ["system"] }
 servo = { version = "0.4", optional = true }
