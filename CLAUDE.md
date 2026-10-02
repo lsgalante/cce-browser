@@ -620,7 +620,7 @@ must never carry an index across a lock boundary.
 in `handle_focus_change` — so edits made in **cce-system-interface's Browser page**
 (`../cce-system-interface/src/pages/browser.rs`, which owns the writing side) apply on
 the next switch back. Keep the key names in `settings.rs` and that page in sync;
-`external-browser` and `raindrop` are currently read here with no UI writing them.
+`external-browser` is currently read here with no UI writing it.
 
 Servo persists per-profile state (cookie jar, auth cache, HSTS) only when given a
 `config_dir` — without one every launch starts logged out of every site. It lives at

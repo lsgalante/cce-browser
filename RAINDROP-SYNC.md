@@ -109,8 +109,9 @@ the single-instance hand-off, so it works while the browser is open.
 `browser.raindrop` (KDL, `browser { raindrop (bool)true }`, off by default) is
 read at launch and on every focus like the other settings; the worker thread
 `cce-raindrop` starts the first time it is on and idles while it is off. Its
-writing side belongs to cce-system-interface's Browser page and does not exist
-yet — like `external-browser`, it is edited by hand for now. Choices:
+writing side is the "Sync Bookmarks with Raindrop" toggle on
+cce-system-interface's Browser page (`src/pages/browser.rs` there) — keep the
+key name in step with `settings.rs`. Choices:
 
 - **It polls the bookmarks every 2 s instead of being told about edits.** A
   bookmark changes from the star, Ctrl+D, the bookmarks menu and the
