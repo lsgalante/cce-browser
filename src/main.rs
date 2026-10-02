@@ -554,6 +554,14 @@ struct BrowserApp {
     /// one the dialog fields use.
     url: cce_ui::widget::LineEdit,
     url_focused: bool,
+    /// The press that is dragging in the URL field is the one that entered
+    /// it. Entering selects the whole URL — unless the press is dragged, in
+    /// which case it selects what the drag covers; so the select-all waits
+    /// for a release that no motion came before.
+    url_entry_press: bool,
+    /// Shift, from its own key events (pointer events carry no modifiers):
+    /// what makes a press in the URL field a shift+click.
+    shift_held: bool,
     /// The circle menu: the DE's corner control toggles the utility bar,
     /// which unfolds from under it. `chrome_t` is the unfold progress
     /// (0 = closed, 1 = bar), animated in `tick` toward whichever state
@@ -2480,6 +2488,8 @@ impl Application for BrowserApp {
             page_buttons: Vec::new(),
             url: cce_ui::widget::LineEdit::with_text(url_text),
             url_focused: false,
+            url_entry_press: false,
+            shift_held: false,
             chrome_open: false,
             chrome_t: 0.0,
             dot_hover: false,
@@ -2733,6 +2743,15 @@ impl Application for BrowserApp {
     fn handle_focus_change(&mut self, focused: bool, needs_rebuild: &mut bool) {
         // The page's own focus: without it WebKit paints no text caret.
         self.host.focus(focused);
+        // Keys and buttons released while another window had focus never
+        // reach us; forget them rather than act on a stale Shift or drag.
+        if !focused {
+            self.shift_held = false;
+            if self.url.dragging() {
+                self.url.release();
+                self.url_entry_press = false;
+            }
+        }
         // A settings change can move the bar to the other edge, so a reload
         // that changed anything has to redraw the chrome.
         if focused && self.reload_settings() {
@@ -2766,6 +2785,19 @@ impl Application for BrowserApp {
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, _needs_rebuild: &mut bool) {
         self.pointer = (pos.x, pos.y);
+        // A drag that began in the URL field owns the pointer until the
+        // release, wherever it goes: past either end of the field it selects
+        // to that end, and the page never sees the motion.
+        if self.url.dragging() {
+            let field = url_rect(&self.bar(), self.settings.bar_position);
+            let at = self.cursor_from_click(pos.x, &field);
+            if self.url.drag_to(at) {
+                // Moved: the press is a drag, not the click that selects all.
+                self.url_entry_press = false;
+                *_needs_rebuild = true;
+            }
+            return;
+        }
         #[cfg(feature = "wpe")]
         if self.ctx_menu.is_some() {
             // Hover highlight tracks the pointer; the page underneath does
@@ -2837,6 +2869,16 @@ impl Application for BrowserApp {
         // engine goes on believing it is still down.
         if !pressed {
             self.drain_page_release(button, pos);
+        }
+
+        // The end of a drag in the URL field, wherever the pointer is now.
+        if !pressed && button == MouseButton::Left && self.url.dragging() {
+            self.url.release();
+            if std::mem::take(&mut self.url_entry_press) {
+                self.select_all_url();
+            }
+            *needs_rebuild = true;
+            return None;
         }
 
         #[cfg(feature = "wpe")]
@@ -3005,15 +3047,16 @@ impl Application for BrowserApp {
             } else {
                 let field = url_rect(&bar, pos_edge);
                 if field.contains(pos.x, pos.y) {
-                    if self.url_focused {
-                        self.url.cursor = self.cursor_from_click(pos.x, &field);
-                        self.url.selection = None;
-                    } else {
-                        // Entering the bar selects the whole URL, so typing
-                        // replaces it instead of appending to it.
-                        self.url_focused = true;
-                        self.select_all_url();
-                    }
+                    let at = self.cursor_from_click(pos.x, &field);
+                    // Entering the bar selects the whole URL, so typing
+                    // replaces it instead of appending to it — on the
+                    // release, if this press is not dragged (see
+                    // `url_entry_press`). Inside the bar a press places the
+                    // caret, Shift extends to it, and a drag selects.
+                    self.url_entry_press = !self.url_focused;
+                    let extend = self.url_focused && self.shift_held;
+                    self.url_focused = true;
+                    self.url.press(at, extend);
                 } else {
                     self.url_focused = false;
                     self.url.selection = None;
@@ -3108,6 +3151,10 @@ impl Application for BrowserApp {
     }
 
     fn handle_key_input(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Self::Message> {
+        // Noted, never consumed: Shift still goes wherever keys go.
+        if matches!(event.logical_key, Key::Named(NamedKey::Shift)) {
+            self.shift_held = event.state == ElementState::Pressed;
+        }
         #[cfg(feature = "wpe")]
         if self.ctx_menu.is_some() && event.state == ElementState::Pressed {
             // Any key dismisses; Escape is just the one people will mean.
