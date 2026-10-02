@@ -13,6 +13,7 @@ mod downloads;
 mod instance;
 mod lineedit;
 mod pages;
+mod raindrop;
 mod session;
 mod settings;
 /// The retired Servo backend; compiled only under `--features servo`.
