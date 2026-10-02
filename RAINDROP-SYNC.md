@@ -150,6 +150,15 @@ key name in step with `settings.rs`. Choices:
   reloading its URL forces nothing.
 - The page is static: the line is as of the page's load, and reloading
   `cce://bookmarks/sync` asks for another (harmless) pass.
+- **Every change is logged by name** in `raindrop-sync.log` beside the base:
+  `time \t what \t link \t title`, one line per bookmark added, removed or
+  renamed on either side, plus refusals, forced passes and failures. Local
+  lines are the difference the edit actually made and Raindrop lines the
+  calls that succeeded, so the log says what happened, not what was planned.
+  Passes that change nothing write nothing; past 512 KB it keeps its newer
+  half. Added after the first day's fetch bug, when "which two bookmarks came
+  back?" had no answer — the status line only counts, and the process log was
+  gone with the restart.
 
 **Testing without an account:** `CCE_RAINDROP_API=<base url>` points the
 client at a stand-in (it logs a warning when it does). The end-to-end run used

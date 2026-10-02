@@ -261,6 +261,24 @@ pub fn iso8601_secs(s: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + h * 3600 + mi * 60 + se).ok()
 }
 
+/// Seconds since the epoch → `2026-10-02T16:04:05Z`; the inverse of
+/// [`iso8601_secs`], for the sync log.
+pub fn iso8601(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Civil date from days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
+
 /// What applying a plan's remote half did — the input to `Plan::base_after`,
 /// which keeps the base honest about anything that failed.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -535,6 +553,15 @@ pub(super) mod tests {
     fn titles_are_flattened_where_they_arrive() {
         let r = parse_item(&serde_json::json!({"_id": 1, "link": "https://a.test/", "title": "two\nlines\tand tab"})).unwrap();
         assert_eq!(r.title, "two lines and tab");
+    }
+
+    #[test]
+    fn timestamps_format_and_round_trip() {
+        assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601(951_868_800), "2000-03-01T00:00:00Z");
+        for secs in [1_790_957_045, 1_709_164_800, 4_102_444_799] {
+            assert_eq!(iso8601_secs(&iso8601(secs)), Some(secs));
+        }
     }
 
     #[test]
