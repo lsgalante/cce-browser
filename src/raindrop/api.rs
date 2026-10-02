@@ -25,6 +25,9 @@ pub const UNSORTED: i64 = -1;
 const PER_PAGE: usize = 50;
 /// A fetch that runs past this many pages is not a bookmark collection.
 const MAX_PAGES: usize = 400;
+/// The orders a collection is read in until every bookmark has been seen —
+/// different sorts break ties differently, so their union fills the gaps.
+const SORTS: [&str; 6] = ["created", "-created", "title", "-title", "domain", "-domain"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiError {
@@ -32,9 +35,10 @@ pub enum ApiError {
     Unauthorized,
     /// Still 429 after waiting once.
     RateLimited,
-    /// The collection changed while it was being paged through, so the list
-    /// may be missing an item — and a missing item reads as a deletion.
-    Changed { fetched: usize, count: usize },
+    /// Every read left bookmarks unseen (or the collection changed between
+    /// reads), so the list may be missing one — and a missing bookmark reads
+    /// as a deletion. Nothing is planned from it.
+    Incomplete { distinct: usize, count: usize },
     Http(u16, String),
     Network(String),
     Parse(String),
@@ -45,10 +49,10 @@ impl std::fmt::Display for ApiError {
         match self {
             ApiError::Unauthorized => write!(f, "Raindrop refused the token"),
             ApiError::RateLimited => write!(f, "Raindrop's rate limit; try again in a minute"),
-            ApiError::Changed { fetched, count } => write!(
+            ApiError::Incomplete { distinct, count } => write!(
                 f,
-                "the collection changed while it was read ({fetched} fetched, {count} reported); \
-                 try again"
+                "could not read the whole collection ({distinct} of {count} bookmarks seen); \
+                 nothing was changed, trying again next pass"
             ),
             ApiError::Http(code, body) => write!(f, "Raindrop answered {code}: {body}"),
             ApiError::Network(e) => write!(f, "could not reach Raindrop: {e}"),
@@ -131,24 +135,52 @@ impl Client {
         Err(ApiError::RateLimited)
     }
 
-    /// Every bookmark in `collection`, oldest first.
+    /// Every bookmark in `collection`, each exactly once.
     ///
-    /// Sorted by creation time ascending, so a bookmark added mid-fetch lands
-    /// on the last page instead of shifting the others. A deletion still
-    /// shifts them, which is why the total is checked against the `count`
-    /// Raindrop reports and the whole fetch refused on a mismatch.
+    /// Raindrop pages by position within a sort, and **ties do not keep their
+    /// order from one page request to the next**: bookmarks saved in one batch
+    /// share a creation time to the millisecond, and a fetch of a real
+    /// 178-bookmark collection returned 7 of them twice and 7 others never,
+    /// with the row total still matching `count`. A bookmark missing from a
+    /// fetch reads as "deleted in Raindrop" to the merge, so a short list is
+    /// never handed on: rows are kept by id, the number of *distinct* ids must
+    /// equal `count`, and until it does the collection is read again under
+    /// another sort — each orders the ties differently — and the reads
+    /// combined. A deletion between reads makes the union overshoot `count`,
+    /// and that is refused too.
     pub fn fetch(&self, collection: i64) -> Result<Vec<Remote>, ApiError> {
+        let mut seen: Vec<Remote> = Vec::new();
+        let mut ids = std::collections::HashSet::new();
+        let mut reported = 0;
+        for sort in SORTS {
+            let (rows, count) = self.fetch_once(collection, sort)?;
+            reported = count;
+            for r in rows {
+                if ids.insert(r.id) {
+                    seen.push(r);
+                }
+            }
+            if seen.len() == count {
+                return Ok(seen);
+            }
+            if seen.len() > count {
+                break;
+            }
+        }
+        Err(ApiError::Incomplete { distinct: seen.len(), count: reported })
+    }
+
+    /// One read of every page under one sort: the rows, and Raindrop's count.
+    fn fetch_once(&self, collection: i64, sort: &str) -> Result<(Vec<Remote>, usize), ApiError> {
         let mut out = Vec::new();
-        let mut reported = None;
+        let mut count = None;
         for page in 0..MAX_PAGES {
             let v = self.call(
                 reqwest::Method::GET,
-                &format!("/raindrops/{collection}?perpage={PER_PAGE}&page={page}&sort=created"),
+                &format!("/raindrops/{collection}?perpage={PER_PAGE}&page={page}&sort={sort}"),
                 None,
             )?;
-            if let Some(c) = v["count"].as_u64() {
-                reported = Some(c as usize);
-            }
+            count = v["count"].as_u64().map(|c| c as usize).or(count);
             let items = v["items"].as_array().ok_or_else(|| ApiError::Parse("no items".into()))?;
             for item in items {
                 out.push(parse_item(item)?);
@@ -157,12 +189,10 @@ impl Client {
                 break;
             }
         }
-        if let Some(count) = reported {
-            if count != out.len() {
-                return Err(ApiError::Changed { fetched: out.len(), count });
-            }
-        }
-        Ok(out)
+        // Without a count there is nothing to check a read against, and an
+        // unchecked read is exactly what this exists to prevent.
+        let count = count.ok_or_else(|| ApiError::Parse("no count in the answer".into()))?;
+        Ok((out, count))
     }
 
     /// Create a bookmark; returns its new id. Link and title only — Raindrop
@@ -393,11 +423,52 @@ pub(super) mod tests {
         assert!(seen[0].0.ends_with("authorization: Bearer tok-123") || seen[0].0.ends_with("Authorization: Bearer tok-123"));
     }
 
+    /// `items` with chosen ids, for pages that repeat or drop some.
+    fn rows(ids: &[u64], count: usize) -> String {
+        let items: Vec<_> = ids
+            .iter()
+            .map(|i| serde_json::json!({
+                "_id": i, "link": format!("https://{i}.test/"), "title": format!("t{i}"),
+                "created": "2026-03-19T16:58:01.830Z",
+            }))
+            .collect();
+        serde_json::json!({ "result": true, "items": items, "count": count }).to_string()
+    }
+
     #[test]
-    fn a_collection_that_shifts_mid_fetch_is_refused() {
-        // A deletion between pages: 50 + 2 fetched, but 53 reported.
-        let (base, _) = server(vec![(200, "", items(1..51, 53)), (200, "", items(52..54, 53))]);
-        assert_eq!(client(&base).fetch(UNSORTED), Err(ApiError::Changed { fetched: 52, count: 53 }));
+    fn tied_rows_that_repeat_and_vanish_are_read_again() {
+        // What Raindrop did: 52 bookmarks, page 1 repeats 50 and never shows 51.
+        let first: Vec<u64> = (1..=50).collect();
+        let (base, seen) = server(vec![
+            (200, "", rows(&first, 52)),
+            (200, "", rows(&[50, 52], 52)),
+            // The second read, newest first, has the tie the other way round.
+            (200, "", rows(&(3..=52).rev().collect::<Vec<_>>(), 52)),
+            (200, "", rows(&[2, 1], 52)),
+        ]);
+        let all = client(&base).fetch(UNSORTED).unwrap();
+        let mut ids: Vec<_> = all.iter().map(|r| r.id).collect();
+        ids.sort();
+        assert_eq!(ids, (1..=52).collect::<Vec<_>>(), "every bookmark, each once");
+        let seen = seen.lock().unwrap();
+        assert!(seen[2].0.contains("sort=-created"), "read again under another sort");
+    }
+
+    #[test]
+    fn a_collection_never_read_whole_is_refused() {
+        // Every read misses id 51.
+        let script: Vec<_> = (0..6)
+            .flat_map(|_| [(200, "", rows(&(1..=50).collect::<Vec<_>>(), 52)), (200, "", rows(&[50, 52], 52))])
+            .collect();
+        let (base, _) = server(script);
+        assert_eq!(client(&base).fetch(UNSORTED), Err(ApiError::Incomplete { distinct: 51, count: 52 }));
+    }
+
+    #[test]
+    fn a_deletion_between_reads_is_refused() {
+        // First read misses 3 of 3; meanwhile one is deleted: the union overshoots.
+        let (base, _) = server(vec![(200, "", rows(&[1, 1], 3)), (200, "", rows(&[2, 3], 2))]);
+        assert_eq!(client(&base).fetch(UNSORTED), Err(ApiError::Incomplete { distinct: 3, count: 2 }));
     }
 
     #[test]

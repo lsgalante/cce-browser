@@ -76,10 +76,19 @@ time; `POST /raindrop` creates; `PUT /raindrop/{id}` is a **partial** update;
 already in Trash, so only ids just fetched from the live collection are ever
 trashed. Choices:
 
-- **The fetch is checked against Raindrop's `count`.** Paging is by position,
-  so a deletion between pages shifts an item past the fetch, and a missing
-  item reads as "deleted in Raindrop". Sorted oldest-first, an *addition*
-  lands on the last page; a mismatch refuses the whole pass.
+- **A fetch must see every bookmark exactly once, or nothing is planned.**
+  Paging is by position within a sort, and **ties do not hold their order
+  between page requests**: bookmarks saved in one batch share a creation time
+  to the millisecond, and on the real 178-bookmark collection one read
+  returned 7 of them twice and 7 others never — with the *row* total still
+  equal to `count`, which is what the first version checked, so 5 bookmarks
+  were silently never imported (and a later pass could have read a missing
+  one as "deleted in Raindrop"). Found 2026-10-02, a day in. Now rows are kept
+  by id, the *distinct* count must equal `count`, and until it does the
+  collection is read again under another sort (`created`, `-created`,
+  `title`, …), each ordering the ties differently, and the reads combined.
+  A union that overshoots `count` means a deletion between reads, and is
+  refused like a read that never completes.
 - **A failure on one item does not stop the rest**, and `base_after` records
   what *happened*: a failed create stays out of the base (retried as new), a
   failed trash keeps its pair (retried, not re-imported), a failed rename keeps
