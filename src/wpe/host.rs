@@ -388,6 +388,34 @@ impl WebKitHost {
                 Some(drop_prompts_ref),
                 0,
             );
+
+            // The fill asks: a channel with a reply, so a credential goes back
+            // to exactly the frame that asked. Same world, same guarantee —
+            // page script cannot ask on it.
+            let name = cstr(formwatch::FILL_CHANNEL);
+            if webkit_user_content_manager_register_script_message_handler_with_reply(
+                self.ucm,
+                name.as_ptr(),
+                world.as_ptr(),
+            ) == 0
+            {
+                log::warn!("could not register the account fill channel");
+                return;
+            }
+            let signal = cstr(&format!(
+                "script-message-with-reply-received::{}",
+                formwatch::FILL_CHANNEL
+            ));
+            g_signal_connect_data(
+                self.ucm as *mut _,
+                signal.as_ptr(),
+                Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(
+                    on_fill_ask as *const () as usize,
+                )),
+                Rc::into_raw(self.prompts.clone()) as gpointer,
+                Some(drop_prompts_ref),
+                0,
+            );
         }
     }
 
@@ -401,11 +429,12 @@ impl WebKitHost {
                 (true, None) => {
                     let source = cstr(formwatch::WATCH_JS);
                     let world = cstr(formwatch::WORLD);
-                    // Top frame only, and at document start so the listeners
-                    // are in place before a login page's own script runs.
+                    // Every frame — sign-in forms are often a frame of their
+                    // own — and at document start, so the listeners are in
+                    // place before a login page's own script runs.
                     let script = webkit_user_script_new_for_world(
                         source.as_ptr(),
-                        WebKitUserContentInjectedFrames::WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                        WebKitUserContentInjectedFrames::WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
                         WebKitUserScriptInjectionTime::WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
                         world.as_ptr(),
                         std::ptr::null(),
@@ -417,34 +446,13 @@ impl WebKitHost {
                 (false, Some(script)) => {
                     webkit_user_content_manager_remove_script(self.ucm, script);
                     webkit_user_script_unref(script);
+                    self.drop_fill_asks();
                 }
                 // Already in the asked-for state; `take` above is why the
                 // enabled case has to put its handle back.
                 (true, Some(script)) => self.watcher = Some(script),
                 (false, None) => {}
             }
-        }
-    }
-
-    /// Nudge the watcher into re-reporting the focused login field, for when
-    /// the chrome has something to offer that it did not have a moment ago.
-    pub fn request_form_state(&self) {
-        if self.watcher.is_none() {
-            return;
-        }
-        unsafe {
-            let source = cstr(super::formwatch::RESCAN_JS);
-            let world = cstr(super::formwatch::WORLD);
-            webkit_web_view_evaluate_javascript(
-                self.active_tab().webview,
-                source.as_ptr(),
-                -1,
-                world.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                None,
-                std::ptr::null_mut(),
-            );
         }
     }
 
@@ -459,29 +467,32 @@ impl WebKitHost {
         self.prompts.borrow_mut().form_events.clear();
     }
 
-    /// Put a picked account into the page's login fields.
+    /// Put a picked account into the login fields of the document `frame`.
     ///
-    /// Runs in the watcher's world, where the elements it recorded live and
-    /// where the page cannot have replaced the setter being used. The script
-    /// carries the credential, so it is built here and dropped immediately;
-    /// it is never logged, and `source_uri` is left null so it cannot show up
-    /// named in a devtools listing either.
-    pub fn fill_credentials(&self, username: &str, password: &str) {
-        use super::formwatch;
-        let script = formwatch::fill_js(username, password);
-        unsafe {
-            let source = cstr(&script);
-            let world = cstr(formwatch::WORLD);
-            webkit_web_view_evaluate_javascript(
-                self.active_tab().webview,
-                source.as_ptr(),
-                -1,
-                world.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                None,
-                std::ptr::null_mut(),
-            );
+    /// Answers that document's fill ask with the credential, as data on the
+    /// reply — the watcher fills its own recorded fields. Returns false, and
+    /// sends nothing, when that document has no ask open: it navigated, a
+    /// newer ask displaced it, or the tab was switched away from.
+    pub fn fill_credentials(&self, frame: &str, username: &str, password: &str) -> bool {
+        let reply = {
+            let mut p = self.prompts.borrow_mut();
+            let Some(at) = p.fill_asks.iter().position(|(t, _)| t == frame) else {
+                return false;
+            };
+            p.fill_asks.remove(at).map(|(_, r)| r)
+        };
+        let Some(reply) = reply else { return false };
+        let answer = super::formwatch::fill_reply(username, password);
+        unsafe { answer_fill(reply, Some(&answer)) };
+        true
+    }
+
+    /// Answer every open fill ask with nothing. On a tab switch and on a
+    /// navigation: whatever field asked is no longer the one on screen.
+    pub fn drop_fill_asks(&self) {
+        let asks: Vec<_> = self.prompts.borrow_mut().fill_asks.drain(..).collect();
+        for (_, reply) in asks {
+            unsafe { answer_fill(reply, None) };
         }
     }
 
@@ -645,6 +656,11 @@ impl WebKitHost {
                 wpe_view_set_visible(old.view, 0);
             }
             self.active = index;
+            // Login fields reported by, and fill asks from, the tab going
+            // away: a list must not open over the next one, and a pick made
+            // there must have nowhere to land.
+            self.clear_form_events();
+            self.drop_fill_asks();
             let tab = &self.tabs[index];
             wpe_view_set_toplevel(tab.view, self.toplevel);
             wpe_view_set_visible(tab.view, 1);
@@ -1525,6 +1541,11 @@ pub(super) struct Prompts {
     /// not a slot: a blur followed by a focus is two different states, and
     /// collapsing them would leave the list open over the wrong field.
     form_events: std::collections::VecDeque<crate::wpe::formwatch::FormEvent>,
+    /// Open fill asks, oldest first, by the asking document's token. Each
+    /// is a reply a watcher's promise is waiting on, held with a ref, and
+    /// every one is answered exactly once: with a credential, or with
+    /// nothing when it is displaced or dropped.
+    fill_asks: std::collections::VecDeque<(String, *mut WebKitScriptMessageReply)>,
 }
 
 /// What was under the pointer when the page asked for a context menu, read
@@ -1596,6 +1617,78 @@ unsafe extern "C" fn on_account_message(
         }
         p.form_events.push_back(event);
     }
+}
+
+/// A login field asking to be filled. The reply is held until a pick
+/// answers it, or a newer ask displaces it. Returning TRUE says it will be
+/// answered — later, which is the point.
+unsafe extern "C" fn on_fill_ask(
+    _ucm: *mut WebKitUserContentManager,
+    value: *mut JSCValue,
+    reply: *mut WebKitScriptMessageReply,
+    data: gpointer,
+) -> gboolean {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    let raw = jsc_value_to_string(value);
+    let token = from_cstr(raw);
+    g_free(raw as *mut _);
+    // The watcher's tokens are 24 hex digits; anything else is not one.
+    let Some(token) =
+        token.filter(|t| t.len() == 24 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+    else {
+        webkit_script_message_reply_ref(reply);
+        answer_fill(reply, None);
+        return 1;
+    };
+    webkit_script_message_reply_ref(reply);
+    let displaced: Vec<_> = {
+        let mut p = prompts.borrow_mut();
+        let mut out = Vec::new();
+        p.fill_asks.retain(|(t, r)| {
+            let same = *t == token;
+            if same {
+                out.push(*r);
+            }
+            !same
+        });
+        p.fill_asks.push_back((token, reply));
+        // Only the focused field's ask matters; a few spare cover a list
+        // still open while focus wanders between frames.
+        while p.fill_asks.len() > 4 {
+            if let Some((_, r)) = p.fill_asks.pop_front() {
+                out.push(r);
+            }
+        }
+        out
+    };
+    for r in displaced {
+        answer_fill(r, None);
+    }
+    1
+}
+
+/// Answer a fill ask — with the credential's JSON, or with null — and let
+/// go of it.
+unsafe fn answer_fill(reply: *mut WebKitScriptMessageReply, value: Option<&str>) {
+    thread_local! {
+        /// A context to build reply values in. Any will do: the value is
+        /// serialized across to the web process, not run here.
+        static JSC: *mut JSCContext = unsafe { jsc_context_new() };
+    }
+    JSC.with(|ctx| {
+        let v = match value {
+            // JSON has no raw NUL — serde escapes it — so this cannot fail on
+            // a credential.
+            Some(s) => {
+                let c = cstr(s);
+                jsc_value_new_string(*ctx, c.as_ptr())
+            }
+            None => jsc_value_new_null(*ctx),
+        };
+        webkit_script_message_reply_return_value(reply, v);
+        g_object_unref(v as *mut _);
+    });
+    webkit_script_message_reply_unref(reply);
 }
 
 unsafe extern "C" fn drop_prompts_ref(data: gpointer, _c: *mut GClosure) {

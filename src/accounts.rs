@@ -7,12 +7,18 @@
 //! attributes beside it. Read the sibling crate's `CLAUDE.md` before changing
 //! the attribute names here — both ends have to agree.
 //!
-//! Two rules shape everything below.
+//! Three rules shape everything below.
 //!
 //! **Secrets are fetched one at a time, at the moment of a pick.** Listing
 //! reads labels, usernames and URLs only; no password is fetched to build a
 //! menu, and none is held afterwards. [`Secret`] exists so that a password
 //! cannot reach a log through a derived `Debug`.
+//!
+//! **Saving writes what cce-secrets writes.** A new login goes into the
+//! default collection with the same shape cce-secrets' own "new entry" form
+//! produces — the label as the title, `UserName` and `URL` attributes, a
+//! `text/plain` secret — so it lists there, and cce-keyring-sync adopts it
+//! like any keyring-born entry.
 //!
 //! **The keyring is never touched on the frame path.** A locked collection
 //! prompts, and a prompt blocks for as long as the person takes to answer it,
@@ -43,6 +49,12 @@ pub struct Secret(String);
 impl Secret {
     pub fn expose(&self) -> &str {
         &self.0
+    }
+}
+
+impl From<String> for Secret {
+    fn from(s: String) -> Self {
+        Self(s)
     }
 }
 
@@ -149,6 +161,19 @@ enum Request {
     Load,
     /// Fetch one entry's password, by object path.
     Fetch(String),
+    /// Write a new entry.
+    Save(NewLogin),
+}
+
+/// A login to write to the keyring, as the person agreed to save it.
+#[derive(Clone, Debug)]
+pub struct NewLogin {
+    /// The entry's title.
+    pub label: String,
+    pub username: String,
+    /// The origin the credential was typed into: what it will be offered on.
+    pub url: String,
+    pub password: Secret,
 }
 
 /// The account index, and the thread that reads it.
@@ -212,6 +237,32 @@ impl Accounts {
         let _ = self.tx.send(Request::Fetch(path.to_string()));
     }
 
+    /// Write a new entry. The outcome comes back as [`Message::Saved`], and
+    /// a successful save re-reads the index so the entry is offered at once.
+    pub fn save(&mut self, login: NewLogin) {
+        let _ = self.tx.send(Request::Save(login));
+    }
+
+    /// Forget the index, so the next [`Accounts::ensure_loaded`] reads it
+    /// again — after a save, which changed it.
+    pub fn invalidate(&mut self) {
+        self.loaded = false;
+    }
+
+    /// Whether the index has been read (successfully or not) and nothing is
+    /// in flight — when a question about what it holds can be answered.
+    pub fn is_ready(&self) -> bool {
+        self.loaded && !self.loading
+    }
+
+    /// Whether `username` already has an entry among `accounts` — what
+    /// decides that a sign-in is not new. Case-insensitive, since sites are,
+    /// and an entry with no username counts for an empty one.
+    pub fn knows(accounts: &[Account], username: &str) -> bool {
+        let wanted = username.trim().to_lowercase();
+        accounts.iter().any(|a| a.username.trim().to_lowercase() == wanted)
+    }
+
     /// The accounts worth offering on `host`, best first: entries with a real
     /// URL ahead of ones matched by their title alone, then by label.
     pub fn matching(&self, host: &str) -> Vec<Account> {
@@ -262,6 +313,9 @@ fn worker(rx: mpsc::Receiver<Request>, tx: calloop::channel::Sender<Message>) {
                     let _ = tx.send(Message::Credential(path, secret));
                 }
             }
+            Request::Save(login) => {
+                let _ = tx.send(Message::Saved(save(ss, &login)));
+            }
         }
     }
 }
@@ -304,6 +358,79 @@ fn load(ss: &secret_service::blocking::SecretService) -> Result<Vec<Account>, St
         }
     }
     Ok(accounts)
+}
+
+/// Write one entry to the default collection — cce-secrets' own target, and
+/// the one cce-keyring-sync syncs.
+///
+/// A locked collection is refused rather than unlocked, for the same reason
+/// listing skips one: the browser does not ask for the keyring password.
+/// It is normally unlocked at login, so this is rare and says what to do.
+/// `replace` is false: an existing entry is never overwritten from here.
+fn save(ss: &secret_service::blocking::SecretService, login: &NewLogin) -> Result<String, String> {
+    let collection = ss
+        .get_default_collection()
+        .map_err(|e| format!("no default keyring collection: {e}"))?;
+    if collection.is_locked().unwrap_or(true) {
+        return Err("the keyring is locked — unlock it in cce-secrets, then sign in again".into());
+    }
+    let mut attrs = std::collections::HashMap::new();
+    if !login.username.is_empty() {
+        attrs.insert("UserName", login.username.as_str());
+    }
+    if !login.url.is_empty() {
+        attrs.insert("URL", login.url.as_str());
+    }
+    collection
+        .create_item(&login.label, attrs, login.password.expose().as_bytes(), false, "text/plain")
+        .map(|_| login.label.clone())
+        // The error text names the operation, not the secret.
+        .map_err(|e| format!("could not save to the keyring: {e}"))
+}
+
+/// Hosts the person has said never to offer saving on. One host per line in
+/// `~/.local/state/cce/browser/never-save.txt`, beside history and bookmarks.
+pub struct NeverSave {
+    path: std::path::PathBuf,
+    hosts: Vec<String>,
+}
+
+impl NeverSave {
+    pub fn load() -> Self {
+        Self::at(crate::pages::state_dir().join("never-save.txt"))
+    }
+
+    fn at(path: std::path::PathBuf) -> Self {
+        let hosts = std::fs::read_to_string(&path)
+            .map(|s| {
+                s.lines()
+                    .map(|l| normalize_host(l))
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { path, hosts }
+    }
+
+    pub fn contains(&self, host: &str) -> bool {
+        self.hosts.contains(&normalize_host(host))
+    }
+
+    pub fn add(&mut self, host: &str) {
+        let host = normalize_host(host);
+        if host.is_empty() || self.hosts.contains(&host) {
+            return;
+        }
+        self.hosts.push(host);
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut body = self.hosts.join("\n");
+        body.push('\n');
+        if let Err(e) = std::fs::write(&self.path, body) {
+            log::warn!("could not write {}: {e}", self.path.display());
+        }
+    }
 }
 
 /// One entry's password. A failure is silent on purpose: the error text from
@@ -374,6 +501,30 @@ mod tests {
         assert_eq!(registrable_label("bbc.co.uk").as_deref(), Some("bbc"));
         assert_eq!(registrable_label("www.example.com").as_deref(), Some("example"));
         assert_eq!(registrable_label("localhost"), None);
+    }
+
+    #[test]
+    fn a_known_username_is_not_new() {
+        let mut a = account("Example", "https://example.com/");
+        a.username = "Me@Example.com".into();
+        assert!(Accounts::knows(&[a.clone()], " me@example.com"));
+        assert!(!Accounts::knows(&[a], "someone@example.com"));
+        assert!(!Accounts::knows(&[], "me"));
+    }
+
+    #[test]
+    fn never_save_persists_hosts() {
+        let dir = std::env::temp_dir().join(format!("cce-never-save-{}", std::process::id()));
+        let path = dir.join("never-save.txt");
+        let mut n = NeverSave::at(path.clone());
+        assert!(!n.contains("example.com"));
+        n.add("WWW.Example.com");
+        n.add("example.com");
+        assert!(n.contains("example.com"));
+        let again = NeverSave::at(path.clone());
+        assert!(again.contains("www.example.com"), "www is not a different site");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "example.com\n");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

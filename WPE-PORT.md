@@ -333,6 +333,7 @@ The examples are the test suite; all need `--features wpe`.
 | `wpe_host` | boot, frames, page state, navigation, history |
 | `wpe_input` | pointer / keyboard / wheel reaching the page, read back via `document.title` |
 | `wpe_tabs` | several views on one display, and a **backgrounded** tab still updating |
+| `wpe_autofill` | account autocomplete across a cross-origin frame: origin, offset relay, fill by token, submit capture, focus gating |
 | `wpe_focus` | window focus reaching every tab's page (`document.hasFocus()`), the condition WebKit paints the text caret on |
 | `wpe_loop` | blocking on GLib's fds vs polling, with the wakeup counts |
 | `wpe_dark` | force-dark, asserted on rendered pixels rather than on the call |

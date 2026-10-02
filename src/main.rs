@@ -342,12 +342,14 @@ enum BmHit {
 /// focused right now.
 ///
 /// It belongs to a *field*, not to the bar — it opens when one takes focus,
-/// follows it when the page scrolls, and goes when focus does. Only the
-/// accounts matching the tab's own host are ever in it, and no password is
+/// follows it when the page scrolls, and goes when focus does. Only accounts
+/// matching the site the field sends to are in it — plus, for a sign-in frame
+/// from another site, the page's own, marked as such — and no password is
 /// fetched to build it: a pick is what asks the keyring for one.
 #[cfg(feature = "wpe")]
 struct AcMenu {
-    /// Matches for this host, before filtering.
+    /// Matches for this field, before filtering: the form's site's first,
+    /// then — for a sign-in frame from another site — the page's.
     all: Vec<accounts::Account>,
     /// What survives what has been typed into the username field.
     shown: Vec<accounts::Account>,
@@ -355,17 +357,79 @@ struct AcMenu {
     selected: usize,
     /// First visible row, when `shown` is longer than the list can show.
     scroll: usize,
-    /// The field, in the chrome's own coordinates.
-    anchor: Rect,
-    /// The host this list was built for. A fetched password is checked
-    /// against it before it is filled: the keyring answers asynchronously,
-    /// and by then the tab could be somewhere else entirely.
+    /// The field, in its own frame's viewport coordinates. The top frame's
+    /// are the chrome's; a child frame's are moved by `frame_offsets`.
+    field: Rect,
+    /// The reporting document's token: where the fill goes, and whose
+    /// offset places the list.
+    frame: String,
+    top: bool,
+    /// The host of the frame the field is in — where the password would go.
+    /// Differs from `host` only for a sign-in frame from another site.
+    form_host: String,
+    /// The tab's host when this list was built. A fetched password is
+    /// checked against it before it is filled: the keyring answers
+    /// asynchronously, and by then the tab could be somewhere else entirely.
     host: String,
     /// The page is not on a secure origin — worth saying before a password
     /// goes into it.
     insecure: bool,
     /// Pointer-hovered row.
     hover: Option<usize>,
+}
+
+/// A sign-in the keyring does not know yet, offered for saving.
+///
+/// Not modal and not tied to the page: the sign-in it came from usually
+/// navigates away at once, and the offer has to outlive that. It waits in the
+/// corner for an answer — Save, Never for this site, or Not now — and holds
+/// the typed password only until then.
+#[cfg(feature = "wpe")]
+struct SaveOffer {
+    /// The frame's origin, stored as the entry's `URL`: the place the
+    /// credential was typed into, so it is offered there next time.
+    origin: String,
+    /// Host of `origin`, and what "Never" remembers.
+    form_host: String,
+    /// The tab's host, which titles the entry: the site the person was
+    /// signing in to, even when the form was a frame from somewhere else.
+    page_host: String,
+    username: String,
+    password: accounts::Secret,
+    stage: SaveStage,
+}
+
+#[cfg(feature = "wpe")]
+#[derive(Clone, PartialEq)]
+enum SaveStage {
+    /// The account index is still being read; whether this is new is not
+    /// known yet, so nothing is shown.
+    Checking,
+    Asking,
+    Saving,
+    Failed(String),
+}
+
+#[cfg(feature = "wpe")]
+const SAVE_W: f32 = 340.0;
+#[cfg(feature = "wpe")]
+const SAVE_BTN_W: f32 = 92.0;
+
+/// The save offer's plate and buttons, from `save_layout`: the one geometry
+/// draw and hit-test read.
+#[cfg(feature = "wpe")]
+struct SaveLayout {
+    plate: Rect,
+    /// Save, Never, Not now — or only the last, as Close, after a failure.
+    buttons: Vec<(Rect, SaveButton)>,
+}
+
+#[cfg(feature = "wpe")]
+#[derive(Clone, Copy, PartialEq)]
+enum SaveButton {
+    Save,
+    Never,
+    Dismiss,
 }
 
 #[cfg(feature = "wpe")]
@@ -439,6 +503,8 @@ pub enum Message {
     /// One entry's password arrived for the account at this object path.
     /// The payload prints as `Secret(…)`; see `accounts::Secret`.
     Credential(String, accounts::Secret),
+    /// A save to the keyring finished: the new entry's title, or why not.
+    Saved(Result<String, String>),
     /// Servo requested an event-loop spin (waker or delegate signal).
     Spin,
     /// Last tab closed: exit the app.
@@ -523,6 +589,20 @@ struct BrowserApp {
     scroll_sent: (f32, f32),
     /// Accounts from cce-secrets, and the worker that reads them.
     accounts: accounts::Accounts,
+    /// Hosts the person said never to offer saving on.
+    never_save: accounts::NeverSave,
+    /// A new sign-in waiting for Save / Never / Not now.
+    #[cfg(feature = "wpe")]
+    save_offer: Option<SaveOffer>,
+    /// Where each child frame's viewport sits in the top frame's, by the
+    /// frame's token, as the watchers relay it. Cleared on navigation.
+    #[cfg(feature = "wpe")]
+    frame_offsets: std::collections::HashMap<String, (f32, f32)>,
+    /// The last login field reported, from any frame — replayed when the
+    /// account index finishes loading, since a field focused before then got
+    /// no list and will not report itself again.
+    #[cfg(feature = "wpe")]
+    last_field: Option<wpe::FormEvent>,
     /// The open account list, if a login field is focused and something in
     /// the keyring matches the page.
     #[cfg(feature = "wpe")]
@@ -825,11 +905,56 @@ impl BrowserApp {
         self.host.url().and_then(|u| u.host_str().map(str::to_string))
     }
 
-    /// A login field was reported. Open, move or refill the account list.
+    /// The accounts a field earns, best first.
     ///
-    /// The origin check is the guard: the watcher runs in the top frame, so
-    /// its origin must be the tab's own. Anything else is dropped rather than
-    /// offered a credential.
+    /// A field is offered the accounts of the site it sends to: `form_host`,
+    /// the frame it lives in. When that frame is from another site than the
+    /// page — iCloud's sign-in is `idmsa.apple.com` inside `icloud.com` — the
+    /// page's own accounts are offered too, after the frame's and marked with
+    /// after the frame's, because the entry people have is usually for the
+    /// site they typed, and the form's host is an implementation detail of it.
+    /// That is a real widening: it hands the page's password to an embedded
+    /// site if picked. It is never automatic, the list says which site the
+    /// form is from (`ac_notes`), and an ad frame with a password field is
+    /// not what sits inside the sites this is for.
+    #[cfg(feature = "wpe")]
+    fn offered(&self, form_host: &str, page_host: &str) -> Vec<accounts::Account> {
+        let mut all = self.accounts.matching(form_host);
+        if form_host != page_host {
+            for a in self.accounts.matching(page_host) {
+                if !all.iter().any(|b| b.path == a.path) {
+                    all.push(a);
+                }
+            }
+        }
+        all
+    }
+
+    /// The lines under the account list, each with its colour: whose form
+    /// this is, when it is not the page's own, and whether the password
+    /// would cross the network in the clear.
+    #[cfg(feature = "wpe")]
+    fn ac_notes(menu: &AcMenu) -> Vec<(String, [u8; 3])> {
+        let mut notes = Vec::new();
+        if menu.form_host != menu.host {
+            notes.push((format!("sign-in form from {}", menu.form_host), TEXT_DIM));
+        }
+        if menu.insecure {
+            notes.push((
+                "insecure page — this password would be sent unencrypted".to_string(),
+                [212, 155, 155],
+            ));
+        }
+        notes
+    }
+
+    /// A login-field event from a watcher. Open, move, refill or close the
+    /// account list; place child frames; take a sign-in for saving.
+    ///
+    /// Which frame spoke is believable — the watchers run in a world the page
+    /// cannot reach, and report their own `location.origin` — so the guard
+    /// is: a top frame must be on the tab's own host, and a child frame is
+    /// matched against its own.
     #[cfg(feature = "wpe")]
     fn on_form_event(&mut self, event: wpe::FormEvent) -> bool {
         use wpe::FormEvent;
@@ -837,14 +962,38 @@ impl BrowserApp {
             return false;
         }
         match event {
-            FormEvent::Blur => {
-                let was = self.ac_menu.is_some();
-                self.ac_menu = None;
+            FormEvent::Blur { frame } => {
+                // Only the field's own frame can close its list: focus moving
+                // from one frame to another blurs one and focuses the other,
+                // and the two reports can arrive in either order.
+                let was = self.ac_menu.as_ref().is_some_and(|m| m.frame == frame);
+                if was {
+                    self.ac_menu = None;
+                }
+                if self.last_field.as_ref().is_some_and(
+                    |e| matches!(e, FormEvent::Field { frame: f, .. } if *f == frame),
+                ) {
+                    self.last_field = None;
+                }
                 was
             }
-            FormEvent::Field { origin, password, rect, value, moved } => {
+            FormEvent::Frame { frame, offset } => {
+                // A page could invent frames; a bound keeps that from growing.
+                if self.frame_offsets.len() >= 32 && !self.frame_offsets.contains_key(&frame) {
+                    self.frame_offsets.clear();
+                }
+                let changed = self.frame_offsets.insert(frame.clone(), offset) != Some(offset);
+                changed && self.ac_menu.as_ref().is_some_and(|m| m.frame == frame)
+            }
+            FormEvent::Submit { origin, top, username, password, .. } => {
+                self.on_submit(origin, top, username, password.into_inner().into());
+                self.save_offer
+                    .as_ref()
+                    .is_some_and(|o| o.stage != SaveStage::Checking)
+            }
+            FormEvent::Field { ref origin, ref frame, top, password, rect, ref value, moved } => {
                 log::debug!(
-                    "login field: password={password} moved={moved} origin={origin} \
+                    "login field: password={password} moved={moved} top={top} origin={origin} \
                      page={:?} rect={rect:?}",
                     self.page_host()
                 );
@@ -852,30 +1001,38 @@ impl BrowserApp {
                     self.ac_menu = None;
                     return false;
                 };
-                let same_origin = url::Url::parse(&origin)
+                let Some(form_host) = url::Url::parse(origin)
                     .ok()
-                    .and_then(|u| u.host_str().map(|h| h == host))
-                    .unwrap_or(false);
-                if !same_origin {
+                    .and_then(|u| u.host_str().map(str::to_string))
+                else {
+                    self.ac_menu = None;
+                    return false;
+                };
+                if top && form_host != host {
                     self.ac_menu = None;
                     return false;
                 }
+                let (frame, filter, insecure) = (
+                    frame.clone(),
+                    // A password field filters by nothing; a username field
+                    // by what is in it.
+                    if password { String::new() } else { value.clone() },
+                    insecure_origin(origin, &form_host),
+                );
+                self.last_field = Some(event);
                 // The index is read the first time a login field appears —
                 // never at launch, so a browser that sees no login form never
                 // opens the keyring.
                 self.accounts.ensure_loaded();
-                let anchor = self.field_rect(rect);
-                let all = self.accounts.matching(&host);
-                log::debug!("{} accounts match {host}", all.len());
-                let insecure = insecure_origin(&origin, &host);
-                // A password field filters by nothing; a username field by
-                // what is in it.
-                let filter = if password { String::new() } else { value };
+                let field = self.field_rect(rect);
+                let all = self.offered(&form_host, &host);
+                log::debug!("{} accounts match {form_host} (page {host})", all.len());
                 match self.ac_menu.as_mut() {
-                    Some(menu) if moved => {
-                        menu.anchor = anchor;
+                    Some(menu) if moved && menu.frame == frame => {
+                        menu.field = field;
                         menu.all = all;
                         menu.host = host.clone();
+                        menu.form_host = form_host;
                         menu.insecure = insecure;
                         menu.refilter(&filter);
                     }
@@ -885,7 +1042,10 @@ impl BrowserApp {
                             shown: Vec::new(),
                             selected: 0,
                             scroll: 0,
-                            anchor,
+                            field,
+                            frame,
+                            top,
+                            form_host,
                             host: host.clone(),
                             insecure,
                             hover: None,
@@ -902,6 +1062,167 @@ impl BrowserApp {
                 true
             }
         }
+    }
+
+    /// A sign-in went out. Hold it as an offer to save, unless it is already
+    /// in the keyring, or the site is on the never list.
+    ///
+    /// Whether it is new can only be answered once the index is read, so the
+    /// offer starts as `Checking` and `resolve_save` decides — now, or when
+    /// the index arrives.
+    #[cfg(feature = "wpe")]
+    fn on_submit(&mut self, origin: String, top: bool, username: String, password: accounts::Secret) {
+        let Some(page_host) = self.page_host() else { return };
+        let Some(form_host) = url::Url::parse(&origin)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+        else {
+            return;
+        };
+        // Same guard as a field: a top frame must be the tab's own.
+        if top && form_host != page_host {
+            return;
+        }
+        if self.never_save.contains(&form_host) {
+            return;
+        }
+        // The fill path's own submit — or the same sign-in reported twice —
+        // is not a second offer.
+        if self.save_offer.as_ref().is_some_and(|o| {
+            o.form_host == form_host && o.username == username && o.password == password
+        }) {
+            return;
+        }
+        self.save_offer = Some(SaveOffer {
+            origin,
+            form_host,
+            page_host,
+            username,
+            password,
+            stage: SaveStage::Checking,
+        });
+        self.accounts.ensure_loaded();
+        self.resolve_save();
+    }
+
+    /// Decide a `Checking` offer, once the index can answer: drop it when an
+    /// entry for that site already has this username, show it otherwise.
+    ///
+    /// "That site" is everything the field would have been offered, borrowed
+    /// entries included — a sign-in filled from the page's own entry into a
+    /// frame from another site is that entry, not a new login.
+    #[cfg(feature = "wpe")]
+    fn resolve_save(&mut self) {
+        let Some(offer) = self.save_offer.as_ref() else { return };
+        if offer.stage != SaveStage::Checking || !self.accounts.is_ready() {
+            return;
+        }
+        if let Some(e) = self.accounts.error.as_ref() {
+            // Nothing could be saved either; saying so on every sign-in
+            // would be noise. The load failure is already logged.
+            log::info!("not offering to save a login: the keyring is unavailable ({e})");
+            self.save_offer = None;
+            return;
+        }
+        let known = self.offered(&offer.form_host, &offer.page_host);
+        if accounts::Accounts::knows(&known, &offer.username) {
+            self.save_offer = None;
+        } else if let Some(o) = self.save_offer.as_mut() {
+            o.stage = SaveStage::Asking;
+        }
+    }
+
+    /// Where the save offer sits: in the corner the bar hangs from, under
+    /// the dot for a top bar and over it for a bottom one — or past the bar
+    /// itself while that is out — so it never covers the controls it sits by.
+    #[cfg(feature = "wpe")]
+    fn save_layout(&self) -> Option<SaveLayout> {
+        let offer = self.save_offer.as_ref()?;
+        if offer.stage == SaveStage::Checking {
+            return None;
+        }
+        let width = SAVE_W.min(self.win.0 - 2.0 * bar_margin()).max(220.0);
+        let height = plate_pad() * 2.0 + 20.0 + 18.0 + 18.0 + inner_gap() + BTN_H;
+        let (cx, cy) = self.dot_center();
+        let edge = cx + plate_dock::CORNER_R;
+        let x = (edge - width).clamp(0.0, (self.win.0 - width).max(0.0));
+        let gap = item_gap();
+        let y = match self.settings.bar_position {
+            settings::BarPosition::Top => {
+                let below = if self.chrome_t > 0.0 {
+                    let (bar, _) = self.chrome_plate();
+                    bar.y + bar.height
+                } else {
+                    cy + plate_dock::CORNER_R
+                };
+                below + gap
+            }
+            settings::BarPosition::Bottom => {
+                let above = if self.chrome_t > 0.0 {
+                    self.chrome_plate().0.y
+                } else {
+                    cy - plate_dock::CORNER_R
+                };
+                (above - gap - height).max(0.0)
+            }
+        };
+        let plate = Rect { x, y, width, height };
+        let by = plate.y + plate.height - plate_pad() - BTN_H;
+        let at = |k: f32| Rect {
+            x: plate.x + plate.width - plate_pad() - (k + 1.0) * SAVE_BTN_W - k * inner_gap(),
+            y: by,
+            width: SAVE_BTN_W,
+            height: BTN_H,
+        };
+        let buttons = match offer.stage {
+            SaveStage::Failed(_) => vec![(at(0.0), SaveButton::Dismiss)],
+            SaveStage::Saving => Vec::new(),
+            _ => vec![
+                (at(0.0), SaveButton::Save),
+                (at(1.0), SaveButton::Dismiss),
+                (at(2.0), SaveButton::Never),
+            ],
+        };
+        Some(SaveLayout { plate, buttons })
+    }
+
+    /// Act on a press at a point over the save offer. Returns whether the
+    /// offer took the press — anywhere on its plate does.
+    #[cfg(feature = "wpe")]
+    fn save_click(&mut self, x: f32, y: f32) -> bool {
+        let Some(layout) = self.save_layout() else { return false };
+        if !hit(&layout.plate, x, y) {
+            return false;
+        }
+        let Some((_, button)) = layout.buttons.iter().find(|(r, _)| hit(r, x, y)) else {
+            return true;
+        };
+        match button {
+            SaveButton::Save => {
+                if let Some(offer) = self.save_offer.as_mut() {
+                    offer.stage = SaveStage::Saving;
+                    let label = offer
+                        .page_host
+                        .strip_prefix("www.")
+                        .unwrap_or(&offer.page_host)
+                        .to_string();
+                    let login = accounts::NewLogin {
+                        label,
+                        username: offer.username.clone(),
+                        url: offer.origin.clone(),
+                        password: offer.password.clone(),
+                    };
+                    self.accounts.save(login);
+                }
+            }
+            SaveButton::Never => {
+                if let Some(offer) = self.save_offer.take() {
+                    self.never_save.add(&offer.form_host);
+                }
+            }
+            SaveButton::Dismiss => self.save_offer = None,
+        }
+        true
     }
 
     /// A viewport rect from the page, in the chrome's coordinates.
@@ -930,15 +1251,19 @@ impl BrowserApp {
             .as_ref()
             .zip(self.page_host())
             .is_some_and(|(menu, host)| menu.host == host);
-        let username = self
+        let target = self
             .ac_menu
             .as_ref()
             .filter(|_| same_page)
-            .and_then(|m| m.shown.iter().find(|a| a.path == path))
-            .map(|a| a.username.clone());
-        match username {
-            Some(username) => self.host.fill_credentials(&username, secret.expose()),
-            None => log::warn!("dropped a credential: the page moved on before it arrived"),
+            .and_then(|m| m.shown.iter().find(|a| a.path == path).map(|a| (a, &m.frame)))
+            .map(|(a, frame)| (a.username.clone(), frame.clone()));
+        // The fill goes to the ask of the document the list was opened for,
+        // and only that one; if it has gone, so does the credential.
+        let filled = target.is_some_and(|(username, frame)| {
+            self.host.fill_credentials(&frame, &username, secret.expose())
+        });
+        if !filled {
+            log::warn!("dropped a credential: the page moved on before it arrived");
         }
         self.ac_menu = None;
     }
@@ -962,22 +1287,25 @@ impl BrowserApp {
         if menu.shown.is_empty() {
             return None;
         }
+        // A child frame's field is placed by the frame's offset, which the
+        // watchers relay separately; until it has arrived there is nowhere
+        // honest to draw the list, so it waits.
+        let (dx, dy) = if menu.top { (0.0, 0.0) } else { *self.frame_offsets.get(&menu.frame)? };
+        let anchor = Rect { x: menu.field.x + dx, y: menu.field.y + dy, ..menu.field };
         let rows = menu.shown.len().min(AC_MAX_ROWS);
-        let height = 2.0 * plate_pad() + rows as f32 * AC_ROW_H + if menu.insecure { 18.0 } else { 0.0 };
+        let height =
+            2.0 * plate_pad() + rows as f32 * AC_ROW_H + Self::ac_notes(menu).len() as f32 * 18.0;
         let width = AC_W.min(self.win.0 - 2.0 * bar_margin()).max(180.0);
-        let x = menu
-            .anchor
-            .x
-            .clamp(0.0, (self.win.0 - width).max(0.0));
+        let x = anchor.x.clamp(0.0, (self.win.0 - width).max(0.0));
         // Under the field, or above it when there is no room below — the
         // list must never cover the field it is filling.
         // style: deliberate — 2px off the field, so the list reads as
         // attached to it; the field is page content, not a plate sibling.
-        let below = menu.anchor.y + menu.anchor.height + 2.0;
+        let below = anchor.y + anchor.height + 2.0;
         let y = if below + height <= self.win.1 - bar_margin() {
             below
         } else {
-            (menu.anchor.y - 2.0 - height).max(0.0)
+            (anchor.y - 2.0 - height).max(0.0)
         };
         let plate = Rect { x, y, width, height };
         // Row *positions*; which account each shows is `first_row() + k`.
@@ -1586,6 +1914,7 @@ impl BrowserApp {
         #[cfg(feature = "wpe")]
         {
             self.ac_menu = None;
+            self.last_field = None;
             self.host.clear_form_events();
         }
         self.host.activate(index);
@@ -1756,16 +2085,78 @@ impl BrowserApp {
                 TEXT_DIM,
             );
         }
-        // Say it plainly when the page is not https: the password is about to
-        // cross the network in the clear, and only the person can decide that
-        // is fine.
-        if menu.insecure {
+        // Say it plainly when the form is another site's, and when the page
+        // is not https: the password is about to go somewhere the person may
+        // not have expected, and only they can decide that is fine.
+        let notes = Self::ac_notes(menu);
+        let first_note = plate.y + plate.height - plate_pad() - notes.len() as f32 * 18.0;
+        for (k, (note, color)) in notes.into_iter().enumerate() {
             pc.text(
-                "insecure page — this password would be sent unencrypted",
+                Self::fit_text(&note, sans, AC_SUB_FONT, plate.width - 2.0 * text_pad()),
                 plate.x + text_pad(),
-                plate.y + plate.height - 15.0,
+                first_note + k as f32 * 18.0 + 3.0,
                 AC_SUB_FONT,
-                [212, 155, 155],
+                color,
+            );
+        }
+    }
+
+    /// Draw the save offer: what would be saved, and the three answers.
+    /// The password itself is never drawn.
+    #[cfg(feature = "wpe")]
+    fn paint_save_offer(&mut self, pc: &mut PaintCtx, sans: &str) {
+        let Some(l) = self.save_layout() else { return };
+        let Some(offer) = self.save_offer.as_ref() else { return };
+        pc.plate(
+            l.plate,
+            (8.0, 8.0, 8.0, 8.0),
+            &cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]),
+            cce_ui::layout::bevel_width().min(3.0),
+        );
+        let x = l.plate.x + plate_pad();
+        let w = l.plate.width - 2.0 * plate_pad();
+        let y = l.plate.y + plate_pad();
+        let (title, line, sub, sub_color) = match &offer.stage {
+            SaveStage::Failed(why) => {
+                ("Password not saved".to_string(), why.clone(), String::new(), TEXT_DIM)
+            }
+            stage => {
+                let title = if *stage == SaveStage::Saving {
+                    "Saving to the keyring…"
+                } else {
+                    "Save this password?"
+                };
+                let who = if offer.username.is_empty() {
+                    "(no username)".to_string()
+                } else {
+                    offer.username.clone()
+                };
+                let site = if offer.form_host == offer.page_host {
+                    offer.form_host.clone()
+                } else {
+                    format!("{} — form from {}", offer.page_host, offer.form_host)
+                };
+                (title.to_string(), who, site, TEXT_DIM)
+            }
+        };
+        pc.text(title, x, y, 14.0, TEXT);
+        pc.text(Self::fit_text(&line, sans, 13.0, w), x, y + 22.0, 13.0, TEXT);
+        pc.text(Self::fit_text(&sub, sans, 12.0, w), x, y + 40.0, 12.0, sub_color);
+        for (rect, button) in &l.buttons {
+            let (label, accent) = match (button, &offer.stage) {
+                (SaveButton::Save, _) => ("Save", true),
+                (SaveButton::Never, _) => ("Never", false),
+                (SaveButton::Dismiss, SaveStage::Failed(_)) => ("Close", false),
+                (SaveButton::Dismiss, _) => ("Not now", false),
+            };
+            pc.rounded_rect(*rect, 6.0, (true, true, true, true), if accent { ACCENT } else { BTN_BG });
+            let tw = measure_text_width(label, sans, 13.0);
+            pc.text(
+                label,
+                rect.x + (rect.width - tw) / 2.0,
+                cce_ui::layout::align_text_y(rect.y, rect.height, 13.0, 0.0),
+                13.0,
+                TEXT,
             );
         }
     }
@@ -2082,6 +2473,13 @@ impl Application for BrowserApp {
             scroll: cce_ui::widget::scroll_motion::ScrollMotion::new(),
             scroll_sent: (0.0, 0.0),
             accounts,
+            never_save: accounts::NeverSave::load(),
+            #[cfg(feature = "wpe")]
+            save_offer: None,
+            #[cfg(feature = "wpe")]
+            frame_offsets: std::collections::HashMap::new(),
+            #[cfg(feature = "wpe")]
+            last_field: None,
             #[cfg(feature = "wpe")]
             ac_menu: None,
             nav_url: None,
@@ -2173,6 +2571,8 @@ impl Application for BrowserApp {
                         #[cfg(feature = "wpe")]
                         {
                             self.ac_menu = None;
+                            self.frame_offsets.clear();
+                            self.last_field = None;
                         }
                     }
                     self.sync_page_state();
@@ -2200,11 +2600,48 @@ impl Application for BrowserApp {
                 }
                 self.accounts.loaded(result);
                 // A field may have been focused while the index was still
-                // being read; this is when its list can finally open.
+                // being read; this is when its list can finally open. The
+                // chrome replays its own copy of that report — the frame it
+                // came from may be one it cannot run script in.
                 #[cfg(feature = "wpe")]
                 {
-                    self.host.request_form_state();
+                    if let Some(wpe::FormEvent::Field {
+                        origin, frame, top, password, rect, value, ..
+                    }) = self.last_field.take()
+                    {
+                        let replay = wpe::FormEvent::Field {
+                            origin, frame, top, password, rect, value, moved: false,
+                        };
+                        self.on_form_event(replay);
+                    }
+                    // And a sign-in may be waiting to learn whether it is new.
+                    self.resolve_save();
                     *needs_rebuild = true;
+                }
+            }
+            Message::Saved(result) => {
+                #[cfg(feature = "wpe")]
+                {
+                    match result {
+                        Ok(label) => {
+                            log::info!("accounts: saved a login as \"{label}\"");
+                            self.save_offer = None;
+                            // The next login field reads the index again, new
+                            // entry and all.
+                            self.accounts.invalidate();
+                        }
+                        Err(why) => {
+                            log::warn!("accounts: {why}");
+                            if let Some(o) = self.save_offer.as_mut() {
+                                o.stage = SaveStage::Failed(why);
+                            }
+                        }
+                    }
+                    *needs_rebuild = true;
+                }
+                #[cfg(not(feature = "wpe"))]
+                {
+                    let _ = result;
                 }
             }
             Message::Credential(path, secret) => {
@@ -2416,6 +2853,17 @@ impl Application for BrowserApp {
                     _ => self.ctx_menu = None,
                 }
             }
+            return None;
+        }
+
+        // The save offer takes any press on its plate, buttons or not; the
+        // page under it never sees one. Presses elsewhere leave it waiting.
+        #[cfg(feature = "wpe")]
+        if self.save_layout().is_some_and(|l| hit(&l.plate, pos.x, pos.y)) {
+            if pressed && button == MouseButton::Left {
+                self.save_click(pos.x, pos.y);
+            }
+            *needs_rebuild = true;
             return None;
         }
 
@@ -2692,7 +3140,7 @@ impl Application for BrowserApp {
         // everything else — the person is typing into the page's own field,
         // and that typing is what filters the list.
         #[cfg(feature = "wpe")]
-        if self.ac_menu.is_some() && event.state == ElementState::Pressed && !self.url_focused {
+        if self.ac_layout().is_some() && event.state == ElementState::Pressed && !self.url_focused {
             match &event.logical_key {
                 Key::Named(NamedKey::ArrowDown) => {
                     if let Some(m) = self.ac_menu.as_mut() {
@@ -3083,6 +3531,8 @@ impl Application for BrowserApp {
         self.paint_bm_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_ac_menu(&mut pc, &sans);
+        #[cfg(feature = "wpe")]
+        self.paint_save_offer(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_ctx_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]

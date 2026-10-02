@@ -27,8 +27,8 @@ Sixteen files, ~8.8k lines. The ten that carry the design:
 | `src/downloads.rs` | the chrome-side download pipeline (Servo has none) |
 | `src/session.rs` | open-tab persistence: the tab set survives a restart |
 | `src/settings.rs` | the per-app KDL config |
-| `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, and which entries a host earns |
-| `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher script, the fill script, and the events between them |
+| `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, which entries a host earns, saving a new login, and the never-save list |
+| `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
 
 ## Build
 
@@ -405,7 +405,9 @@ own multiplier on a precise delta; the direct path has always moved that far.)
 ## Account autocomplete (cce-secrets)
 
 A login field on a page gets a list of the accounts the keyring holds for that
-site; picking one fills the username and password. There is no cce-secrets
+site; picking one fills the username and password. A sign-in the keyring does
+not know yet is offered for saving (Save / Never / Not now), and a saved entry
+is offered from then on. There is no cce-secrets
 *protocol* — that app fronts the freedesktop **Secret Service** (gnome-keyring
 here) and so does this, reading the same entries: item label as the title,
 `UserName` and `URL` as attributes. `browser.accounts` (default true) is the
@@ -423,11 +425,33 @@ The security shape is the design, not decoration:
   cannot see or replace the watcher's helpers, so it cannot hook the moment a
   credential is filled, and it cannot post on the chrome's message channel to
   fake a focused field.
-- **Top frame only.** A password field in a cross-origin iframe gets no
-  suggestions: such a frame cannot report a position in the top document's
-  coordinates anyway, and an embedded frame asking for the embedder's
-  credentials is the attack this must not enable. The reported `location.origin`
-  is checked against the tab's own host on every event, on top of that.
+- **Every frame, matched by the frame's own origin.** Sign-in forms are often
+  an iframe from another site (iCloud's is `idmsa.apple.com` inside
+  `icloud.com`), and that frame is where the password goes, so accounts are
+  matched against the *frame's* host. Inside the private world
+  `location.origin` is the frame's real origin, so it can be believed; a top
+  frame must still be on the tab's own host. For a frame from another site the
+  page's own accounts are offered too, after the frame's, under a "sign-in form
+  from <host>" line — a deliberate widening (it would hand the page's password
+  to the embedded site if picked) that is what makes iCloud work with an
+  `icloud.com` entry.
+- **A frame places itself by relay.** It knows its field only in its own
+  viewport, so each frame announces a random token to its parent with
+  `postMessage`; each parent's watcher finds the sending frame by
+  `event.source`, adds its offset and passes it up, and the top reports a
+  `Frame` offset the chrome keeps in `frame_offsets`. Only geometry travels
+  that way (a forgery misplaces the list, nothing more), and the watcher
+  swallows those messages so the page never sees them.
+- **A fill is an answer, not a script.** The chrome can evaluate script only
+  in the top frame, so a focused field *asks* to be filled on a reply channel
+  (`FILL_CHANNEL`); the host holds the newest asks by token and a pick answers
+  exactly the one the list was opened for, with the credential as data. No
+  password is ever spliced into script source.
+- **Only a focused document speaks.** The channels are shared by every tab and
+  say nothing about which one spoke, so watchers report and ask only while
+  `document.hasFocus()` — true only in the shown tab, now that the window's
+  focus reaches the page (`WebKitHost::focus`) — and a tab switch drops every
+  queued event and open ask.
 - **Matching is narrow** (`Account::matches`): exact host, or a *parent* domain
   covering its subdomains — never upward, never sideways. An entry with no URL
   falls back to its title against the site name (`GitHub` → `github.com`), the
@@ -438,8 +462,9 @@ The security shape is the design, not decoration:
   cannot spill it into a log.
 - **The fill is re-checked when it lands.** An unlock prompt can put seconds
   between the pick and the answer, so `fill_account` drops the credential
-  unless the list is still open, still holds that account, and the tab is
-  still on the host it was opened for.
+  unless the list is still open, still holds that account, the tab is still
+  on the host it was opened for, and the asking document's token still has
+  an ask open.
 - **Never automatic.** Nothing fills without a pick, nothing submits the form,
   and a locked collection is skipped rather than unlocked — the browser asking
   for the keyring password because a page happened to show a login field would
@@ -454,9 +479,11 @@ Things that were learned the hard way and are easy to undo:
   that never sees one never opens the store, which is what keeps this from
   costing an unlock prompt at login.
 - **A field can be focused before the index has finished loading** — it always
-  is, on a page that autofocuses. The chrome answers the load by asking the
-  watcher to re-report (`request_form_state` → `RESCAN_JS`); without that
-  nudge the first login form of a session silently gets nothing.
+  is, on a page that autofocuses. The chrome keeps its own copy of the last
+  field report (`last_field`) and replays it when the index arrives; without
+  that the first login form of a session silently gets nothing. (A replay, not
+  a rescan script, because the field may be in a frame the chrome cannot run
+  script in.)
 - **The engine's dirty flag is not a navigation.** Clearing the list on
   `dirty` closed it in the same pump that opened it (title and loading
   transitions set it too). It is keyed on the tab's URL actually changing
@@ -470,11 +497,42 @@ Things that were learned the hard way and are easy to undo:
   *logical* size and sets the scale separately, so a viewport rect from the
   page needs no conversion at any output scale (verified at scale 2).
 
+### Saving a new login
+
+The watcher reports a sign-in going out — a form's `submit` (which fires only
+once the page's own validation passed), or, on the many pages with no form,
+Enter in a login field or a button that says it signs in — with the username
+and password. The chrome holds it as a `SaveOffer` and asks only when the
+index has no entry for that site with that username (the same set the field
+would have been offered, so filling from the page's entry into a sign-in frame
+is not "new"), and the site is not on the never list. Points that are choices:
+
+- **It writes what cce-secrets writes**: default collection, the page's host as
+  the title, `UserName`, `URL` = the *form's* origin (where it will be offered
+  next), `text/plain`, never replacing an item. cce-keyring-sync adopts it like
+  any keyring-born entry.
+- **A locked collection is refused, not unlocked** — same rule as listing.
+- **The offer outlives the page.** It sits in the dot's corner, survives the
+  navigation a sign-in usually causes, and waits for an answer; it is not
+  modal, and only a press on its own plate is its.
+- **"Never" is per form host**, in `~/.local/state/cce/browser/never-save.txt`.
+  There is no UI to undo it yet; delete the line.
+- The typed password crosses the watcher's channel as `formwatch::Password` and
+  lives as `accounts::Secret` — both print redacted — and only until answered.
+- An existing entry is never updated (a changed password is not detected);
+  that needs comparing secrets, which this deliberately never fetches unasked.
+
 Testing it needs an isolated keyring, never the real one: `dbus-run-session`
 plus `gnome-keyring-daemon --unlock --components=secrets`, seeded with
 `secret-tool`, and the browser launched into that bus with
 `DBUS_SESSION_BUS_ADDRESS`. A `file:` page will not do — its origin is `null`,
-so serve the fixture over http on localhost.
+so serve the fixture over http on localhost (`127.0.0.1` and `localhost` are
+two origins, which is a cross-site sign-in frame for free). Two traps: give
+`gnome-keyring-daemon` a **short** `-C` control directory (a long scratch path
+overflows the 108-byte socket path and fails as "Address already in use"), and
+run it `--foreground` in the background so one process owns the bus name.
+`examples/wpe_autofill.rs` covers the engine side (frames, relay, fill, submit,
+focus gating) with no keyring at all.
 
 ## `cce://` pages
 
@@ -575,9 +633,8 @@ clipboard path as the rest of the DE.
 
 Worth knowing before assuming a bug: no find-in-page, no zoom, no favicons, and no
 history/URL autocomplete. (The context menu, JS dialogs and HTTP auth landed with the
-WPE backend and are Servo-only gaps now.) Account autocomplete does not *save* a new
-login — cce-secrets is where entries are written — and it does not fill inside
-cross-origin iframes. Ctrl+Shift+O ("hand this page to
+WPE backend and are Servo-only gaps now.) Account autocomplete saves new logins but
+never updates a changed password, and "never save" has no undo UI. Ctrl+Shift+O ("hand this page to
 another browser") is the deliberate escape hatch for pages Servo cannot follow, such as
 a Cloudflare challenge that never completes.
 
