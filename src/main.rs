@@ -11,7 +11,6 @@
 mod accounts;
 mod downloads;
 mod instance;
-mod lineedit;
 mod pages;
 mod raindrop;
 mod session;
@@ -189,7 +188,7 @@ struct Modal {
     title: String,
     message: String,
     /// Editable fields, in tab order. Empty for a bare alert or confirm.
-    fields: Vec<(&'static str, lineedit::LineEdit)>,
+    fields: Vec<(&'static str, cce_ui::widget::LineEdit)>,
     focused: usize,
     has_cancel: bool,
     kind: ModalKind,
@@ -553,7 +552,7 @@ struct BrowserApp {
     /// URL bar contents; mirrors the page URL unless the bar is focused.
     /// Text, caret and selection all live in the shared editor — the same
     /// one the dialog fields use.
-    url: lineedit::LineEdit,
+    url: cce_ui::widget::LineEdit,
     url_focused: bool,
     /// The circle menu: the DE's corner control toggles the utility bar,
     /// which unfolds from under it. `chrome_t` is the unfold progress
@@ -1618,7 +1617,7 @@ impl BrowserApp {
         if !self.url_focused {
             if let Some(u) = self.host.url() {
                 let s = u.to_string();
-                self.url = lineedit::LineEdit::with_text(
+                self.url = cce_ui::widget::LineEdit::with_text(
                     if s == "about:blank" { String::new() } else { s },
                 );
             }
@@ -1635,7 +1634,7 @@ impl BrowserApp {
         if let Some(d) = self.host.pending_dialog() {
             let mut fields = Vec::new();
             if let Some(default) = d.prompt_default.clone() {
-                let mut e = lineedit::LineEdit::with_text(default);
+                let mut e = cce_ui::widget::LineEdit::with_text(default);
                 e.select_all();
                 fields.push(("", e));
             }
@@ -1663,8 +1662,8 @@ impl BrowserApp {
                 },
                 message: where_,
                 fields: vec![
-                    ("Username", lineedit::LineEdit::default()),
-                    ("Password", lineedit::LineEdit::masked()),
+                    ("Username", cce_ui::widget::LineEdit::default()),
+                    ("Password", cce_ui::widget::LineEdit::masked()),
                 ],
                 focused: 0,
                 has_cancel: true,
@@ -1908,7 +1907,7 @@ impl BrowserApp {
     fn new_tab(&mut self) {
         let url = Url::parse("about:blank").expect("about:blank");
         self.host.open_tab(url);
-        self.url = lineedit::LineEdit::default();
+        self.url = cce_ui::widget::LineEdit::default();
         self.url_focused = true;
         // The focused field has to be on screen, so a new tab unfolds the
         // menu even when it was opened by chord.
@@ -1976,7 +1975,7 @@ impl BrowserApp {
         }
         let mut end = text.len();
         while end > 0 {
-            end = lineedit::prev_boundary(text, end);
+            end = cce_ui::widget::line_edit::prev_boundary(text, end);
             let cut = format!("{}...", &text[..end]);
             if measure_text_width(&cut, sans, size) <= avail {
                 return cut;
@@ -2386,18 +2385,18 @@ impl BrowserApp {
 
 
 
-    /// URL-bar keys. Editing is the shared [`lineedit::LineEdit`]; only what
+    /// URL-bar keys. Editing is the shared [`cce_ui::widget::LineEdit`]; only what
     /// makes this bar a *URL* bar — Enter navigates, Escape returns focus to
     /// the page — is decided here.
     fn edit_url(&mut self, event: &KeyEvent) {
         match self.url.handle_key(event) {
-            lineedit::EditOutcome::Submit => self.navigate(),
-            lineedit::EditOutcome::Cancel => {
+            cce_ui::widget::EditOutcome::Submit => self.navigate(),
+            cce_ui::widget::EditOutcome::Cancel => {
                 self.url_focused = false;
                 self.url.selection = None;
                 self.sync_page_state();
             }
-            lineedit::EditOutcome::Edited | lineedit::EditOutcome::Ignored => {}
+            cce_ui::widget::EditOutcome::Edited | cce_ui::widget::EditOutcome::Ignored => {}
         }
     }
 }
@@ -2479,7 +2478,7 @@ impl Application for BrowserApp {
             scale: 1.0,
             pointer: (0.0, 0.0),
             page_buttons: Vec::new(),
-            url: lineedit::LineEdit::with_text(url_text),
+            url: cce_ui::widget::LineEdit::with_text(url_text),
             url_focused: false,
             chrome_open: false,
             chrome_t: 0.0,
@@ -3145,18 +3144,18 @@ impl Application for BrowserApp {
                 // No field: Enter accepts, Escape cancels, nothing else acts.
                 Some(_) => match (&event.logical_key, event.state) {
                     (Key::Named(NamedKey::Enter), ElementState::Pressed) => {
-                        lineedit::EditOutcome::Submit
+                        cce_ui::widget::EditOutcome::Submit
                     }
                     (Key::Named(NamedKey::Escape), ElementState::Pressed) => {
-                        lineedit::EditOutcome::Cancel
+                        cce_ui::widget::EditOutcome::Cancel
                     }
-                    _ => lineedit::EditOutcome::Ignored,
+                    _ => cce_ui::widget::EditOutcome::Ignored,
                 },
-                None => lineedit::EditOutcome::Ignored,
+                None => cce_ui::widget::EditOutcome::Ignored,
             };
             match outcome {
-                lineedit::EditOutcome::Submit => self.close_modal(true),
-                lineedit::EditOutcome::Cancel => self.close_modal(false),
+                cce_ui::widget::EditOutcome::Submit => self.close_modal(true),
+                cce_ui::widget::EditOutcome::Cancel => self.close_modal(false),
                 _ => {}
             }
             return None;
