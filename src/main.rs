@@ -592,6 +592,10 @@ struct BrowserApp {
     accounts: accounts::Accounts,
     /// Hosts the person said never to offer saving on.
     never_save: accounts::NeverSave,
+    /// The `browser.raindrop` setting, shared live with the sync worker,
+    /// which is started the first time it is on (RAINDROP-SYNC.md).
+    raindrop_on: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    raindrop_started: bool,
     /// A new sign-in waiting for Save / Never / Not now.
     #[cfg(feature = "wpe")]
     save_offer: Option<SaveOffer>,
@@ -1814,6 +1818,11 @@ impl BrowserApp {
                 self.ac_menu = None;
             }
         }
+        self.raindrop_on.store(new.raindrop, std::sync::atomic::Ordering::SeqCst);
+        if new.raindrop && !self.raindrop_started {
+            raindrop::sync::spawn(self.host.bookmarks(), self.raindrop_on.clone());
+            self.raindrop_started = true;
+        }
         self.host.set_history_enabled(new.history);
         self.host.set_color_scheme_dark(new.color_scheme.is_dark());
         self.host.set_force_dark(new.color_scheme.forces_dark());
@@ -2440,6 +2449,11 @@ impl Application for BrowserApp {
         #[cfg(feature = "wpe")]
         host.set_accounts_enabled(settings.accounts);
         let accounts = accounts::Accounts::spawn(sender.clone());
+        let raindrop_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(settings.raindrop));
+        let raindrop_started = settings.raindrop;
+        if raindrop_started {
+            raindrop::sync::spawn(host.bookmarks(), raindrop_on.clone());
+        }
         let favorites = host.favorites();
         let favs = favorites.snapshot();
         let bookmarks = host.bookmarks();
@@ -2475,6 +2489,8 @@ impl Application for BrowserApp {
             scroll_sent: (0.0, 0.0),
             accounts,
             never_save: accounts::NeverSave::load(),
+            raindrop_on,
+            raindrop_started,
             #[cfg(feature = "wpe")]
             save_offer: None,
             #[cfg(feature = "wpe")]

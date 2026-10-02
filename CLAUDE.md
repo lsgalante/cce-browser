@@ -29,6 +29,7 @@ Sixteen files, ~8.8k lines. The ten that carry the design:
 | `src/settings.rs` | the per-app KDL config |
 | `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, which entries a host earns, saving a new login, and the never-save list |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
+| `src/raindrop/` | bookmark sync with Raindrop.io's Unsorted: the three-way merge (`mod.rs`), the REST client (`api.rs`), the worker and status line (`sync.rs`) — design in RAINDROP-SYNC.md |
 
 ## Build
 
@@ -534,6 +535,19 @@ run it `--foreground` in the background so one process owns the bus name.
 `examples/wpe_autofill.rs` covers the engine side (frames, relay, fill, submit,
 focus gating) with no keyring at all.
 
+## Raindrop bookmark sync
+
+With `browser.raindrop` on, bookmarks sync with Raindrop.io's **Unsorted**
+collection: a worker thread polls the in-memory bookmarks, runs a three-way
+merge against `raindrop-sync.tsv` (the pairs as of the last pass), and shows
+its status on `cce://bookmarks`. **Read `RAINDROP-SYNC.md` before touching
+`src/raindrop/`** — every rule in the merge (identity by Raindrop id, only link
+and title ever sent, the deletion guard, the base recording what *happened*)
+exists because the alternative silently deletes or duplicates bookmarks. The
+token is a keyring entry `service=raindrop.io` with no `UserName`;
+`cce-browser --raindrop-plan` is a read-only dry run against the real account,
+and `CCE_RAINDROP_API` points everything at a stand-in for testing.
+
 ## `cce://` pages
 
 `CceProtocol` registers the `cce` scheme with Servo's `ProtocolRegistry`, so
@@ -606,7 +620,7 @@ must never carry an index across a lock boundary.
 in `handle_focus_change` — so edits made in **cce-system-interface's Browser page**
 (`../cce-system-interface/src/pages/browser.rs`, which owns the writing side) apply on
 the next switch back. Keep the key names in `settings.rs` and that page in sync;
-`external-browser` is currently read here with no UI writing it.
+`external-browser` and `raindrop` are currently read here with no UI writing them.
 
 Servo persists per-profile state (cookie jar, auth cache, HSTS) only when given a
 `config_dir` — without one every launch starts logged out of every site. It lives at

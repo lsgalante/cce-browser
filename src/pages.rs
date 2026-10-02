@@ -193,12 +193,96 @@ impl History {
 pub struct Bookmarks {
     entries: Mutex<Vec<Entry>>,
     path: PathBuf,
+    /// The Raindrop sync's last word, for the page to show. `None` while the
+    /// sync is off.
+    sync_note: Mutex<Option<SyncNote>>,
+    /// Raised by the page's sync links for the sync worker to pick up — the
+    /// handler cannot do network work itself. 1 = sync now, 2 = run the
+    /// refused pass anyway.
+    sync_request: std::sync::atomic::AtomicU8,
 }
+
+/// What the Raindrop sync last said, shown on `cce://bookmarks`.
+#[derive(Clone, Debug, Default)]
+pub struct SyncNote {
+    pub text: String,
+    /// When it was said, for "3m ago".
+    pub at: u64,
+    /// Set when a pass was refused: the code the "sync anyway" link must
+    /// carry. Random per refusal, so a page that links to `cce://` cannot
+    /// force a mass deletion — it cannot read this page to learn the code.
+    pub force_code: Option<u64>,
+}
+
+pub const SYNC_NOW: u8 = 1;
+pub const SYNC_FORCE: u8 = 2;
 
 impl Bookmarks {
     pub fn load() -> Self {
-        let path = state_dir().join("bookmarks.tsv");
-        Self { entries: Mutex::new(read_tsv(&path)), path }
+        Self::at(state_dir().join("bookmarks.tsv"))
+    }
+
+    pub(crate) fn at(path: PathBuf) -> Self {
+        Self {
+            entries: Mutex::new(read_tsv(&path)),
+            path,
+            sync_note: Mutex::new(None),
+            sync_request: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    /// Edit every row at once, under the lock, and write the file — the
+    /// Raindrop sync's way in, so a whole pass lands as one change that no
+    /// star or remove can interleave with. Fields are sanitized on the way
+    /// back: a title from elsewhere can hold a tab or a newline, and this
+    /// format has no escaping.
+    pub fn edit_rows<R>(&self, f: impl FnOnce(&mut Vec<(u64, String, String)>) -> R) -> R {
+        let mut entries = self.entries.lock().unwrap();
+        let mut rows: Vec<_> =
+            entries.iter().map(|e| (e.ts, e.url.clone(), e.title.clone())).collect();
+        let out = f(&mut rows);
+        *entries = rows
+            .into_iter()
+            .map(|(ts, url, title)| Entry { ts, url: sanitize(&url), title: sanitize(&title) })
+            .collect();
+        write_tsv(&self.path, &entries);
+        out
+    }
+
+    pub fn set_sync_note(&self, note: Option<SyncNote>) {
+        *self.sync_note.lock().unwrap() = note;
+    }
+
+    /// The "sync anyway" code on the page right now, if a refusal is showing.
+    pub fn sync_force_code(&self) -> Option<u64> {
+        self.sync_note.lock().unwrap().as_ref().and_then(|n| n.force_code)
+    }
+
+    /// The page's pending sync request, cleared as it is read.
+    pub fn take_sync_request(&self) -> u8 {
+        self.sync_request.swap(0, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The sync status line and its links, or nothing while the sync is off.
+    fn sync_html(&self) -> String {
+        let Some(note) = self.sync_note.lock().unwrap().clone() else {
+            return String::new();
+        };
+        let ago = now().saturating_sub(note.at);
+        let ago = match ago {
+            0..=59 => "just now".to_string(),
+            60..=3599 => format!("{}m ago", ago / 60),
+            _ => format!("{}h ago", ago / 3600),
+        };
+        let force = note
+            .force_code
+            .map(|c| format!(" <a class=rm href=\"cce://bookmarks/sync-force?code={c}\">sync anyway</a>"))
+            .unwrap_or_default();
+        format!(
+            "<div class=e><span class=w></span><span class=u>Raindrop: {} · {ago}</span>\
+             <a class=rm href=\"cce://bookmarks/sync\">sync now</a>{force}</div>\n",
+            html_escape(&note.text)
+        )
     }
 
     pub fn contains(&self, url: &str) -> bool {
@@ -296,6 +380,8 @@ impl Bookmarks {
         } else {
             rows
         };
+        drop(entries);
+        let body = format!("{}{body}", self.sync_html());
         page("Bookmarks", &meta, &body, "")
     }
 }
@@ -539,6 +625,21 @@ impl CceProtocol {
                 }
                 Some(self.bookmarks.html(&self.favorites))
             }
+            "bookmarks/sync" => {
+                self.bookmarks.sync_request.store(SYNC_NOW, std::sync::atomic::Ordering::SeqCst);
+                Some(self.bookmarks.html(&self.favorites))
+            }
+            // Only with the code the refusal put on this page: forcing a pass
+            // the guard refused is how a mass deletion happens on purpose, and
+            // it must not happen because some web page linked here.
+            "bookmarks/sync-force" => {
+                let expected = self.bookmarks.sync_note.lock().unwrap().as_ref().and_then(|n| n.force_code);
+                let given = param("code").and_then(|c| c.parse::<u64>().ok());
+                if expected.is_some() && given == expected {
+                    self.bookmarks.sync_request.store(SYNC_FORCE, std::sync::atomic::Ordering::SeqCst);
+                }
+                Some(self.bookmarks.html(&self.favorites))
+            }
             "favorites" => Some(self.favorites.html()),
             // Adding lands on the favorites page so the new pill's place in
             // the strip is visible right away. A bookmark promoted without a
@@ -589,6 +690,43 @@ impl CceProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_links_raise_requests_and_force_needs_the_code() {
+        let dir = std::env::temp_dir().join(format!("cce-browser-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proto = CceProtocol {
+            history: Arc::new(History { entries: Mutex::new(Vec::new()), path: dir.join("history.tsv") }),
+            bookmarks: Arc::new(Bookmarks::at(dir.join("bookmarks.tsv"))),
+            favorites: Arc::new(Favorites { entries: Mutex::new(Vec::new()), path: dir.join("favorites.tsv") }),
+            downloads: Arc::new(crate::downloads::Downloads::default()),
+            clear_cookies: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let b = &proto.bookmarks;
+        // Off: no status line at all.
+        assert!(!proto.route("cce://bookmarks").unwrap().contains("Raindrop:"));
+
+        b.set_sync_note(Some(SyncNote { text: "synced".into(), at: now(), force_code: None }));
+        assert!(proto.route("cce://bookmarks").unwrap().contains("Raindrop: synced · just now"));
+        proto.route("cce://bookmarks/sync");
+        assert_eq!(b.take_sync_request(), SYNC_NOW);
+        assert_eq!(b.take_sync_request(), 0, "a request is taken once");
+
+        // Forcing needs a refusal, and its code.
+        proto.route("cce://bookmarks/sync-force?code=7");
+        assert_eq!(b.take_sync_request(), 0, "nothing was refused");
+        b.set_sync_note(Some(SyncNote { text: "refused".into(), at: now(), force_code: Some(42) }));
+        assert!(proto.route("cce://bookmarks").unwrap().contains("sync-force?code=42"));
+        proto.route("cce://bookmarks/sync-force?code=7");
+        assert_eq!(b.take_sync_request(), 0, "the wrong code forces nothing");
+        proto.route("cce://bookmarks/sync-force?code=42");
+        assert_eq!(b.take_sync_request(), SYNC_FORCE);
+
+        // A pass's edit sanitizes what it writes.
+        b.edit_rows(|rows| rows.push((1, "https://a.test/".into(), "two\nlines\there".into())));
+        assert_eq!(b.rows(), vec![(1, "https://a.test/".to_string(), "two lines here".to_string())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A favorites store in a scratch directory of this TEST's own.
     ///
@@ -651,7 +789,7 @@ mod tests {
     fn bookmarks_list_newest_first_with_labelled_entries() {
         let dir = std::env::temp_dir().join(format!("cce-browser-bm-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let b = Bookmarks { entries: Mutex::new(Vec::new()), path: dir.join("bookmarks.tsv") };
+        let b = Bookmarks::at(dir.join("bookmarks.tsv"));
         b.toggle("https://www.first.example/a", "First");
         b.toggle("https://second.example/b", "");
         let seen: Vec<(String, String)> =

@@ -1,10 +1,11 @@
 # Bookmark sync with Raindrop.io
 
-Status: **phase 2 done** (2026-10-02). Phase 1 is the merge, the deletion
-guard, the sync state file and applying a plan locally (`src/raindrop/mod.rs`);
-phase 2 is the REST client, the keyring token and a read-only dry run
-(`src/raindrop/api.rs`, `cce-browser --raindrop-plan`). 25 unit tests, the
-client's against a stand-in server. Nothing syncs on its own yet — phase 3.
+Status: **phase 3 done** (2026-10-02) — the browser syncs on its own when
+`browser.raindrop` is on. Phase 1 is the merge (`src/raindrop/mod.rs`), phase 2
+the REST client, keyring token and `cce-browser --raindrop-plan` dry run
+(`src/raindrop/api.rs`), phase 3 the worker and the status line
+(`src/raindrop/sync.rs`). 30 unit tests, plus one for the page links; phase 3 was also run end to end in a
+shadow session against a stand-in Raindrop and a throwaway keyring.
 
 ## Decisions
 
@@ -103,13 +104,50 @@ offered to a login form. A locked keyring is an error, never a prompt.
 `bookmarks.tsv` and the base, prints it, and changes nothing. It runs ahead of
 the single-instance hand-off, so it works while the browser is open.
 
-## Phase 3 — wiring
+## Phase 3 — the worker (done)
 
-The worker, the debounce, `apply_local` against `pages::Bookmarks` under its
-lock, `save_base` last. A one-line status on `cce://bookmarks` ("synced 3m
-ago", or why not, including a refused plan with a way to force it). Setting
-`browser.raindrop` (off by default); its writing side belongs to
-cce-system-interface's Browser page — keep the key names in sync.
+`browser.raindrop` (KDL, `browser { raindrop (bool)true }`, off by default) is
+read at launch and on every focus like the other settings; the worker thread
+`cce-raindrop` starts the first time it is on and idles while it is off. Its
+writing side belongs to cce-system-interface's Browser page and does not exist
+yet — like `external-browser`, it is edited by hand for now. Choices:
+
+- **It polls the bookmarks every 2 s instead of being told about edits.** A
+  bookmark changes from the star, Ctrl+D, the bookmarks menu and the
+  `cce://bookmarks` page; comparing the in-memory rows (no I/O) catches all of
+  them with no hook in each. A change syncs once it has held still for one
+  poll, so a burst of edits is one pass. A full pass every 10 minutes brings
+  Raindrop's side; the page's "sync now" asks for one at once.
+- **A pass's local half is one locked edit** (`Bookmarks::edit_rows`), so no
+  star or remove can land in the middle of it, and it is skipped entirely when
+  the plan changes nothing here — an idle pass never rewrites the file. The
+  worker re-reads the rows after its own pass, so its edits are not mistaken
+  for the person's.
+- **Titles are flattened where they arrive** (`api::parse_item`): a tab or a
+  line break in a Raindrop title would otherwise be flattened by the TSV store
+  and read as "renamed in Raindrop" on every pass.
+- **A skipped link edit leaves the base** (`settle_base`): otherwise its pair
+  would point at a URL that is not here and the next pass would trash
+  Raindrop's copy.
+- **The status line lives on `cce://bookmarks`**, set by the worker through
+  `Bookmarks::set_sync_note`: what the last pass did and when, with "sync now".
+  A refused pass shows why and a **"sync anyway"** link carrying a random code
+  that `cce://bookmarks/sync-force` checks — a web page linking to `cce://`
+  cannot force a mass deletion, since it cannot read the page to learn the
+  code. The code holds for as long as passes keep being refused (a periodic
+  pass, a reload); a fresh one each time made the link on screen stale, which
+  is how the end-to-end run found it. After a forced pass the code is gone, so
+  reloading its URL forces nothing.
+- The page is static: the line is as of the page's load, and reloading
+  `cce://bookmarks/sync` asks for another (harmless) pass.
+
+**Testing without an account:** `CCE_RAINDROP_API=<base url>` points the
+client at a stand-in (it logs a warning when it does). The end-to-end run used
+a ~60-line Python stand-in for Unsorted (GET/POST/PUT/DELETE, held in memory),
+a throwaway keyring holding a fake token (the autofill section of CLAUDE.md has
+the recipe and its two traps), and checked: first pass imports and creates; a
+local remove trashes; a rename and a save on the "phone" arrive; an emptied
+collection is refused with the bookmarks untouched; "sync anyway" runs it.
 
 ## Phase 4 — favorites (optional)
 

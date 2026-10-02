@@ -92,6 +92,10 @@ pub struct Settings {
     /// single switch for the whole feature: with it off the browser injects
     /// no watcher script and never opens the keyring.
     pub accounts: bool,
+    /// Sync bookmarks with Raindrop.io's Unsorted collection
+    /// (RAINDROP-SYNC.md). Off by default: it needs a token in the keyring,
+    /// and it writes to an account elsewhere.
+    pub raindrop: bool,
     /// Window edge the utility bar floats against.
     pub bar_position: BarPosition,
     /// What pages are told to prefer.
@@ -109,6 +113,7 @@ impl Default for Settings {
             download_dir: None,
             history: true,
             accounts: true,
+            raindrop: false,
             bar_position: BarPosition::Top,
             color_scheme: ColorScheme::Dark,
             external_browser: None,
@@ -152,6 +157,7 @@ pub fn load() -> Settings {
         download_dir,
         history: b["history"].as_bool().unwrap_or(true),
         accounts: b["accounts"].as_bool().unwrap_or(true),
+        raindrop: b["raindrop"].as_bool().unwrap_or(false),
         bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
         color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("dark")),
         external_browser: b["external-browser"]

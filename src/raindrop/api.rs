@@ -64,8 +64,17 @@ pub struct Client {
 }
 
 impl Client {
+    /// The real Raindrop — or, when `CCE_RAINDROP_API` is set, a stand-in at
+    /// that base URL, which is how the whole browser is tested end to end
+    /// without writing to an account.
     pub fn new(token: Secret) -> Self {
-        Self::with_base(token, BASE)
+        match std::env::var("CCE_RAINDROP_API") {
+            Ok(base) if !base.is_empty() => {
+                log::warn!("raindrop: using the stand-in API at {base}");
+                Self::with_base(token, &base)
+            }
+            _ => Self::with_base(token, BASE),
+        }
     }
 
     /// Against another server — the tests' stand-in.
@@ -184,10 +193,14 @@ impl Client {
 fn parse_item(v: &serde_json::Value) -> Result<Remote, ApiError> {
     let id = v["_id"].as_u64().ok_or_else(|| ApiError::Parse("an item has no _id".into()))?;
     let link = v["link"].as_str().ok_or_else(|| ApiError::Parse(format!("item {id} has no link")))?;
+    // Tabs and line breaks become spaces here, at the source: the local
+    // store has no escaping and flattens them, and a title that differed
+    // only in that way would read as renamed in Raindrop on every pass.
+    let flat = |s: &str| s.replace(['\t', '\n', '\r'], " ");
     Ok(Remote {
         id,
-        link: link.to_string(),
-        title: v["title"].as_str().unwrap_or_default().to_string(),
+        link: flat(link),
+        title: flat(v["title"].as_str().unwrap_or_default()),
         created: v["created"].as_str().and_then(iso8601_secs).unwrap_or(0),
     })
 }
@@ -302,14 +315,14 @@ pub fn describe(plan: &Plan, local: &[Local], remote: &[Remote], base: &[Synced]
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::{Arc, Mutex};
 
     /// A stand-in Raindrop: answers each request with the next scripted
     /// `(status, extra headers, body)` and records `(request line, body)`.
-    fn server(script: Vec<(u16, &'static str, String)>) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+    pub(in crate::raindrop) fn server(script: Vec<(u16, &'static str, String)>) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -354,7 +367,7 @@ mod tests {
         (base, seen)
     }
 
-    fn items(range: std::ops::Range<u64>, count: usize) -> String {
+    pub(in crate::raindrop) fn items(range: std::ops::Range<u64>, count: usize) -> String {
         let items: Vec<_> = range
             .map(|i| serde_json::json!({
                 "_id": i, "link": format!("https://{i}.test/"), "title": format!("t{i}"),
@@ -445,6 +458,12 @@ mod tests {
         assert_eq!(applied.created, vec![("https://b.test/".to_string(), 8)]);
         assert_eq!(applied.failed_trash, vec![3]);
         assert_eq!(applied.errors.len(), 2);
+    }
+
+    #[test]
+    fn titles_are_flattened_where_they_arrive() {
+        let r = parse_item(&serde_json::json!({"_id": 1, "link": "https://a.test/", "title": "two\nlines\tand tab"})).unwrap();
+        assert_eq!(r.title, "two lines and tab");
     }
 
     #[test]

@@ -25,10 +25,8 @@
 //! * **Raindrop's duplicates are left alone.** Locally a URL is a key; a second
 //!   Raindrop entry for a link already here is neither imported nor removed.
 
-// Not wired into the browser until phase 3; the tests exercise all of it.
-#![allow(dead_code)]
-
 pub mod api;
+pub mod sync;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -292,18 +290,30 @@ pub fn guard(plan: &Plan, local_len: usize, remote_len: usize, base_len: usize) 
     None
 }
 
+/// What [`apply_local`] left undone.
+#[derive(Debug, Default, PartialEq)]
+pub struct Skipped {
+    pub count: usize,
+    /// The *new* URLs of link edits not applied. Their pairs must leave the
+    /// base: it would pair the id with a URL that is not here, and the next
+    /// pass would read that as "deleted here" and trash the Raindrop copy.
+    /// Dropped from the base, the two simply re-pair (or both survive).
+    pub relinks: Vec<String>,
+}
+
 /// Apply a plan's local half to the bookmarks as they are **now**.
 ///
 /// The plan was made from a `snapshot`, and the person may have bookmarked or
 /// removed something while Raindrop was answering. An operation on a URL whose
 /// entry is not what the snapshot had is skipped — the next pass sees the new
 /// state and plans again — so a local edit is never overwritten by a stale
-/// plan. Returns how many were skipped.
-pub fn apply_local(current: &mut Vec<Local>, snapshot: &[Local], plan: &Plan) -> usize {
+/// plan.
+pub fn apply_local(current: &mut Vec<Local>, snapshot: &[Local], plan: &Plan) -> Skipped {
     let unchanged = |current: &Vec<Local>, url: &str| {
         current.iter().find(|l| l.url == url) == snapshot.iter().find(|l| l.url == url)
     };
     let mut skipped = 0;
+    let mut relinks = Vec::new();
     for (old, new) in &plan.relink_local {
         if unchanged(current, old) && !current.iter().any(|l| l.url == *new) {
             if let Some(l) = current.iter_mut().find(|l| l.url == *old) {
@@ -311,12 +321,14 @@ pub fn apply_local(current: &mut Vec<Local>, snapshot: &[Local], plan: &Plan) ->
             }
         } else {
             skipped += 1;
+            relinks.push(new.clone());
         }
     }
     for (url, title) in &plan.rename_local {
         // Renames address the post-relink URL; a relinked entry was checked
         // against the snapshot by its old one above.
-        let relinked = plan.relink_local.iter().any(|(_, n)| n == url);
+        let relinked =
+            plan.relink_local.iter().any(|(_, n)| n == url) && !relinks.contains(url);
         if relinked || unchanged(current, url) {
             if let Some(l) = current.iter_mut().find(|l| l.url == *url) {
                 l.title = title.clone();
@@ -341,7 +353,15 @@ pub fn apply_local(current: &mut Vec<Local>, snapshot: &[Local], plan: &Plan) ->
     }
     // Local order is bookmarking time; an import lands where it was made.
     current.sort_by_key(|l| l.ts);
-    skipped
+    Skipped { count: skipped, relinks }
+}
+
+/// The base to save after a pass: `base_after`, minus the pairs of link edits
+/// that were skipped here (see [`Skipped::relinks`]).
+pub fn settle_base(plan: &Plan, prior: &[Synced], applied: &api::Applied, skipped: &Skipped) -> Vec<Synced> {
+    let mut base = plan.base_after(prior, applied);
+    base.retain(|b| !skipped.relinks.contains(&b.url));
+    base
 }
 
 /// `cce-browser --raindrop-plan`: fetch Unsorted, plan a pass against the
@@ -445,7 +465,7 @@ mod tests {
             created.push((c.url.clone(), id));
         }
         let mut local_now = local.to_vec();
-        assert_eq!(apply_local(&mut local_now, local, &p), 0);
+        assert_eq!(apply_local(&mut local_now, local, &p).count, 0);
         let applied = api::Applied { created, ..Default::default() };
         (local_now, remote, p.base_after(base, &applied))
     }
@@ -625,10 +645,26 @@ mod tests {
         };
         // Meanwhile: a.test re-bookmarked with a new title, c.test bookmarked.
         let mut current = vec![l("https://a.test/", "A again", 5), l("https://b.test/", "B", 2), l("https://c.test/", "mine", 6)];
-        assert_eq!(apply_local(&mut current, &snapshot, &p), 2);
+        assert_eq!(apply_local(&mut current, &snapshot, &p).count, 2);
         assert!(current.iter().any(|x| x.url == "https://a.test/" && x.title == "A again"));
         assert!(current.iter().any(|x| x.url == "https://b.test/" && x.title == "B2"));
         assert!(current.iter().any(|x| x.url == "https://c.test/" && x.title == "mine"));
+    }
+
+    #[test]
+    fn a_skipped_link_edit_cannot_become_a_deletion() {
+        let prior = [s(1, "http://old.test/", "P")];
+        let snapshot = vec![l("http://old.test/", "P", 1)];
+        let remote = [r(1, "https://new.test/", "P")];
+        let p = plan(&snapshot, &remote, &prior).unwrap();
+        // Mid-pass the person re-bookmarked the old link with a new title.
+        let mut current = vec![l("http://old.test/", "P again", 9)];
+        let skipped = apply_local(&mut current, &snapshot, &p);
+        assert_eq!(skipped.relinks, vec!["https://new.test/".to_string()]);
+        let base = settle_base(&p, &prior, &api::Applied::default(), &skipped);
+        let next = plan(&current, &remote, &base).unwrap();
+        assert!(next.trash_remote.is_empty(), "Raindrop's copy is not trashed");
+        assert!(next.delete_local.is_empty(), "and neither is the local one");
     }
 
     #[test]
