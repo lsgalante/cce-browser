@@ -194,6 +194,14 @@ pub struct WebKitHost {
     /// Kept so a tab made active later inherits it: focus belongs to the view,
     /// and only the active tab's view should have it.
     window_focused: bool,
+    /// The pointer buttons the page is holding, as `WPE_MODIFIER_POINTER_*`
+    /// bits, stamped on every pointer event.
+    ///
+    /// WebKit reads a drag off the *move* event's own modifiers, not off the
+    /// press it saw earlier: a move reporting no held button is a hover, so
+    /// press-drag-release over text selected nothing (and dragged nothing)
+    /// while every move went out with an empty mask.
+    held_buttons: Cell<WPEModifiers::Type>,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -348,6 +356,7 @@ impl WebKitHost {
                 watcher: None,
                 spare: None,
                 window_focused: false,
+                held_buttons: Cell::new(0),
             };
             // The account watcher's channel, in its own script world. Both
             // halves are registered here, once, on the shared content
@@ -1139,7 +1148,7 @@ impl WebKitHost {
                 view,
                 WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
                 input::now_ms(),
-                0,
+                self.held_buttons.get(),
                 x,
                 y,
                 0.0,
@@ -1164,6 +1173,15 @@ impl WebKitHost {
             } else {
                 0
             };
+            // The mask describes the state *after* this event, which is
+            // what a DOM `buttons` reads on mousedown and mouseup.
+            let bit = input::button_modifier(n);
+            let held = if pressed {
+                self.held_buttons.get() | bit
+            } else {
+                self.held_buttons.get() & !bit
+            };
+            self.held_buttons.set(held);
             let e = wpe_event_pointer_button_new(
                 if pressed {
                     WPEEventType::WPE_EVENT_POINTER_DOWN
@@ -1173,7 +1191,7 @@ impl WebKitHost {
                 view,
                 WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
                 time,
-                0,
+                held,
                 n,
                 x,
                 y,

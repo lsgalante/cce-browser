@@ -110,6 +110,16 @@ pub(super) fn button_number(b: MouseButton) -> Option<u32> {
     })
 }
 
+/// An X11 button number's held-button bit, the form a pointer event's
+/// modifiers carry it in (`WPE_MODIFIER_POINTER_BUTTON1` is button 1, and the
+/// five are consecutive).
+pub(super) fn button_modifier(n: u32) -> WPEModifiers::Type {
+    match n {
+        1..=5 => WPEModifiers::WPE_MODIFIER_POINTER_BUTTON1 << (n - 1),
+        _ => 0,
+    }
+}
+
 pub(super) fn modifiers(ctrl: bool, shift: bool, alt: bool) -> WPEModifiers::Type {
     let mut m: WPEModifiers::Type = 0;
     if ctrl {
