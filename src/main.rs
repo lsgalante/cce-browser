@@ -2692,7 +2692,7 @@ impl Application for BrowserApp {
                 // compositor deliberately answers it with an attention
                 // notification, not focus.)
                 std::thread::spawn(|| {
-                    let _ = cce_ui::ipc::send_command("cce", "focus-window cce-browser");
+                    let _ = cce_ui::ipc::focus_window("cce-browser");
                 });
                 *needs_rebuild = true;
             }
