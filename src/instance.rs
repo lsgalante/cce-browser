@@ -89,6 +89,9 @@ fn try_forward(path: &str, arg: Option<&str>) -> bool {
     }
     // Wait for the ack: returning (and exiting) on write alone races the
     // instance actually reading the line.
+    // Bounded: an instance whose listener is stuck must not hang this
+    // launch forever; unanswered, the launch is not forwarded.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply).is_ok()
 }
@@ -103,11 +106,9 @@ pub fn spawn_listener(sender: calloop::channel::Sender<Message>) {
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
-            let mut reader = BufReader::new(conn);
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_err() {
+            let Some(line) = read_request_line(&conn, 64 * 1024, std::time::Duration::from_secs(2)) else {
                 continue;
-            }
+            };
             let msg = match parse_command(line.trim()) {
                 Some(m) => m,
                 None => continue,
@@ -115,7 +116,7 @@ pub fn spawn_listener(sender: calloop::channel::Sender<Message>) {
             if sender.send(msg).is_err() {
                 return; // channel gone: the app is shutting down
             }
-            let _ = reader.get_mut().write_all(b"ok\n");
+            let _ = (&conn).write_all(b"ok\n");
         }
     });
 }
@@ -158,4 +159,39 @@ mod tests {
         assert!(parse_command("open ").is_none());
         assert!(parse_command("bogus").is_none());
     }
+}
+
+/// One request line from a control-socket client, bounded in size and in
+/// TOTAL time. Until 2026-10-02 this was `BufReader::read_line` on a socket
+/// with no timeout at all, so a client that connected and said nothing (or trickled a
+/// byte at a time) held the listener thread for good, and every later
+/// launch forwarded to it (a link opened from another app) waited behind. None on EOF before any byte, timeout,
+/// overflow or a read error.
+fn read_request_line(conn: &std::os::unix::net::UnixStream, limit: usize, deadline: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    let until = std::time::Instant::now() + deadline;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let mut reader = conn;
+    loop {
+        let left = until.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero())?;
+        conn.set_read_timeout(Some(left)).ok()?;
+        let n = reader.read(&mut chunk).ok()?;
+        if n == 0 {
+            if buf.is_empty() {
+                return None;
+            }
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(end) = buf.iter().position(|&b| b == b'\n') {
+            buf.truncate(end + 1);
+            break;
+        }
+        if buf.len() > limit {
+            return None;
+        }
+    }
+    let _ = conn.set_read_timeout(None);
+    String::from_utf8(buf).ok()
 }
