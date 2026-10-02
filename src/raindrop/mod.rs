@@ -28,8 +28,17 @@
 // Not wired into the browser until phase 3; the tests exercise all of it.
 #![allow(dead_code)]
 
+pub mod api;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// A Raindrop bookmark's id (`_id` in the API).
 pub type RaindropId = u64;
@@ -96,13 +105,31 @@ impl Plan {
             && self.add_local.is_empty()
     }
 
-    /// The base to save once the remote side has been applied. `created` maps
-    /// each local URL Raindrop accepted to the id it gave it; a create that
-    /// failed is simply absent, stays out of the base, and is tried again
-    /// next pass as "new here" — never misread as a deletion.
-    pub fn base_after(&self, created: &[(String, RaindropId)]) -> Vec<Synced> {
+    /// The base to save once the remote side has been applied (`prior` is the
+    /// base the plan was made from). It must describe what *happened*, not
+    /// what was planned, or the next pass misreads a failure:
+    ///
+    /// * a create that failed stays out of the base, so it is tried again as
+    ///   "new here" — never read as deleted in Raindrop;
+    /// * a trash that failed keeps its old pair, so it is tried again — not
+    ///   re-imported as "new in Raindrop";
+    /// * a rename that failed keeps its old title, so Raindrop's unchanged
+    ///   title is not read as Raindrop renaming it back.
+    pub fn base_after(&self, prior: &[Synced], applied: &api::Applied) -> Vec<Synced> {
         let mut base = self.base.clone();
-        for (url, id) in created {
+        for id in &applied.failed_renames {
+            if let (Some(b), Some(old)) =
+                (base.iter_mut().find(|b| b.id == *id), prior.iter().find(|p| p.id == *id))
+            {
+                b.title = old.title.clone();
+            }
+        }
+        for id in &applied.failed_trash {
+            if let Some(old) = prior.iter().find(|p| p.id == *id) {
+                base.push(old.clone());
+            }
+        }
+        for (url, id) in &applied.created {
             if let Some(l) = self.create_remote.iter().find(|l| l.url == *url) {
                 base.push(Synced { id: *id, url: l.url.clone(), title: l.title.clone() });
             }
@@ -317,6 +344,30 @@ pub fn apply_local(current: &mut Vec<Local>, snapshot: &[Local], plan: &Plan) ->
     skipped
 }
 
+/// `cce-browser --raindrop-plan`: fetch Unsorted, plan a pass against the
+/// local bookmarks and the base, and describe it — changing nothing on either
+/// side. The way to look at a real account before anything is allowed to
+/// write to it.
+pub fn dry_run() -> Result<String, String> {
+    let local: Vec<Local> = crate::pages::Bookmarks::load()
+        .rows()
+        .into_iter()
+        .map(|(ts, url, title)| Local { url, title, ts })
+        .collect();
+    let base = load_base(&state_path());
+    let token = crate::accounts::raindrop_token()?;
+    let remote = api::Client::new(token).fetch(api::UNSORTED).map_err(|e| e.to_string())?;
+    let mut out = String::from("dry run: nothing has been changed\n\n");
+    match plan(&local, &remote, &base) {
+        Ok(p) => out.push_str(&api::describe(&p, &local, &remote, &base)),
+        Err(refused) => {
+            out.push_str(&format!("REFUSED: {}\n\n", refused.reason));
+            out.push_str(&api::describe(&refused.plan, &local, &remote, &base));
+        }
+    }
+    Ok(out)
+}
+
 /// `~/.local/state/cce/browser/raindrop-sync.tsv`.
 pub fn state_path() -> PathBuf {
     crate::pages::state_dir().join("raindrop-sync.tsv")
@@ -395,7 +446,8 @@ mod tests {
         }
         let mut local_now = local.to_vec();
         assert_eq!(apply_local(&mut local_now, local, &p), 0);
-        (local_now, remote, p.base_after(&created))
+        let applied = api::Applied { created, ..Default::default() };
+        (local_now, remote, p.base_after(base, &applied))
     }
 
     #[test]
@@ -538,10 +590,28 @@ mod tests {
     fn a_failed_create_is_retried_not_deleted() {
         let local = [l("https://new.test/", "N", 1)];
         let p = plan(&local, &[], &[]).unwrap();
-        let base = p.base_after(&[]); // Raindrop refused the create
+        let base = p.base_after(&[], &api::Applied::default()); // Raindrop refused the create
         let again = plan(&local, &[], &base).unwrap();
         assert_eq!(again.create_remote.len(), 1);
         assert!(again.delete_local.is_empty());
+    }
+
+    #[test]
+    fn failed_trash_and_rename_are_retried_not_reversed() {
+        let prior = [s(1, "https://a.test/", "A"), s(2, "https://b.test/", "B")];
+        // a.test deleted here; b.test renamed here.
+        let local = [l("https://b.test/", "B new", 2)];
+        let remote = [r(1, "https://a.test/", "A"), r(2, "https://b.test/", "B")];
+        let p = plan(&local, &remote, &prior).unwrap();
+        assert_eq!((p.trash_remote.clone(), p.rename_remote.clone()), (vec![1], vec![(2, "B new".to_string())]));
+        // Both calls fail.
+        let applied = api::Applied { failed_trash: vec![1], failed_renames: vec![2], ..Default::default() };
+        let base = p.base_after(&prior, &applied);
+        let again = plan(&local, &remote, &base).unwrap();
+        assert_eq!(again.trash_remote, vec![1], "the trash is retried");
+        assert!(again.add_local.is_empty(), "not re-imported");
+        assert_eq!(again.rename_remote, vec![(2, "B new".to_string())], "the rename is retried");
+        assert!(again.rename_local.is_empty(), "not reversed");
     }
 
     #[test]

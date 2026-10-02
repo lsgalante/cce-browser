@@ -229,6 +229,17 @@ impl Bookmarks {
         write_tsv(&self.path, &entries);
     }
 
+    /// Every bookmark as stored — `(ts, url, title)` in file order — for the
+    /// Raindrop sync, which needs the timestamps the menu does not.
+    pub fn rows(&self) -> Vec<(u64, String, String)> {
+        self.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| (e.ts, e.url.clone(), e.title.clone()))
+            .collect()
+    }
+
     /// The bookmarks as the chrome's menu lists them: newest first, the
     /// same order the `cce://bookmarks` page renders.
     pub fn snapshot(&self) -> Vec<Link> {

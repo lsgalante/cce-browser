@@ -1,8 +1,10 @@
 # Bookmark sync with Raindrop.io
 
-Status: **phase 1 done** (2026-10-02) — the merge, the deletion guard, the sync
-state file and applying a plan locally, all in `src/raindrop.rs` with no
-network, under 15 unit tests. Nothing is wired into the browser yet.
+Status: **phase 2 done** (2026-10-02). Phase 1 is the merge, the deletion
+guard, the sync state file and applying a plan locally (`src/raindrop/mod.rs`);
+phase 2 is the REST client, the keyring token and a read-only dry run
+(`src/raindrop/api.rs`, `cce-browser --raindrop-plan`). 25 unit tests, the
+client's against a stand-in server. Nothing syncs on its own yet — phase 3.
 
 ## Decisions
 
@@ -62,21 +64,44 @@ Rules, each with a test:
   bookmarks stay local.
 - A pass settles: re-planning a synced state is a no-op (tested end to end).
 
-## Phase 2 — the API client
+## Phase 2 — the API client (done)
 
-To confirm against Raindrop's API docs first: REST at
-`api.raindrop.io/rest/v1`; a personal **test token** (integration settings) as
-`Authorization: Bearer`, so no OAuth; `GET /raindrops/{collection}` paged 50 at
-a time (a full fetch each pass — ~20 requests per 1000 bookmarks, inside the
-~120/min limit); `POST /raindrop` to create, `PUT /raindrop/{id}` to rename
-(title only), `DELETE /raindrop/{id}` to trash. Blocking `reqwest` on the
-worker (already a dependency). A dry-run mode logs the plan and applies
-nothing — run it against the real account before anything writes.
+Checked against developer.raindrop.io on 2026-10-02: REST at
+`api.raindrop.io/rest/v1`, `Authorization: Bearer <test token>` (from the
+integration settings; test tokens do not expire), 120 requests/minute with
+`429` past it, ISO 8601 timestamps. `GET /raindrops/-1` pages Unsorted 50 at a
+time; `POST /raindrop` creates; `PUT /raindrop/{id}` is a **partial** update;
+`DELETE /raindrop/{id}` moves to Trash — and is **permanent** on an item
+already in Trash, so only ids just fetched from the live collection are ever
+trashed. Choices:
 
-**The token** lives in the keyring as an entry with no `UserName` (attribute
-`service=raindrop.io`), so cce-keyring-sync — which skips entries without
-`UserName` — never sends it to 1Password. A locked keyring skips the pass; it
-never prompts.
+- **The fetch is checked against Raindrop's `count`.** Paging is by position,
+  so a deletion between pages shifts an item past the fetch, and a missing
+  item reads as "deleted in Raindrop". Sorted oldest-first, an *addition*
+  lands on the last page; a mismatch refuses the whole pass.
+- **A failure on one item does not stop the rest**, and `base_after` records
+  what *happened*: a failed create stays out of the base (retried as new), a
+  failed trash keeps its pair (retried, not re-imported), a failed rename keeps
+  its old title (retried, not reversed). A `401` stops the pass at once.
+- **One `429` is waited out** (until `X-RateLimit-Reset`, at most a minute).
+- `reqwest` is now a plain dependency (it was Servo-only) — `blocking`, the
+  same build cce-map and cce-calendar use; JSON bodies are serialized by hand
+  rather than turning on its `json` feature, to keep it the same build.
+
+**The token** lives in the keyring as an entry with no `UserName`, found by
+`service=raindrop.io`:
+
+```sh
+secret-tool store --label='Raindrop.io token' service raindrop.io
+```
+
+cce-keyring-sync skips entries without `UserName`, so it stays on this machine
+and never goes to 1Password; the account index skips it too, so it is never
+offered to a login form. A locked keyring is an error, never a prompt.
+
+**`cce-browser --raindrop-plan`** fetches Unsorted, plans a pass against
+`bookmarks.tsv` and the base, prints it, and changes nothing. It runs ahead of
+the single-instance hand-off, so it works while the browser is open.
 
 ## Phase 3 — wiring
 

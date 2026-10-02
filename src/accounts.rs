@@ -388,6 +388,42 @@ fn save(ss: &secret_service::blocking::SecretService, login: &NewLogin) -> Resul
         .map_err(|e| format!("could not save to the keyring: {e}"))
 }
 
+/// The attribute the Raindrop.io token's keyring entry is found by.
+pub const RAINDROP_TOKEN_ATTR: (&str, &str) = ("service", "raindrop.io");
+
+/// The Raindrop.io test token, from the keyring.
+///
+/// Stored as an entry with **no `UserName`**, found by `service=raindrop.io`:
+/// cce-keyring-sync skips entries without a `UserName`, so the token stays on
+/// this machine rather than travelling to 1Password, and the account index
+/// above skips it too (no username, no URL), so it is never offered to a
+/// login form. A locked keyring is an error, never an unlock prompt — the
+/// same rule as everything else here.
+pub fn raindrop_token() -> Result<Secret, String> {
+    use secret_service::blocking::SecretService;
+    use secret_service::EncryptionType;
+    let ss = SecretService::connect(EncryptionType::Dh)
+        .map_err(|e| format!("no secret service: {e}"))?;
+    let found = ss
+        .search_items(std::collections::HashMap::from([RAINDROP_TOKEN_ATTR]))
+        .map_err(|e| format!("searching the keyring failed: {e}"))?;
+    let Some(item) = found.unlocked.first() else {
+        return Err(if found.locked.is_empty() {
+            "no Raindrop token in the keyring — store one with: \
+             secret-tool store --label='Raindrop.io token' service raindrop.io"
+                .to_string()
+        } else {
+            "the keyring is locked — unlock it in cce-secrets".to_string()
+        });
+    };
+    let bytes = item.get_secret().map_err(|_| "could not read the Raindrop token".to_string())?;
+    let token = String::from_utf8_lossy(&bytes).trim().to_string();
+    if token.is_empty() {
+        return Err("the Raindrop token in the keyring is empty".to_string());
+    }
+    Ok(Secret(token))
+}
+
 /// Hosts the person has said never to offer saving on. One host per line in
 /// `~/.local/state/cce/browser/never-save.txt`, beside history and bookmarks.
 pub struct NeverSave {

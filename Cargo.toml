@@ -16,7 +16,7 @@ default = ["wpe"]
 wpe = ["dep:rustix"]
 # The retired Servo backend, kept buildable for comparison:
 #   cargo build --release -p cce-browser --no-default-features --features servo
-servo = ["dep:servo", "dep:dpi", "dep:euclid", "dep:rustls", "dep:reqwest", "dep:http"]
+servo = ["dep:servo", "dep:dpi", "dep:euclid", "dep:rustls", "dep:http"]
 
 [dependencies]
 cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "6634ba3d690bb2125aad371eb5ef4cf10962999a" }
@@ -25,7 +25,10 @@ wayland-client = { version = "0.31", features = ["system"] }
 servo = { version = "0.4", optional = true }
 url = "2"
 http = { version = "1", optional = true }
-reqwest = { version = "0.12", features = ["blocking"], optional = true }
+# Downloads on the Servo backend, and Raindrop bookmark sync on both. The same
+# version and features cce-map and cce-calendar build, so the shared target/
+# already holds it.
+reqwest = { version = "0.12", features = ["blocking"] }
 dpi = { version = "0.1", optional = true }
 euclid = { version = "0.22", optional = true }
 rustls = { version = "0.23", features = ["aws-lc-rs"], optional = true }

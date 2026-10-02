@@ -3553,6 +3553,19 @@ impl Application for BrowserApp {
 
 fn main() {
     env_logger::init();
+    // A read-only look at what a Raindrop sync would do (RAINDROP-SYNC.md).
+    // Ahead of the instance hand-off: it is a tool, not a launch, and must
+    // work while the browser is running.
+    if std::env::args().nth(1).as_deref() == Some("--raindrop-plan") {
+        match raindrop::dry_run() {
+            Ok(report) => print!("{report}"),
+            Err(e) => {
+                eprintln!("raindrop: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     // Hand the launch to a running instance before any engine work: an
     // external open (`xdg-open` → `cce-browser %u`) becomes a tab there,
     // and this process never touches Wayland or the shared profile dir.
