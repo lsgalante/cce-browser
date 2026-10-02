@@ -190,6 +190,10 @@ pub struct WebKitHost {
     /// the colour scheme is display-level and force-dark lives in the shared
     /// user-content-manager it was built with.
     spare: Option<(*mut WebKitWebView, *mut WPEView, Rc<TabState>)>,
+    /// Whether the window holds keyboard focus, as last told by [`Self::focus`].
+    /// Kept so a tab made active later inherits it: focus belongs to the view,
+    /// and only the active tab's view should have it.
+    window_focused: bool,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -306,7 +310,12 @@ impl WebKitHost {
                 true
             }));
 
-            let toplevel = wpe_display_create_toplevel(display, 1);
+            // `0` is no view limit, and every tab's view must fit: a full
+            // toplevel refuses `wpe_view_set_toplevel` *silently*. At `1`
+            // (the spike's value) only the first tab ever attached, and every
+            // later one ran without the window's scale (rendering at half
+            // resolution on a 2x output) or its ACTIVE state (no text caret).
+            let toplevel = wpe_display_create_toplevel(display, 0);
             // Scale is 1 until the first `resize` from a real window; the
             // constructor's size is already logical.
             wpe_toplevel_resized(toplevel, size_px.0 as i32, size_px.1 as i32);
@@ -338,6 +347,7 @@ impl WebKitHost {
                 ucm: webkit_user_content_manager_new(),
                 watcher: None,
                 spare: None,
+                window_focused: false,
             };
             // The account watcher's channel, in its own script world. Both
             // halves are registered here, once, on the shared content
@@ -628,6 +638,9 @@ impl WebKitHost {
         }
         unsafe {
             if let Some(old) = self.tabs.get(self.active) {
+                if self.window_focused {
+                    wpe_view_focus_out(old.view);
+                }
                 wpe_view_unmap(old.view);
                 wpe_view_set_visible(old.view, 0);
             }
@@ -638,6 +651,9 @@ impl WebKitHost {
             wpe_view_map(tab.view);
             let (lw, lh) = self.logical_size();
             wpe_view_resized(tab.view, lw, lh);
+            if self.window_focused {
+                wpe_view_focus_in(tab.view);
+            }
         }
     }
 
@@ -1215,15 +1231,30 @@ impl WebKitHost {
         }
     }
 
-    /// Page focus. Without this the page has no focused frame and keyboard
-    /// input is dropped, which looks exactly like a broken key mapping.
-    pub fn focus(&self, focused: bool) {
+    /// Window focus, from the runner's keyboard enter/leave.
+    ///
+    /// WebKit needs **two** things before it paints a text caret: the view
+    /// focused and the toplevel `ACTIVE`. Keystrokes reach a focused field
+    /// with neither, so the only symptom of missing this is a field you can
+    /// type into with no caret in it — which shipped, unnoticed, because
+    /// nothing called this at all. `document.hasFocus()` reads the same pair;
+    /// `examples/wpe_focus.rs` checks it.
+    pub fn focus(&mut self, focused: bool) {
+        self.window_focused = focused;
         unsafe {
-            let view = self.active_tab().view;
-            if focused {
-                wpe_view_focus_in(view)
+            let state = wpe_toplevel_get_state(self.toplevel);
+            let state = if focused {
+                state | WPEToplevelState::WPE_TOPLEVEL_STATE_ACTIVE
             } else {
-                wpe_view_focus_out(view)
+                state & !WPEToplevelState::WPE_TOPLEVEL_STATE_ACTIVE
+            };
+            wpe_toplevel_state_changed(self.toplevel, state);
+            if let Some(tab) = self.tabs.get(self.active) {
+                if focused {
+                    wpe_view_focus_in(tab.view)
+                } else {
+                    wpe_view_focus_out(tab.view)
+                }
             }
         }
     }

@@ -844,7 +844,7 @@ impl ServoHost {
 
     /// Page focus. A no-op for Servo, which tracks focus itself; present so
     /// both backends accept the same call.
-    pub fn focus(&self, _focused: bool) {}
+    pub fn focus(&mut self, _focused: bool) {}
 
     /// Forward a key to the page, modifiers included.
     ///

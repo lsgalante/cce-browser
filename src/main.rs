@@ -2269,6 +2269,8 @@ impl Application for BrowserApp {
     }
 
     fn handle_focus_change(&mut self, focused: bool, needs_rebuild: &mut bool) {
+        // The page's own focus: without it WebKit paints no text caret.
+        self.host.focus(focused);
         // A settings change can move the bar to the other edge, so a reload
         // that changed anything has to redraw the chrome.
         if focused && self.reload_settings() {
