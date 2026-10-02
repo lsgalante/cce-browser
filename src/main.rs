@@ -308,7 +308,7 @@ impl CtxMenu {
     }
 
     fn item_at(&self, x: f32, y: f32) -> Option<usize> {
-        (0..self.items.len()).find(|&i| hit(&self.row_rect(i), x, y))
+        (0..self.items.len()).find(|&i| self.row_rect(i).contains(x, y))
     }
 }
 
@@ -623,9 +623,6 @@ struct BrowserApp {
     fav_hover: Option<usize>,
 }
 
-fn hit(r: &Rect, x: f32, y: f32) -> bool {
-    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-}
 
 /// The floating utility bar, overlaid on the page content. Anchored to the
 /// top or bottom window edge per the config; the page is full-bleed either
@@ -1196,10 +1193,10 @@ impl BrowserApp {
     #[cfg(feature = "wpe")]
     fn save_click(&mut self, x: f32, y: f32) -> bool {
         let Some(layout) = self.save_layout() else { return false };
-        if !hit(&layout.plate, x, y) {
+        if !layout.plate.contains(x, y) {
             return false;
         }
-        let Some((_, button)) = layout.buttons.iter().find(|(r, _)| hit(r, x, y)) else {
+        let Some((_, button)) = layout.buttons.iter().find(|(r, _)| r.contains(x, y)) else {
             return true;
         };
         match button {
@@ -1332,7 +1329,7 @@ impl BrowserApp {
     fn ac_hit(&self, x: f32, y: f32) -> Option<usize> {
         let (_, rows) = self.ac_layout()?;
         let first = self.ac_menu.as_ref()?.first_row();
-        rows.iter().position(|r| hit(r, x, y)).map(|k| first + k)
+        rows.iter().position(|r| r.contains(x, y)).map(|k| first + k)
     }
 
     /// Whether the active page is one that can be saved at all: an internal
@@ -1433,13 +1430,13 @@ impl BrowserApp {
     /// plate itself before deciding a click was "outside".
     fn bm_hit(&self, x: f32, y: f32) -> Option<BmHit> {
         let l = self.bm_layout()?;
-        if hit(&l.toggle, x, y) {
+        if l.toggle.contains(x, y) {
             return Some(BmHit::Toggle);
         }
-        if hit(&l.manage, x, y) {
+        if l.manage.contains(x, y) {
             return Some(BmHit::Manage);
         }
-        l.rows.iter().find(|(r, _)| hit(r, x, y)).map(|(r, i)| {
+        l.rows.iter().find(|(r, _)| r.contains(x, y)).map(|(r, i)| {
             BmHit::Entry(*i, x >= r.x + r.width - BM_RM_W)
         })
     }
@@ -1568,7 +1565,7 @@ impl BrowserApp {
     /// Whether a pointer position is over the chrome: the corner control
     /// always, the plate while any of it is showing.
     fn chrome_hit(&self, x: f32, y: f32) -> bool {
-        self.dot_hit(x, y) || (self.chrome_t > 0.0 && hit(&self.chrome_plate().0, x, y))
+        self.dot_hit(x, y) || (self.chrome_t > 0.0 && self.chrome_plate().0.contains(x, y))
     }
 
     fn open_chrome(&mut self) {
@@ -2801,7 +2798,7 @@ impl Application for BrowserApp {
         }
         let over_fav = if self.chrome_open && !self.favs.is_empty() {
             let bar = self.bar();
-            self.fav_rects(&bar).iter().position(|r| hit(r, pos.x, pos.y))
+            self.fav_rects(&bar).iter().position(|r| r.contains(pos.x, pos.y))
         } else {
             None
         };
@@ -2842,9 +2839,9 @@ impl Application for BrowserApp {
                 let r = m.rect(self.win);
                 let (ok, cancel) = m.button_rects(&r);
                 (
-                    hit(&ok, pos.x, pos.y),
-                    cancel.is_some_and(|c| hit(&c, pos.x, pos.y)),
-                    (0..m.fields.len()).find(|&i| hit(&m.field_rect(&r, i), pos.x, pos.y)),
+                    ok.contains(pos.x, pos.y),
+                    cancel.is_some_and(|c| c.contains(pos.x, pos.y)),
+                    (0..m.fields.len()).find(|&i| m.field_rect(&r, i).contains(pos.x, pos.y)),
                 )
             };
             if hit_ok {
@@ -2876,7 +2873,7 @@ impl Application for BrowserApp {
         // The save offer takes any press on its plate, buttons or not; the
         // page under it never sees one. Presses elsewhere leave it waiting.
         #[cfg(feature = "wpe")]
-        if self.save_layout().is_some_and(|l| hit(&l.plate, pos.x, pos.y)) {
+        if self.save_layout().is_some_and(|l| l.plate.contains(pos.x, pos.y)) {
             if pressed && button == MouseButton::Left {
                 self.save_click(pos.x, pos.y);
             }
@@ -2912,7 +2909,7 @@ impl Application for BrowserApp {
             }
             *needs_rebuild = true;
             let target = self.bm_hit(pos.x, pos.y);
-            let inside = self.bm_layout().is_some_and(|l| hit(&l.plate, pos.x, pos.y));
+            let inside = self.bm_layout().is_some_and(|l| l.plate.contains(pos.x, pos.y));
             if target.is_some() {
                 self.bm_click(button, target);
             } else if !inside {
@@ -2947,11 +2944,11 @@ impl Application for BrowserApp {
             let count = self.host.tab_count();
             for i in 0..count {
                 let pill = tab_rect(&bar, pos_edge, count, i);
-                if !hit(&pill, pos.x, pos.y) {
+                if !pill.contains(pos.x, pos.y) {
                     continue;
                 }
                 let on_close =
-                    tab_close_rect(&pill).is_some_and(|r| hit(&r, pos.x, pos.y));
+                    tab_close_rect(&pill).is_some_and(|r| r.contains(pos.x, pos.y));
                 if button == MouseButton::Middle || on_close {
                     return self.close_tab(i);
                 }
@@ -2964,7 +2961,7 @@ impl Application for BrowserApp {
             // Favorites strip: a pill is a menu pick — load it here and fold
             // — or, middle-clicked, a new tab, with the bar left out so
             // several can be opened in a row.
-            if let Some(i) = self.fav_rects(&bar).iter().position(|r| hit(r, pos.x, pos.y)) {
+            if let Some(i) = self.fav_rects(&bar).iter().position(|r| r.contains(pos.x, pos.y)) {
                 let Ok(url) = Url::parse(&self.favs[i].url) else { return None };
                 if button == MouseButton::Middle {
                     self.host.open_tab(url);
@@ -2982,21 +2979,21 @@ impl Application for BrowserApp {
             if button != MouseButton::Left {
                 return None;
             }
-            if hit(&plus_rect(&bar, pos_edge), pos.x, pos.y) {
+            if plus_rect(&bar, pos_edge).contains(pos.x, pos.y) {
                 self.new_tab();
-            } else if hit(&btn_rect(&bar, 0), pos.x, pos.y) {
+            } else if btn_rect(&bar, 0).contains(pos.x, pos.y) {
                 self.host.back();
-            } else if hit(&btn_rect(&bar, 1), pos.x, pos.y) {
+            } else if btn_rect(&bar, 1).contains(pos.x, pos.y) {
                 self.host.forward();
-            } else if hit(&btn_rect(&bar, 2), pos.x, pos.y) {
+            } else if btn_rect(&bar, 2).contains(pos.x, pos.y) {
                 self.host.reload();
-            } else if hit(&star_rect(&bar, pos_edge), pos.x, pos.y) {
+            } else if star_rect(&bar, pos_edge).contains(pos.x, pos.y) {
                 self.host.toggle_bookmark();
-            } else if hit(&bm_btn_rect(&bar, pos_edge), pos.x, pos.y) {
+            } else if bm_btn_rect(&bar, pos_edge).contains(pos.x, pos.y) {
                 self.open_bm_menu();
             } else {
                 let field = url_rect(&bar, pos_edge);
-                if hit(&field, pos.x, pos.y) {
+                if field.contains(pos.x, pos.y) {
                     if self.url_focused {
                         self.url.cursor = self.cursor_from_click(pos.x, &field);
                         self.url.selection = None;
@@ -3034,7 +3031,7 @@ impl Application for BrowserApp {
         #[cfg(feature = "wpe")]
         if self
             .ac_layout()
-            .is_some_and(|(plate, _)| hit(&plate, pos.x, pos.y))
+            .is_some_and(|(plate, _)| plate.contains(pos.x, pos.y))
         {
             return;
         }
@@ -3043,7 +3040,7 @@ impl Application for BrowserApp {
         // anywhere else it is swallowed rather than scrolling the page
         // behind it.
         if self.bm_menu.is_some() {
-            if self.bm_layout().is_some_and(|l| hit(&l.plate, pos.x, pos.y)) {
+            if self.bm_layout().is_some_and(|l| l.plate.contains(pos.x, pos.y)) {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => *y as f64,
                     MouseScrollDelta::PixelDelta(p) => p.y,
