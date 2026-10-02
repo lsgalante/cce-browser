@@ -7,10 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `cce-browser` is a web browser for the CCE Wayland desktop environment, built on
 **embedded WPE WebKit** (since 2026-08-30; the original Servo backend survives behind
 a feature flag — see WPE-PORT.md for the whole port). It is one crate of the multi-repo `cce` workspace (its
-own git repo side-by-side with its siblings; `origin` is the local *bare* repo
-`~/git/cce-browser.git`, so **committing is not publishing — `git push origin master`
-is**, after which gitsite mirrors it to `https://git.lucas.co/cce-browser.git`, the old
-fetch-only static mirror now kept as the `published` remote). Read the workspace-level
+own git repo side-by-side with its siblings; `origin` is GitHub,
+`github.com/lsgalante/cce-browser`, and a post-commit hook pushes each commit there —
+`https://git.lucas.co/cce-browser.git` is only an hourly mirror of GitHub. **Committing
+is not publishing**: a commit whose push failed (hook missing, network down) is on no
+remote at all, so check `origin/master` after committing). Read the workspace-level
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
