@@ -7,9 +7,9 @@
 //! `exec` the real browser when no instance answers.
 //!
 //! It therefore deliberately duplicates the client half of the socket
-//! protocol instead of importing it: `src/instance.rs` (same crate) is the
-//! server side and the fallback client, `cce_ui::ipc::socket_path` is the
-//! path convention. All three must agree on `/tmp/cce-browser-<display>.sock`
+//! protocol instead of importing it: `src/instance.rs` (same crate, on
+//! `cce_ui::ipc::instance`) is the server side and the fallback client,
+//! `cce_ui::ipc::socket_path` is the path convention. All three must agree on `/tmp/cce-browser-<display>.sock`
 //! and the `open <arg>` / `new-tab` lines. The protocol is small on purpose;
 //! change it in both files or not at all.
 
@@ -26,9 +26,10 @@ fn socket_path() -> String {
     }
 }
 
-/// One forwarding attempt; false on any failure. Mirrors
-/// `instance::try_forward`, ack wait included — exiting on write alone races
-/// the instance actually reading the line.
+/// One forwarding attempt; false on any failure. Mirrors the client half of
+/// `cce_ui::ipc::instance::forward_or_claim`, ack wait included — exiting on
+/// write alone races the instance actually reading the line — and so is its
+/// bound on that wait: a stuck instance must not hang every click forever.
 fn try_forward(arg: Option<&str>) -> bool {
     let Ok(mut stream) = UnixStream::connect(socket_path()) else {
         return false;
@@ -52,6 +53,7 @@ fn try_forward(arg: Option<&str>) -> bool {
     if stream.write_all(command.as_bytes()).is_err() {
         return false;
     }
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply).is_ok()
 }
