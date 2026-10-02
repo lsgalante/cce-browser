@@ -96,6 +96,23 @@ fn bar_h(favorites: bool) -> f32 {
 const BAR_RADIUS: f32 = 10.0;
 /// Seconds for the bar to unfold from the corner control (and back).
 const CHROME_ANIM_S: f32 = 0.18;
+
+/// One frame of the bar's unfold: `t` moves `dt` worth toward `target`
+/// (0 folded, 1 open), or straight onto it when the DE's animations switch
+/// (`cce_ui::motion::enabled`) is off — "snap, never freeze", as every
+/// cce-ui widget does, so the bar still opens and shuts, just without the
+/// glide.
+fn chrome_step(t: f32, target: f32, dt: f32, animate: bool) -> f32 {
+    if !animate {
+        return target;
+    }
+    let step = dt / CHROME_ANIM_S;
+    if target > t {
+        (t + step).min(target)
+    } else {
+        (t - step).max(target)
+    }
+}
 /// Width reserved at the right end of the row the corner control sits on
 /// (the tab row for a top bar, the controls row for a bottom one), so the
 /// "+" or the bookmark star clears the dot in the bar's corner.
@@ -2708,12 +2725,7 @@ impl Application for BrowserApp {
         }
         let target = if self.chrome_open { 1.0 } else { 0.0 };
         if self.chrome_t != target {
-            let step = dt / CHROME_ANIM_S;
-            self.chrome_t = if target > self.chrome_t {
-                (self.chrome_t + step).min(1.0)
-            } else {
-                (self.chrome_t - step).max(0.0)
-            };
+            self.chrome_t = chrome_step(self.chrome_t, target, dt, cce_ui::motion::enabled());
             // Keeps the runner's warm loop alive until the morph lands.
             *needs_rebuild = true;
         }
@@ -3594,6 +3606,26 @@ mod tests {
     use super::*;
 
     const SEARCH: &str = "https://duckduckgo.com/?q=";
+
+    #[test]
+    fn the_bar_glides_with_animations_on_and_snaps_with_them_off() {
+        let frame = 1.0 / 60.0;
+        // On: a frame moves it part of the way, and it lands exactly.
+        let t = chrome_step(0.0, 1.0, frame, true);
+        assert!(t > 0.0 && t < 1.0, "{t}");
+        assert_eq!(chrome_step(0.95, 1.0, frame, true), 1.0);
+        assert_eq!(chrome_step(0.05, 0.0, frame, true), 0.0);
+        // The whole unfold takes CHROME_ANIM_S, whichever way it goes.
+        let frames = (CHROME_ANIM_S / frame).ceil() as usize;
+        let open = (0..frames).fold(0.0, |t, _| chrome_step(t, 1.0, frame, true));
+        let shut = (0..frames).fold(1.0, |t, _| chrome_step(t, 0.0, frame, true));
+        assert_eq!((open, shut), (1.0, 0.0));
+        // Off: one frame lands it, from anywhere, either way — snap, not freeze.
+        for from in [0.0, 0.3, 1.0] {
+            assert_eq!(chrome_step(from, 1.0, frame, false), 1.0);
+            assert_eq!(chrome_step(from, 0.0, frame, false), 0.0);
+        }
+    }
 
     #[test]
     fn startup_arg_resolves_an_existing_path_to_a_file_url() {

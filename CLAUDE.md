@@ -318,8 +318,9 @@ circle menu is the corner of the thing it expands into, so the dot sits where
 the bar's corner will be, the bar grows out of the dot's own disc, and open,
 the dot is the bar's corner. It is always drawn and always live: clicking it
 unfolds the two-row bar, clicking it again folds the bar back. `chrome_open` names the state, `chrome_t` the unfold
-progress (animated in `tick` over `CHROME_ANIM_S`), and `dot_hover` its hover
-emphasis, which is a repaint. **Do not decorate the dot** — no glyph, no
+progress (animated in `tick` over `CHROME_ANIM_S`, or landed in one frame
+when the DE's animations switch, `cce_ui::motion::enabled`, is off), and
+`dot_hover` its hover emphasis, which is a repaint. **Do not decorate the dot** — no glyph, no
 lines, no ring; it is the DE's control, not a browser icon.
 
 `chrome_plate()` is the one shape draw and hit-test both read — the bar, or
