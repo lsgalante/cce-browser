@@ -259,9 +259,9 @@ handler like any other navigation) and removes.
 
 The controls row's **"B" button** (immediately left of the star) drops the
 bookmarks menu: the star is *this* page's bookmark, the button beside it is
-all of them. Three sections — add/remove this page, the saved pages
-themselves (newest first, the `cce://bookmarks` order), and
-`Manage Bookmarks (n)` which hands the collection to that page. A row visits
+all of them. A **search field** on top, then three sections — add/remove
+this page, the saved pages themselves (newest first, the `cce://bookmarks`
+order), and `Manage Bookmarks (n)` which hands the collection to that page. A row visits
 in the active tab and folds everything away, middle-click opens it in a new
 tab and leaves the menu up, and the **remove "x"** on the hovered row prunes
 in place. It closes on Escape (ahead of the URL bar and the page), on a
@@ -290,6 +290,19 @@ Points that are choices, not accidents:
   way), and hover is the highlight rect's job.
 - Opening drops URL-bar focus, for the same reason folding does: a field
   behind a menu must not keep eating keystrokes.
+- **The search field has the keyboard while the menu is open** (a
+  `LineEdit`, so caret, selection, clipboard and undo come with it). Every
+  word typed must appear in a bookmark's title or address, ignoring case;
+  Enter visits the first match; Escape still closes the menu; the chrome's
+  Ctrl chords still fire first, as they do over a focused URL bar. A query
+  edit — a key, a paste, an undo — re-filters (`BmMenu::filter`) and takes
+  the list back to its top. `all` is the snapshot, `items` what the query
+  lets through, and an `Entry` index points into `items`.
+- **The plate is sized for the whole collection, not the matches.** Above a
+  bottom bar a plate that shrank as the query narrowed would slide its
+  search field out from under the pointer mid-typing (it did, in the first
+  cut); unmatched slots are left empty instead. `Manage Bookmarks (n)`
+  counts the whole collection for the same reason it exists.
 
 `Ctrl+B` still opens the `cce://bookmarks` page rather than this menu — the
 page is the fuller tool, and the menu is a pointer affordance.

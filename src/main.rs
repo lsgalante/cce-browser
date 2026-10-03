@@ -337,15 +337,55 @@ impl CtxMenu {
 /// explicitly. Unlike the right-click menu this is not gated on an engine
 /// backend — bookmarks are app state, so the menu works on either.
 struct BmMenu {
+    /// Every bookmark, as the store held them when the menu opened (or was
+    /// last refreshed through it).
+    all: Vec<pages::Link>,
+    /// The ones the search lets through, in store order — what the rows
+    /// show and what an `Entry` index points into.
     items: Vec<pages::Link>,
+    /// The search field at the top of the plate. It has the keyboard while
+    /// the menu is open.
+    query: cce_ui::widget::LineEdit,
     /// First listed bookmark, when there are more than the plate can show.
     scroll: usize,
     hover: Option<BmHit>,
 }
 
+impl BmMenu {
+    fn new(all: Vec<pages::Link>) -> Self {
+        let mut m = BmMenu {
+            all,
+            items: Vec::new(),
+            query: cce_ui::widget::LineEdit::default(),
+            scroll: 0,
+            hover: None,
+        };
+        m.filter();
+        m
+    }
+
+    /// Re-derive `items` from `all` and the query: every word typed must
+    /// appear in the title or the address, ignoring case.
+    fn filter(&mut self) {
+        let words: Vec<String> =
+            self.query.text.split_whitespace().map(str::to_lowercase).collect();
+        self.items = self
+            .all
+            .iter()
+            .filter(|l| {
+                let hay = format!("{}\n{}", l.label, l.url).to_lowercase();
+                words.iter().all(|w| hay.contains(w.as_str()))
+            })
+            .cloned()
+            .collect();
+    }
+}
+
 /// What a pointer position falls on inside the menu.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BmHit {
+    /// The search field.
+    Search,
     /// The add/remove row for the page in the active tab.
     Toggle,
     /// A bookmark row: its index, and whether the pointer is on the remove
@@ -503,6 +543,8 @@ impl AcMenu {
 /// one-geometry rule the bar's own helpers follow.
 struct BmLayout {
     plate: Rect,
+    /// The search field, the plate's first row.
+    search: Rect,
     toggle: Rect,
     /// `(rect, index into items)` for each row the plate can show.
     rows: Vec<(Rect, usize)>,
@@ -1373,11 +1415,7 @@ impl BrowserApp {
             self.url.selection = None;
             self.sync_page_state();
         }
-        self.bm_menu = Some(BmMenu {
-            items: self.bookmarks.snapshot(),
-            scroll: 0,
-            hover: None,
-        });
+        self.bm_menu = Some(BmMenu::new(self.bookmarks.snapshot()));
     }
 
     fn close_bm_menu(&mut self) {
@@ -1387,13 +1425,63 @@ impl BrowserApp {
     /// Re-read the store into the open menu after an edit made through it,
     /// keeping the scroll inside the new range.
     fn refresh_bm_menu(&mut self) {
-        let items = self.bookmarks.snapshot();
-        let cap = self.bm_layout().map_or(items.len(), |l| l.cap);
+        let all = self.bookmarks.snapshot();
         if let Some(m) = self.bm_menu.as_mut() {
-            m.scroll = m.scroll.min(items.len().saturating_sub(cap));
-            m.items = items;
+            m.all = all;
+            m.filter();
             m.hover = None;
         }
+        self.clamp_bm_scroll();
+    }
+
+    /// Keep the menu's scroll inside the range its (filtered) list has.
+    fn clamp_bm_scroll(&mut self) {
+        let cap = self.bm_layout().map_or(usize::MAX, |l| l.cap);
+        if let Some(m) = self.bm_menu.as_mut() {
+            m.scroll = m.scroll.min(m.items.len().saturating_sub(cap));
+        }
+    }
+
+    /// The search field's keys, while the menu is open. Escape never gets
+    /// here (it closes the menu first); Enter visits the first match, as a
+    /// click on it would; anything that changes the query re-filters the
+    /// list and takes it back to the top.
+    fn edit_bm_search(&mut self, event: &KeyEvent) {
+        let Some(m) = self.bm_menu.as_mut() else { return };
+        let before = m.query.text.clone();
+        match m.query.handle_key(event) {
+            cce_ui::widget::EditOutcome::Submit => {
+                if !m.items.is_empty() {
+                    self.bm_open(0, false);
+                }
+                return;
+            }
+            cce_ui::widget::EditOutcome::Cancel => {
+                self.close_bm_menu();
+                return;
+            }
+            _ => {}
+        }
+        if m.query.text != before {
+            self.bm_query_changed();
+        }
+    }
+
+    /// The query's text changed (a key, a paste, an undo): re-filter and
+    /// start the list from its top again.
+    fn bm_query_changed(&mut self) {
+        if let Some(m) = self.bm_menu.as_mut() {
+            m.filter();
+            m.scroll = 0;
+            m.hover = None;
+        }
+    }
+
+    /// Byte of the search query under pointer x `x`.
+    fn bm_query_index_at(&mut self, x: f32) -> Option<usize> {
+        let field = self.bm_layout()?.search;
+        let text = self.bm_menu.as_ref()?.query.text.clone();
+        Some(self.boundary_at_x(&text, x - field.x - text_pad()))
     }
 
     /// The menu's geometry for the current window, bar edge and item count:
@@ -1410,17 +1498,21 @@ impl BrowserApp {
         let width = BM_W.min(self.win.0 - 2.0 * bar_margin()).max(160.0);
         let x = (btn.x + btn.width - width)
             .clamp(bar_margin(), (self.win.0 - bar_margin() - width).max(bar_margin()));
-        // The furniture the list is fitted around: toggle row, two rules and
-        // the manage row.
-        let fixed = 2.0 * plate_pad() + 2.0 * BM_ROW_H + 2.0 * BM_SEP_H;
+        // The furniture the list is fitted around: the search row and its
+        // gap, the toggle row, two rules and the manage row.
+        let fixed = 2.0 * plate_pad() + 3.0 * BM_ROW_H + inner_gap() + 2.0 * BM_SEP_H;
         let avail = match self.settings.bar_position {
             settings::BarPosition::Top => self.win.1 - (bar.y + bar.height + item_gap()) - bar_margin(),
             settings::BarPosition::Bottom => bar.y - item_gap() - bar_margin(),
         };
         let cap = (((avail - fixed) / BM_ROW_H).floor().max(1.0)) as usize;
-        // An empty list still shows its one "nothing here" row.
-        let shown = menu.items.len().clamp(1, cap);
-        let height = fixed + shown as f32 * BM_ROW_H;
+        // The plate is sized for the whole collection, not for what the
+        // search lets through, so it keeps its size while a query narrows
+        // the list: hanging above a bottom bar, a plate that shrank would
+        // slide its search field out from under the pointer mid-typing.
+        // An empty list still keeps its one "nothing here" row.
+        let slots = menu.all.len().clamp(1, cap);
+        let height = fixed + slots as f32 * BM_ROW_H;
         let y = match self.settings.bar_position {
             settings::BarPosition::Top => bar.y + bar.height + item_gap(),
             settings::BarPosition::Bottom => bar.y - item_gap() - height,
@@ -1434,17 +1526,28 @@ impl BrowserApp {
             width: width - 4.0,
             height: BM_ROW_H,
         };
-        let list_y = BM_ROW_H + BM_SEP_H;
+        let toggle_y = BM_ROW_H + inner_gap();
+        let list_y = toggle_y + BM_ROW_H + BM_SEP_H;
+        let shown = menu.items.len().min(slots);
         let first = menu.scroll.min(menu.items.len().saturating_sub(shown));
-        let rows = (0..shown.min(menu.items.len()))
+        let rows = (0..shown)
             .map(|k| (row(list_y + k as f32 * BM_ROW_H), first + k))
             .collect();
+        // The field sits in its row at the plate's text inset, so its text
+        // lines up with the rows' labels below it.
+        let search = Rect {
+            x: x + plate_pad(),
+            y: y + plate_pad(),
+            width: width - 2.0 * plate_pad(),
+            height: BM_ROW_H,
+        };
         Some(BmLayout {
             plate,
-            toggle: row(0.0),
+            search,
+            toggle: row(toggle_y),
             rows,
             empty: menu.items.is_empty().then(|| row(list_y)),
-            manage: row(list_y + shown as f32 * BM_ROW_H + BM_SEP_H),
+            manage: row(list_y + slots as f32 * BM_ROW_H + BM_SEP_H),
             cap,
         })
     }
@@ -1454,6 +1557,9 @@ impl BrowserApp {
     /// plate itself before deciding a click was "outside".
     fn bm_hit(&self, x: f32, y: f32) -> Option<BmHit> {
         let l = self.bm_layout()?;
+        if l.search.contains(x, y) {
+            return Some(BmHit::Search);
+        }
         if l.toggle.contains(x, y) {
             return Some(BmHit::Toggle);
         }
@@ -2228,16 +2334,60 @@ impl BrowserApp {
     /// pages already saved, and the way out to the full collection.
     fn paint_bm_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
         let Some(l) = self.bm_layout() else { return };
-        let (items, hover, scroll) = match self.bm_menu.as_ref() {
-            Some(m) => (m.items.clone(), m.hover, m.scroll),
+        let (total, items, hover, scroll, searching, query, caret, sel) = match self.bm_menu.as_ref() {
+            Some(m) => (
+                m.all.len(),
+                m.items.clone(),
+                m.hover,
+                m.scroll,
+                !m.query.text.is_empty(),
+                m.query.text.clone(),
+                m.query.cursor,
+                m.query.selection.filter(|&(a, b)| a < b),
+            ),
             None => return,
         };
+        // Measured before painting borrows anything: the field's caret and
+        // selection, on the same shaped run it draws.
+        let caret_x = self.x_of_boundary(&query, caret);
+        let sel_x = sel.map(|(a, b)| (self.x_of_boundary(&query, a), self.x_of_boundary(&query, b)));
         pc.plate(
             l.plate,
             (8.0, 8.0, 8.0, 8.0),
             &cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]),
             cce_ui::layout::bevel_width().min(3.0),
         );
+
+        // The search field. It has the keyboard whenever the menu is open,
+        // so it always wears the focused rim and shows its caret.
+        let f = l.search;
+        pc.rounded_rect(
+            Rect { x: f.x - 1.0, y: f.y - 1.0, width: f.width + 2.0, height: f.height + 2.0 },
+            7.0,
+            (true, true, true, true),
+            RIM_FOCUS,
+        );
+        pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
+        let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
+        // style: deliberate — caret and selection 4px inside the rim, as the
+        // URL bar and the dialog fields draw them.
+        pc.clip(f, |pc| {
+            if let Some((x0, x1)) = sel_x {
+                pc.quad(
+                    Rect { x: f.x + text_pad() + x0, y: f.y + 4.0, width: x1 - x0, height: f.height - 8.0 },
+                    SEL_BG,
+                );
+            }
+            if query.is_empty() {
+                pc.text("Search bookmarks", f.x + text_pad(), ty, URL_FONT, TEXT_DIM);
+            } else {
+                pc.text(query.clone(), f.x + text_pad(), ty, URL_FONT, TEXT);
+            }
+            pc.quad(
+                Rect { x: f.x + text_pad() + caret_x, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
+                [0.85, 0.87, 0.92, 1.0],
+            );
+        });
 
         let text_at = |pc: &mut PaintCtx, r: &Rect, s: String, color: [u8; 3]| {
             pc.text(
@@ -2303,7 +2453,8 @@ impl BrowserApp {
             }
         }
         if let Some(r) = l.empty {
-            text_at(pc, &r, "No bookmarks yet".to_string(), TEXT_DIM);
+            let what = if searching { "No matches" } else { "No bookmarks yet" };
+            text_at(pc, &r, what.to_string(), TEXT_DIM);
         }
 
         // Scroll position, when the list is longer than the plate.
@@ -2348,7 +2499,8 @@ impl BrowserApp {
         text_at(
             pc,
             &l.manage,
-            format!("Manage Bookmarks ({})", items.len()),
+            // The whole collection: this row hands all of it to the page.
+            format!("Manage Bookmarks ({total})"),
             TEXT,
         );
     }
@@ -2453,7 +2605,20 @@ impl BrowserApp {
             let i = m.focused;
             return m.fields.get_mut(i).map(|(_, e)| e);
         }
+        if let Some(m) = self.bm_menu.as_mut() {
+            return Some(&mut m.query);
+        }
         self.url_focused.then_some(&mut self.url)
+    }
+
+    /// Whether `focused_edit` is the bookmarks menu's search field — an undo
+    /// there changes the query, so the list has to follow.
+    fn bm_search_has_keyboard(&self) -> bool {
+        #[cfg(feature = "wpe")]
+        if self.modal.is_some() {
+            return false;
+        }
+        self.bm_menu.is_some()
     }
 
 
@@ -2797,6 +2962,9 @@ impl Application for BrowserApp {
     /// which is how Ctrl+Z still reaches a web page's own editor.
     fn undo(&mut self, needs_rebuild: &mut bool) -> bool {
         let done = self.focused_edit().is_some_and(|e| e.undo());
+        if done && self.bm_search_has_keyboard() {
+            self.bm_query_changed();
+        }
         *needs_rebuild |= done;
         done
     }
@@ -2804,6 +2972,9 @@ impl Application for BrowserApp {
     /// Redo — see [`undo`](Self::undo).
     fn redo(&mut self, needs_rebuild: &mut bool) -> bool {
         let done = self.focused_edit().is_some_and(|e| e.redo());
+        if done && self.bm_search_has_keyboard() {
+            self.bm_query_changed();
+        }
         *needs_rebuild |= done;
         done
     }
@@ -2839,6 +3010,9 @@ impl Application for BrowserApp {
                 for (_, edit) in m.fields.iter_mut() {
                     edit.release();
                 }
+            }
+            if let Some(m) = self.bm_menu.as_mut() {
+                m.query.release();
             }
         }
         // A settings change can move the bar to the other edge, so a reload
@@ -2928,6 +3102,14 @@ impl Application for BrowserApp {
         // An open bookmarks menu tracks hover, and the page under it sees
         // no moves at all.
         if self.bm_menu.is_some() {
+            if self.bm_menu.as_ref().is_some_and(|m| m.query.dragging()) {
+                if let Some(at) = self.bm_query_index_at(pos.x) {
+                    if self.bm_menu.as_mut().is_some_and(|m| m.query.drag_to(at)) {
+                        *_needs_rebuild = true;
+                    }
+                }
+                return;
+            }
             let h = self.bm_hit(pos.x, pos.y);
             if self.bm_menu.as_ref().is_some_and(|m| m.hover != h) {
                 if let Some(m) = self.bm_menu.as_mut() {
@@ -3079,10 +3261,28 @@ impl Application for BrowserApp {
         // goes no further — the rule the right-click menu already follows.
         if self.bm_menu.is_some() {
             if !pressed {
+                // The end of a drag in the search field, wherever it is.
+                if button == MouseButton::Left {
+                    if let Some(m) = self.bm_menu.as_mut() {
+                        m.query.release();
+                    }
+                }
                 return None;
             }
             *needs_rebuild = true;
             let target = self.bm_hit(pos.x, pos.y);
+            // The search field: a press places the caret and starts a drag,
+            // Shift extends — the URL bar's rules.
+            if target == Some(BmHit::Search) {
+                if button == MouseButton::Left {
+                    let at = self.bm_query_index_at(pos.x);
+                    let shift = self.shift_held;
+                    if let (Some(at), Some(m)) = (at, self.bm_menu.as_mut()) {
+                        m.query.press(at, shift);
+                    }
+                }
+                return None;
+            }
             let inside = self.bm_layout().is_some_and(|l| l.plate.contains(pos.x, pos.y));
             if target.is_some() {
                 self.bm_click(button, target);
@@ -3441,6 +3641,16 @@ impl Application for BrowserApp {
             }
         }
 
+        // An open bookmarks menu's search field has the keyboard, the way a
+        // focused URL bar does (opening the menu drops the bar's focus).
+        if self.bm_menu.is_some() {
+            if event.state == ElementState::Pressed {
+                self.edit_bm_search(event);
+                *needs_rebuild = true;
+            }
+            return None;
+        }
+
         if self.url_focused {
             if event.state == ElementState::Pressed {
                 self.edit_url(event);
@@ -3773,6 +3983,31 @@ mod tests {
     use super::*;
 
     const SEARCH: &str = "https://duckduckgo.com/?q=";
+
+    #[test]
+    fn the_bookmarks_search_keeps_entries_matching_every_word() {
+        let link = |label: &str, url: &str| pages::Link { label: label.into(), url: url.into() };
+        let mut m = BmMenu::new(vec![
+            link("Rust Book", "https://doc.rust-lang.org/book/"),
+            link("Example Domain", "https://example.com/"),
+            link("rustup", "https://rustup.rs/"),
+        ]);
+        assert_eq!(m.items.len(), 3, "an empty query lets everything through");
+        m.query.text = "RUST".into();
+        m.filter();
+        let labels: Vec<_> = m.items.iter().map(|l| l.label.as_str()).collect();
+        assert_eq!(labels, ["Rust Book", "rustup"], "case-insensitive, store order kept");
+        m.query.text = "rust book".into();
+        m.filter();
+        assert_eq!(m.items.len(), 1, "every word must match");
+        m.query.text = "example.com".into();
+        m.filter();
+        assert_eq!(m.items[0].label, "Example Domain", "the address counts too");
+        m.query.text = "nothing-like-this".into();
+        m.filter();
+        assert!(m.items.is_empty());
+        assert_eq!(m.all.len(), 3, "filtering never drops the snapshot");
+    }
 
     #[test]
     fn the_bar_glides_with_animations_on_and_snaps_with_them_off() {
