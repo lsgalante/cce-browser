@@ -293,10 +293,13 @@ Points that are choices, not accidents:
 - **The search field has the keyboard while the menu is open** (a
   `LineEdit`, so caret, selection, clipboard and undo come with it). Every
   word typed must appear in a bookmark's title or address, ignoring case;
-  Enter visits the first match; Escape still closes the menu; the chrome's
-  Ctrl chords still fire first, as they do over a focused URL bar. A query
-  edit — a key, a paste, an undo — re-filters (`BmMenu::filter`) and takes
-  the list back to its top. `all` is the snapshot, `items` what the query
+  Up/Down move a selected row through the matches (`BmMenu::step`: it wraps
+  at the ends and scrolls to stay in view, as the account list does, and is
+  highlighted like a hovered row); Enter visits the selected row; Escape
+  still closes the menu; the chrome's Ctrl chords still fire first, as they
+  do over a focused URL bar. A query edit — a key, a paste, an undo —
+  re-filters (`BmMenu::filter`) and takes the list and the selection back to
+  the first match. `all` is the snapshot, `items` what the query
   lets through, and an `Entry` index points into `items`.
 - **The plate is sized for the whole collection, not the matches.** Above a
   bottom bar a plate that shrank as the query narrowed would slide its

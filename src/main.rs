@@ -349,6 +349,9 @@ struct BmMenu {
     /// First listed bookmark, when there are more than the plate can show.
     scroll: usize,
     hover: Option<BmHit>,
+    /// The keyboard's row, an index into `items`: Up/Down move it and Enter
+    /// visits it. Highlighted like a hovered row, as the account list does.
+    selected: usize,
 }
 
 impl BmMenu {
@@ -359,6 +362,7 @@ impl BmMenu {
             query: cce_ui::widget::LineEdit::default(),
             scroll: 0,
             hover: None,
+            selected: 0,
         };
         m.filter();
         m
@@ -378,6 +382,24 @@ impl BmMenu {
             })
             .cloned()
             .collect();
+        self.selected = self.selected.min(self.items.len().saturating_sub(1));
+    }
+
+    /// Move the keyboard selection by `delta` rows, wrapping at the ends as
+    /// the account list does, and scroll so it stays among the `visible`
+    /// rows the plate shows.
+    fn step(&mut self, delta: isize, visible: usize) {
+        if self.items.is_empty() {
+            return;
+        }
+        let n = self.items.len() as isize;
+        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+        let visible = visible.max(1);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + visible {
+            self.scroll = self.selected + 1 - visible;
+        }
     }
 }
 
@@ -1447,12 +1469,26 @@ impl BrowserApp {
     /// click on it would; anything that changes the query re-filters the
     /// list and takes it back to the top.
     fn edit_bm_search(&mut self, event: &KeyEvent) {
+        // Up/Down walk the matches; the field has no use for them.
+        let delta = match event.logical_key {
+            Key::Named(NamedKey::ArrowDown) => Some(1),
+            Key::Named(NamedKey::ArrowUp) => Some(-1),
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            let visible = self.bm_layout().map_or(1, |l| l.rows.len());
+            if let Some(m) = self.bm_menu.as_mut() {
+                m.step(delta, visible);
+            }
+            return;
+        }
         let Some(m) = self.bm_menu.as_mut() else { return };
         let before = m.query.text.clone();
         match m.query.handle_key(event) {
             cce_ui::widget::EditOutcome::Submit => {
                 if !m.items.is_empty() {
-                    self.bm_open(0, false);
+                    let i = m.selected;
+                    self.bm_open(i, false);
                 }
                 return;
             }
@@ -1473,6 +1509,7 @@ impl BrowserApp {
         if let Some(m) = self.bm_menu.as_mut() {
             m.filter();
             m.scroll = 0;
+            m.selected = 0;
             m.hover = None;
         }
     }
@@ -2334,7 +2371,7 @@ impl BrowserApp {
     /// pages already saved, and the way out to the full collection.
     fn paint_bm_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
         let Some(l) = self.bm_layout() else { return };
-        let (total, items, hover, scroll, searching, query, caret, sel) = match self.bm_menu.as_ref() {
+        let (total, items, hover, scroll, searching, query, caret, sel, selected) = match self.bm_menu.as_ref() {
             Some(m) => (
                 m.all.len(),
                 m.items.clone(),
@@ -2344,6 +2381,7 @@ impl BrowserApp {
                 m.query.text.clone(),
                 m.query.cursor,
                 m.query.selection.filter(|&(a, b)| a < b),
+                m.selected,
             ),
             None => return,
         };
@@ -2421,7 +2459,7 @@ impl BrowserApp {
         for (r, i) in &l.rows {
             let Some(item) = items.get(*i) else { continue };
             let hovered = matches!(hover, Some(BmHit::Entry(h, _)) if h == *i);
-            if hovered {
+            if hovered || *i == selected {
                 highlight(pc, r);
             }
             text_at(
@@ -4007,6 +4045,32 @@ mod tests {
         m.filter();
         assert!(m.items.is_empty());
         assert_eq!(m.all.len(), 3, "filtering never drops the snapshot");
+    }
+
+    #[test]
+    fn the_bookmarks_selection_wraps_and_stays_in_view() {
+        let link = |n: usize| pages::Link { label: format!("page {n}"), url: format!("https://e.com/{n}") };
+        let mut m = BmMenu::new((0..5).map(link).collect());
+        assert_eq!(m.selected, 0);
+        m.step(1, 3);
+        m.step(1, 3);
+        assert_eq!((m.selected, m.scroll), (2, 0), "still among the three shown");
+        m.step(1, 3);
+        assert_eq!((m.selected, m.scroll), (3, 1), "scrolled to keep it in view");
+        m.step(1, 3);
+        m.step(1, 3);
+        assert_eq!((m.selected, m.scroll), (0, 0), "wrapped past the end, back to the top");
+        m.step(-1, 3);
+        assert_eq!((m.selected, m.scroll), (4, 2), "and back past the start, to the bottom");
+        // A narrower query keeps the selection on a match.
+        m.query.text = "page 1".into();
+        m.filter();
+        assert_eq!((m.items.len(), m.selected), (1, 0));
+        // Nothing to select: stepping does nothing.
+        m.query.text = "none".into();
+        m.filter();
+        m.step(1, 3);
+        assert_eq!(m.selected, 0);
     }
 
     #[test]
