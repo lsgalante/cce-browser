@@ -2444,6 +2444,18 @@ impl BrowserApp {
         self.url.select_all();
     }
 
+    /// The line field that has the keyboard, if any: a dialog's focused field
+    /// while one is up (it blocks everything else), else the URL bar while
+    /// it is focused. Undo and redo act on this.
+    fn focused_edit(&mut self) -> Option<&mut cce_ui::widget::LineEdit> {
+        #[cfg(feature = "wpe")]
+        if let Some(m) = self.modal.as_mut() {
+            let i = m.focused;
+            return m.fields.get_mut(i).map(|(_, e)| e);
+        }
+        self.url_focused.then_some(&mut self.url)
+    }
+
 
 
     /// URL-bar keys. Editing is the shared [`cce_ui::widget::LineEdit`]; only what
@@ -2776,6 +2788,24 @@ impl Application for BrowserApp {
                 *needs_rebuild = true;
             }
         }
+    }
+
+    /// The DE's undo chord (`input.kdl`, Ctrl+Z by default), offered here by
+    /// the runner before it becomes a key: it undoes typing in whichever
+    /// field has the keyboard — a dialog's focused field, else the URL bar.
+    /// With neither, or nothing to undo, false lets the chord go on as a key,
+    /// which is how Ctrl+Z still reaches a web page's own editor.
+    fn undo(&mut self, needs_rebuild: &mut bool) -> bool {
+        let done = self.focused_edit().is_some_and(|e| e.undo());
+        *needs_rebuild |= done;
+        done
+    }
+
+    /// Redo — see [`undo`](Self::undo).
+    fn redo(&mut self, needs_rebuild: &mut bool) -> bool {
+        let done = self.focused_edit().is_some_and(|e| e.redo());
+        *needs_rebuild |= done;
+        done
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
