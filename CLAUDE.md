@@ -298,8 +298,8 @@ archive: everything worth finding again, newest first. **Favorites**
 `about:favorites`, `Ctrl+Shift+B`) are the handful of places worth a
 permanent one-click spot: a **strip of label pills inside the bar**, between
 the tab row and the controls row. Click loads the favorite in the active tab
-and folds the bar (a menu pick); middle-click opens it in a new tab and
-leaves the bar out. Insertion order is strip order; the page reorders
+and folds the bar (a menu pick); middle-click opens it in a background tab
+and leaves the bar out. Insertion order is strip order; the page reorders
 (▲/▼), renames (a GET form per row — form submissions reach the `cce:`
 handler like any other navigation) and removes.
 
@@ -310,8 +310,8 @@ bookmarks menu: the star is *this* page's bookmark, the button beside it is
 all of them. A **search field** on top, then three sections — add/remove
 this page, the saved pages themselves (newest first, the `cce://bookmarks`
 order), and `Manage Bookmarks (n)` which hands the collection to that page. A row visits
-in the active tab and folds everything away, middle-click opens it in a new
-tab and leaves the menu up, and the **remove "x"** on the hovered row prunes
+in the active tab and folds everything away, middle-click opens it in a
+background tab and leaves the menu up, and the **remove "x"** on the hovered row prunes
 in place. It closes on Escape (ahead of the URL bar and the page), on a
 click anywhere off its plate, and with the bar it hangs from.
 
@@ -413,6 +413,14 @@ Menu semantics, all in `handle_mouse_input` / `handle_key_input`:
   unfocused (the first Escape in a focused field only drops focus, as
   before); submitting a URL; picking a tab. Closing a tab does *not* fold —
   several often go in a row.
+- **Peek**: a tab opening in the background (`open_background_tab`) unfolds a
+  folded bar for `CHROME_PEEK` (1.5s), so the new tab is seen landing in the
+  strip, then folds it again. `chrome_peek` is the deadline; a thread sends
+  `Spin` when it passes (an idle page turns no loop) and `settle_peek` folds.
+  Any press on the bar, or any explicit open, makes it the person's and it
+  stays; a pointer *brought onto* it holds the fold off; a page click does
+  not fold a peek, so a run of middle-clicked links keeps it out instead of
+  flapping it. A bar the person already had open is left alone.
 - Folding drops URL-bar focus (`close_chrome`), so an off-screen field never
   keeps eating keystrokes. Wheel and pointer moves over the chrome stay off the
   page, gated by `chrome_hit`, not `bar_rect`.
@@ -453,6 +461,24 @@ holds the `WebKitOptionMenu` and hands the chrome an `OptionMenuInfo`;
 `examples/wpe_options.rs` proves the engine side against the real engine.
 
 ### Middle-click is a background tab
+
+Every "open this in a new tab" that is not the person asking for a fresh tab
+opens **behind** the page: a middle-clicked link in a page, a middle-clicked
+favorite or bookmark-menu row, and the context menu's "Open Link in New Tab".
+The active tab, its focus and the URL bar stay as they were, and the bar
+peeks (above). `Ctrl+T`, the "+" and a forwarded external open still open in
+front — those are asks to *go* somewhere.
+
+A page link reaches the chrome through WebKit's `decide-policy`
+(`on_decide_policy`): a link-click navigation — or new-window one, for
+`target=_blank` — carrying mouse button 2 is ignored and its URL queued
+(`take_background_opens`, drained in the `Spin` handler). Everything else gets
+WebKit's default. A background webview is left unmapped and invisible, the
+state a switched-away tab is in. `examples/wpe_middle.rs` proves the engine
+side (both link kinds diverted, left-click undisturbed, the tab loading
+behind the page). On the retired Servo backend `open_background_tab` is an
+open followed by switching back, and page middle-clicks are not caught.
+
 ### Key routing
 
 `handle_key_input` is a three-stage funnel and the order is load-bearing: Ctrl chords

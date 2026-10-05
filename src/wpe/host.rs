@@ -743,6 +743,13 @@ impl WebKitHost {
                 on_show_option_menu as *const () as usize,
                 &self.prompts,
             );
+            // A middle-clicked link is a background tab, not a navigation.
+            connect_raw(
+                wv,
+                "decide-policy",
+                on_decide_policy as *const () as usize,
+                &self.prompts,
+            );
             let (lw, lh) = self.logical_size();
             wpe_view_resized(view, lw, lh);
             wpe_view_set_visible(view, 1);
@@ -770,6 +777,16 @@ impl WebKitHost {
     }
 
     pub fn open_tab(&mut self, url: Url) {
+        self.add_tab(url, true);
+    }
+
+    /// Open `url` in a new tab behind the active one: it loads, and shows
+    /// up in the strip, but the page on screen and its focus stay put.
+    pub fn open_background_tab(&mut self, url: Url) {
+        self.add_tab(url, false);
+    }
+
+    fn add_tab(&mut self, url: Url, show: bool) {
         let (webview, view, state) = match self.spare.take() {
             // Adopt the prewarmed webview; only the navigation is paid.
             Some((wv, view, state)) => {
@@ -782,6 +799,14 @@ impl WebKitHost {
             None => {
                 let state = Rc::new(TabState::default());
                 let (wv, view) = self.build_webview(&url, &state);
+                if !show {
+                    // Built mapped, like every webview; a background one
+                    // starts the way a switched-away tab is left.
+                    unsafe {
+                        wpe_view_unmap(view);
+                        wpe_view_set_visible(view, 0);
+                    }
+                }
                 (wv, view, state)
             }
         };
@@ -796,7 +821,9 @@ impl WebKitHost {
             loading: true,
             image: None,
         });
-        self.activate(self.tabs.len() - 1);
+        if show {
+            self.activate(self.tabs.len() - 1);
+        }
         // Replace the spare right away, but after the load started, so the
         // page fetch runs while this builds — measured, it does not show up
         // in the click-to-tab time.
@@ -2204,6 +2231,46 @@ unsafe extern "C" fn on_authenticate(
     };
     g_object_ref(request as *mut _);
     prompts.borrow_mut().auth = Some((request, pending));
+    1
+}
+
+/// A navigation is about to happen. A middle-click on a link — which WebKit
+/// reports as an ordinary navigation (or a new-window one, for a
+/// `target=_blank` link) carrying the button — is diverted to a background
+/// tab: the decision is ignored here and the URL queued for the chrome.
+/// Everything else gets WebKit's default.
+unsafe extern "C" fn on_decide_policy(
+    _wv: *mut WebKitWebView,
+    decision: *mut WebKitPolicyDecision,
+    kind: WebKitPolicyDecisionType::Type,
+    data: gpointer,
+) -> gboolean {
+    if kind != WebKitPolicyDecisionType::WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION
+        && kind != WebKitPolicyDecisionType::WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION
+    {
+        return 0;
+    }
+    let action = webkit_navigation_policy_decision_get_navigation_action(
+        decision as *mut WebKitNavigationPolicyDecision,
+    );
+    if action.is_null()
+        || webkit_navigation_action_get_mouse_button(action) != 2
+        || webkit_navigation_action_get_navigation_type(action)
+            != WebKitNavigationType::WEBKIT_NAVIGATION_TYPE_LINK_CLICKED
+    {
+        return 0;
+    }
+    let request = webkit_navigation_action_get_request(action);
+    let Some(url) = (!request.is_null())
+        .then(|| from_cstr(webkit_uri_request_get_uri(request)))
+        .flatten()
+        .and_then(|u| Url::parse(&u).ok())
+    else {
+        return 0;
+    };
+    webkit_policy_decision_ignore(decision);
+    let prompts = &*(data as *const RefCell<Prompts>);
+    prompts.borrow_mut().background_opens.push(url);
     1
 }
 

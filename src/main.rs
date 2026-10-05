@@ -95,6 +95,9 @@ fn bar_h(favorites: bool) -> f32 {
 const BAR_RADIUS: f32 = 10.0;
 /// Seconds for the bar to unfold from the corner control (and back).
 const CHROME_ANIM_S: f32 = 0.18;
+/// How long the bar stays out after a tab opens in the background — long
+/// enough to see the new tab land in the strip — before folding itself.
+const CHROME_PEEK: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// One frame of the bar's unfold: `t` moves `dt` worth toward `target`
 /// (0 folded, 1 open), or straight onto it when the DE's animations switch
@@ -766,6 +769,14 @@ struct BrowserApp {
     /// `chrome_open` names.
     chrome_open: bool,
     chrome_t: f32,
+    /// Set while the bar is out on its own — unfolded to show a tab that
+    /// opened in the background — and when it folds again. Anything the
+    /// person does with the bar makes it theirs (`None`), and then it stays.
+    chrome_peek: Option<std::time::Instant>,
+    /// Where the pointer was when the peek began. Still there is not a
+    /// hover: a link middle-clicked near the top of the page sits under
+    /// the bar it unfolds, and must not hold it out.
+    peek_pointer: (f32, f32),
     /// Pointer over the corner control — its hover emphasis is a repaint.
     dot_hover: bool,
     loading: bool,
@@ -1757,10 +1768,7 @@ impl BrowserApp {
             return;
         };
         if new_tab {
-            self.host.open_tab(url);
-            self.url_focused = false;
-            self.sync_page_state();
-            self.persist_session();
+            self.open_background_tab(url);
         } else {
             self.host.load(url);
             self.loading = true;
@@ -1875,12 +1883,61 @@ impl BrowserApp {
 
     fn open_chrome(&mut self) {
         self.chrome_open = true;
+        self.chrome_peek = None;
+    }
+
+    /// Unfold the bar for a moment, to show a tab that just opened behind
+    /// the page. A bar the person already has open is left alone; a peek
+    /// already under way runs on from now.
+    fn peek_chrome(&mut self) {
+        if self.chrome_open && self.chrome_peek.is_none() {
+            return;
+        }
+        self.chrome_open = true;
+        self.peek_pointer = self.pointer;
+        self.arm_peek();
+    }
+
+    /// Set the peek's deadline, and a wake for it: an idle page produces
+    /// nothing that would turn the loop when it passes.
+    fn arm_peek(&mut self) {
+        self.chrome_peek = Some(std::time::Instant::now() + CHROME_PEEK);
+        let tx = self.sender.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(CHROME_PEEK);
+            let _ = tx.send(Message::Spin);
+        });
+    }
+
+    /// Fold a peek whose time is up. A pointer brought onto the bar holds
+    /// it out a while longer. Returns whether the bar folded.
+    fn settle_peek(&mut self) -> bool {
+        let Some(at) = self.chrome_peek else { return false };
+        if std::time::Instant::now() < at {
+            return false;
+        }
+        if self.pointer != self.peek_pointer && self.chrome_hit(self.pointer.0, self.pointer.1) {
+            self.arm_peek();
+            return false;
+        }
+        self.close_chrome();
+        true
+    }
+
+    /// Open `url` in a tab behind the page — a middle-click's tab — and
+    /// show the bar for a moment so the new tab is seen to arrive.
+    fn open_background_tab(&mut self, url: Url) {
+        self.host.open_background_tab(url);
+        self.sync_page_state();
+        self.persist_session();
+        self.peek_chrome();
     }
 
     /// Fold the bar back into the orb; drops URL-bar focus with it, since
     /// a field that is not on screen must not keep eating keystrokes.
     fn close_chrome(&mut self) {
         self.chrome_open = false;
+        self.chrome_peek = None;
         // The menu hangs off a bar that is going away.
         self.bm_menu = None;
         if self.url_focused {
@@ -2196,8 +2253,7 @@ impl BrowserApp {
             CtxAction::Paste => self.host.editing_action_cmd(EditingCommand::Paste),
             CtxAction::OpenInTab(uri) => {
                 if let Ok(url) = Url::parse(uri) {
-                    self.host.open_tab(url);
-                    self.sync_page_state();
+                    self.open_background_tab(url);
                 }
             }
             CtxAction::CopyText(text) => {
@@ -3114,6 +3170,8 @@ impl Application for BrowserApp {
             shift_held: false,
             chrome_open: false,
             chrome_t: 0.0,
+            chrome_peek: None,
+            peek_pointer: (0.0, 0.0),
             dot_hover: false,
             loading: true,
             title: None,
@@ -3230,6 +3288,14 @@ impl Application for BrowserApp {
                 #[cfg(feature = "wpe")]
                 if self.opt_menu.is_some() && !self.host.option_menu_open() {
                     self.opt_menu = None;
+                    *needs_rebuild = true;
+                }
+                #[cfg(feature = "wpe")]
+                for url in self.host.take_background_opens() {
+                    self.open_background_tab(url);
+                    *needs_rebuild = true;
+                }
+                if self.settle_peek() {
                     *needs_rebuild = true;
                 }
                 if self.host.take_download_started() {
@@ -3746,6 +3812,8 @@ impl Application for BrowserApp {
                 return None;
             }
             *needs_rebuild = true;
+            // Using a bar that was only peeking makes it the person's.
+            self.chrome_peek = None;
             // The corner control toggles the bar, open or closed.
             if self.dot_hit(pos.x, pos.y) {
                 if button == MouseButton::Left {
@@ -3785,10 +3853,7 @@ impl Application for BrowserApp {
             if let Some(i) = self.fav_rects(&bar).iter().position(|r| r.contains(pos.x, pos.y)) {
                 let Ok(url) = Url::parse(&self.favs[i].url) else { return None };
                 if button == MouseButton::Middle {
-                    self.host.open_tab(url);
-                    self.url_focused = false;
-                    self.sync_page_state();
-                    self.persist_session();
+                    self.open_background_tab(url);
                 } else {
                     self.host.load(url);
                     self.loading = true;
@@ -3834,8 +3899,9 @@ impl Application for BrowserApp {
         }
 
         // Page area: a click folds the menu (and URL-bar focus with it),
-        // then goes to the page.
-        if self.chrome_open && pressed {
+        // then goes to the page. Not a peek, which folds on its own: a run
+        // of middle-clicked links keeps it out rather than flapping it.
+        if self.chrome_open && pressed && self.chrome_peek.is_none() {
             self.close_chrome();
             *needs_rebuild = true;
         }

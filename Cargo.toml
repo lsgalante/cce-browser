@@ -99,5 +99,9 @@ name = "wpe_ctx"
 required-features = ["wpe"]
 
 [[example]]
+name = "wpe_middle"
+required-features = ["wpe"]
+
+[[example]]
 name = "wpe_options"
 required-features = ["wpe"]

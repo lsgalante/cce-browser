@@ -470,6 +470,13 @@ impl ServoHost {
         self.activate(self.tabs.len() - 1);
     }
 
+    /// Open a new tab behind the active one, which stays shown and focused.
+    pub fn open_background_tab(&mut self, url: Url) {
+        let back = self.active;
+        self.open_tab(url);
+        self.activate(back);
+    }
+
     /// Close a tab. Returns false when that was the last tab (the app should
     /// exit; the tab is gone either way).
     pub fn close_tab(&mut self, index: usize) -> bool {
