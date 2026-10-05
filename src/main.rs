@@ -200,6 +200,10 @@ enum ModalKind {
     Script,
     /// An HTTP auth challenge.
     Auth,
+    /// The active tab's WebProcess stopped answering. Unlike the other two
+    /// the page is not waiting on this — it is stuck — so nothing in WebKit
+    /// is held open; the answer is to kill the process or leave it be.
+    Unresponsive,
 }
 
 #[cfg(feature = "wpe")]
@@ -238,6 +242,14 @@ impl Modal {
             y: r.y + plate_pad() + 42.0 + i as f32 * (MODAL_FIELD_H + inner_gap()),
             width: r.width - plate_pad() * 2.0,
             height: MODAL_FIELD_H,
+        }
+    }
+
+    /// The (ok, cancel) button labels.
+    fn labels(&self) -> (&'static str, &'static str) {
+        match self.kind {
+            ModalKind::Unresponsive => ("Stop page", "Wait"),
+            _ => ("OK", "Cancel"),
         }
     }
 
@@ -1779,7 +1791,12 @@ impl BrowserApp {
     /// needs redrawing.
     #[cfg(feature = "wpe")]
     fn sync_modal(&mut self) -> bool {
-        if self.modal.is_some() {
+        if let Some(m) = &self.modal {
+            // A hang that cleared on its own takes its question with it.
+            if matches!(m.kind, ModalKind::Unresponsive) && !self.host.active_unresponsive() {
+                self.modal = None;
+                return true;
+            }
             return false;
         }
         if let Some(d) = self.host.pending_dialog() {
@@ -1822,6 +1839,22 @@ impl BrowserApp {
             });
             return true;
         }
+        if self.host.active_unresponsive() {
+            let site = self
+                .host
+                .url()
+                .map(|u| u.host_str().map_or_else(|| u.to_string(), str::to_string))
+                .unwrap_or_default();
+            self.modal = Some(Modal {
+                title: "This page isn't responding".to_string(),
+                message: site,
+                fields: Vec::new(),
+                focused: 0,
+                has_cancel: true,
+                kind: ModalKind::Unresponsive,
+            });
+            return true;
+        }
         false
     }
 
@@ -1833,6 +1866,13 @@ impl BrowserApp {
             ModalKind::Script => {
                 let text = m.fields.first().map(|(_, e)| e.text.clone());
                 self.host.respond_dialog(ok, text.as_deref());
+            }
+            ModalKind::Unresponsive => {
+                if ok {
+                    self.host.stop_unresponsive();
+                } else {
+                    self.host.wait_unresponsive();
+                }
             }
             ModalKind::Auth => {
                 if ok {
@@ -2218,7 +2258,8 @@ impl BrowserApp {
         }
 
         let (ok, cancel) = m.button_rects(&r);
-        for (rect, label, accent) in [(Some(ok), "OK", true), (cancel, "Cancel", false)]
+        let (ok_label, cancel_label) = m.labels();
+        for (rect, label, accent) in [(Some(ok), ok_label, true), (cancel, cancel_label, false)]
             .into_iter()
             .filter_map(|(rc, l, a)| rc.map(|rc| (rc, l, a)))
         {
@@ -3548,8 +3589,13 @@ impl Application for BrowserApp {
                     m.fields[i].1.handle_key(event)
                 }
                 // No field: Enter accepts, Escape cancels, nothing else acts.
-                Some(_) => match (&event.logical_key, event.state) {
-                    (Key::Named(NamedKey::Enter), ElementState::Pressed) => {
+                // Except over a hang, where accepting kills the page: that
+                // question can pop up mid-typing, and an Enter meant for the
+                // page must not throw away what was typed into it.
+                Some(m) => match (&event.logical_key, event.state) {
+                    (Key::Named(NamedKey::Enter), ElementState::Pressed)
+                        if !matches!(m.kind, ModalKind::Unresponsive) =>
+                    {
                         cce_ui::widget::EditOutcome::Submit
                     }
                     (Key::Named(NamedKey::Escape), ElementState::Pressed) => {

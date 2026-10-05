@@ -41,7 +41,28 @@ struct TabState {
     /// tab report a title change — the old polling only ever looked at the
     /// active webview.
     dirty: Cell<bool>,
+    /// The tab's WebProcess died, and why (`WebKitWebProcessTerminationReason`).
+    /// Set by the signal, taken by `pump`, which puts the error page up —
+    /// outside the signal, so the load is not started from inside WebKit's
+    /// own teardown of the process.
+    terminated: Cell<Option<WebKitWebProcessTerminationReason::Type>>,
+    /// WebKit's responsiveness timer gave up on the WebProcess: a message
+    /// has gone ~3s without an answer. Cleared when it answers again.
+    unresponsive: Cell<bool>,
+    /// The person chose to wait on this hang, so it is not asked about again
+    /// until the page recovers and hangs anew.
+    hang_waived: Cell<bool>,
+    /// When the outstanding [`WebKitHost::ping`] went out, if one has not
+    /// been answered yet.
+    ping_since: Cell<Option<std::time::Instant>>,
 }
+
+/// How long a page may leave a ping unanswered before it counts as hung —
+/// WebKit's own responsiveness timeout.
+const HANG_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The world the ping runs in, so the page never sees it.
+const PING_WORLD: &str = "cce-ping";
 
 /// One tab: its webview plus the app-visible page state and the last frame
 /// uploaded to the image registry (id, w px, h px). Same shape as
@@ -92,19 +113,98 @@ unsafe extern "C" fn drop_state_ref(data: gpointer, _closure: *mut GClosure) {
 }
 
 unsafe fn connect_notify(wv: *mut WebKitWebView, signal: &str, state: &Rc<TabState>) {
+    connect_state(wv, signal, on_notify as *const () as usize, state);
+}
+
+/// Connect `cb` with a `TabState` as its data.
+unsafe fn connect_state(wv: *mut WebKitWebView, signal: &str, cb: usize, state: &Rc<TabState>) {
     let name = cstr(signal);
     // Each connection owns its own ref, handed back by `drop_state_ref`.
     let raw = Rc::into_raw(state.clone()) as gpointer;
     g_signal_connect_data(
         wv as *mut _,
         name.as_ptr(),
-        Some(std::mem::transmute::<_, unsafe extern "C" fn()>(
-            on_notify as unsafe extern "C" fn(*mut GObject, *mut GParamSpec, gpointer),
-        )),
+        Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(cb)),
         raw,
         Some(drop_state_ref),
         0,
     );
+}
+
+/// The tab's WebProcess is gone — crashed, killed for memory, or stopped by
+/// [`WebKitHost::stop_unresponsive`]. Without this the tab just froze on its
+/// last frame, with nothing saying the page behind it no longer existed.
+unsafe extern "C" fn on_terminated(
+    _wv: *mut WebKitWebView,
+    reason: WebKitWebProcessTerminationReason::Type,
+    data: gpointer,
+) {
+    let st = &*(data as *const TabState);
+    st.terminated.set(Some(reason));
+    st.unresponsive.set(false);
+    st.hang_waived.set(false);
+    st.ping_since.set(None);
+    st.dirty.set(true);
+}
+
+/// The ping came back — or failed because the process is gone, which the
+/// termination signal reports on its own.
+unsafe extern "C" fn on_ping(source: *mut GObject, res: *mut GAsyncResult, data: gpointer) {
+    let st = Rc::from_raw(data as *const TabState);
+    let mut err: *mut GError = std::ptr::null_mut();
+    let v = webkit_web_view_evaluate_javascript_finish(source as *mut WebKitWebView, res, &mut err);
+    if !v.is_null() {
+        g_object_unref(v as *mut _);
+    }
+    if !err.is_null() {
+        g_error_free(err);
+    }
+    st.ping_since.set(None);
+    if !st.unresponsive.get() {
+        st.hang_waived.set(false);
+    }
+}
+
+/// Fires once the grace has run out. It does nothing itself: being a GLib
+/// source is what wakes the loop, and the `pump` that follows is where an
+/// unanswered ping is noticed. Without it, a hung page — which sends nothing
+/// — would leave the loop asleep and the question unasked.
+unsafe extern "C" fn on_ping_due(_data: gpointer) {}
+
+unsafe extern "C" fn on_responsive(obj: *mut GObject, _pspec: *mut GParamSpec, data: gpointer) {
+    let st = &*(data as *const TabState);
+    let responsive = webkit_web_view_get_is_web_process_responsive(obj as *mut WebKitWebView) != 0;
+    st.unresponsive.set(!responsive);
+    if responsive {
+        st.hang_waived.set(false);
+    }
+}
+
+/// The page shown in place of one whose WebProcess died. Loaded as
+/// *alternate* HTML for the dead page's own URL, so the URL bar, the saved
+/// session and Reload all still mean the real page.
+fn terminated_page(url: Option<&Url>, reason: WebKitWebProcessTerminationReason::Type) -> String {
+    use crate::pages::{html_escape, page};
+    use WebKitWebProcessTerminationReason::*;
+    let (title, why) = match reason {
+        WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT => (
+            "This page ran out of memory",
+            "Its renderer used more memory than it is allowed and was stopped.",
+        ),
+        WEBKIT_WEB_PROCESS_TERMINATED_BY_API => (
+            "This page was stopped",
+            "Its renderer had stopped responding, and was shut down.",
+        ),
+        _ => ("This page crashed", "Its renderer exited unexpectedly."),
+    };
+    let meta = match url {
+        Some(u) => {
+            let u = html_escape(u.as_str());
+            format!("{u}<a href=\"{u}\">Reload</a>")
+        }
+        None => String::new(),
+    };
+    page(title, &meta, &format!("<p class=empty>{why}</p>"), "")
 }
 
 /// The frame handed over by `render_buffer`, drained by `pump`. A slot, not a
@@ -529,6 +629,15 @@ impl WebKitHost {
             for sig in ["notify::title", "notify::uri", "notify::is-loading"] {
                 connect_notify(wv, sig, state);
             }
+            // A dead or hung WebProcess. The first gets an error page in
+            // `pump`; the second is offered to the chrome to ask about.
+            connect_state(wv, "web-process-terminated", on_terminated as *const () as usize, state);
+            connect_state(
+                wv,
+                "notify::is-web-process-responsive",
+                on_responsive as *const () as usize,
+                state,
+            );
             // A page's alert/confirm/prompt, and HTTP auth challenges. Both
             // are held open and answered later, so the chrome can draw a real
             // dialog rather than the handler having to decide inline.
@@ -872,6 +981,29 @@ impl WebKitHost {
             if !tab.state.dirty.replace(false) {
                 continue;
             }
+            if let Some(reason) = tab.state.terminated.take() {
+                // Loading anything respawns a WebProcess; this loads the
+                // error page under the dead page's URL. Reload — the chrome's
+                // or the page's link — then fetches the real one.
+                log::warn!(
+                    "web process for {} terminated (reason {reason})",
+                    tab.url.as_ref().map_or("<no url>", |u| u.as_str())
+                );
+                unsafe {
+                    let html = cstr(&terminated_page(tab.url.as_ref(), reason));
+                    let uri = tab.url.as_ref().map(|u| cstr(u.as_str()));
+                    webkit_web_view_load_alternate_html(
+                        tab.webview,
+                        html.as_ptr(),
+                        uri.as_ref().map_or(std::ptr::null(), |u| u.as_ptr()),
+                        // The page's own URL as the base too: without one the
+                        // error page is `about:blank` to itself, so its
+                        // Reload link — refused outright when the dead page
+                        // was a `file:` — had nowhere real to go.
+                        uri.as_ref().map_or(std::ptr::null(), |u| u.as_ptr()),
+                    );
+                }
+            }
             tab.title = tab.state.title.borrow().clone();
             if let Some(u) = tab.state.url.borrow().clone() {
                 tab.url = Some(u);
@@ -899,6 +1031,61 @@ impl WebKitHost {
     }
     pub fn loading(&self) -> bool {
         self.active_tab().loading
+    }
+
+    /// The active tab's WebProcess has stopped answering, and the person has
+    /// not already chosen to wait on it.
+    pub fn active_unresponsive(&self) -> bool {
+        self.tabs.get(self.active).is_some_and(|t| {
+            let ping_overdue = t.state.ping_since.get().is_some_and(|at| at.elapsed() >= HANG_GRACE);
+            (t.state.unresponsive.get() || ping_overdue) && !t.state.hang_waived.get()
+        })
+    }
+
+    /// Ask the active page's main thread for an answer, to learn whether it
+    /// is still there.
+    ///
+    /// WebKit's own responsiveness timer misses the commonest hang: pointer
+    /// events are queued behind an unacknowledged one, and a *move* — which
+    /// always comes before a click — does not start the timer. So the
+    /// clicks behind it are never even sent, and the page that ignores them
+    /// is never reported. A no-op script, in a world the page cannot see,
+    /// is answered by the same main thread, so its silence is the hang.
+    fn ping(&self) {
+        let Some(t) = self.tabs.get(self.active) else { return };
+        if t.state.ping_since.get().is_some() {
+            return;
+        }
+        t.state.ping_since.set(Some(std::time::Instant::now()));
+        unsafe {
+            let (script, world) = (cstr("0"), cstr(PING_WORLD));
+            webkit_web_view_evaluate_javascript(
+                t.webview,
+                script.as_ptr(),
+                -1,
+                world.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                Some(on_ping),
+                Rc::into_raw(t.state.clone()) as gpointer,
+            );
+            g_timeout_add_once(HANG_GRACE.as_millis() as u32 + 50, Some(on_ping_due), std::ptr::null_mut());
+        }
+    }
+
+    /// Leave the active tab's hang alone until it recovers.
+    pub fn wait_unresponsive(&self) {
+        if let Some(t) = self.tabs.get(self.active) {
+            t.state.hang_waived.set(true);
+        }
+    }
+
+    /// Kill the active tab's hung WebProcess. The termination signal follows,
+    /// and with it the error page offering a reload.
+    pub fn stop_unresponsive(&self) {
+        if let Some(t) = self.tabs.get(self.active) {
+            unsafe { webkit_web_view_terminate_web_process(t.webview) }
+        }
     }
 
     pub fn load(&self, url: Url) {
@@ -1162,6 +1349,9 @@ impl WebKitHost {
         let Some(n) = input::button_number(button) else {
             return;
         };
+        if pressed {
+            self.ping();
+        }
         unsafe {
             let view = self.active_tab().view;
             let time = input::now_ms();

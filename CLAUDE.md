@@ -233,6 +233,34 @@ are choices, not accidents:
   WebProcess each on WPE). Fine at normal tab counts; lazy restore is the
   upgrade path if someone lives with dozens.
 
+### A dead or hung page
+
+A tab's WebProcess can die (crash, memory limit) or hang (a deadlock inside
+WebKit/Mesa froze one for good on 2026-10-05: main thread on a driver lock,
+zero CPU, the UI process perfectly idle — it looked like the browser was
+stuck). `src/wpe/host.rs` handles both; `examples/wpe_crash.rs` proves them
+against the real engine. Points that are choices:
+
+- **A dead process gets an error page under the dead page's URL**
+  (`web-process-terminated` → `terminated_page`, loaded as alternate HTML in
+  `pump`, not inside the signal). The URL bar, the saved session and Reload
+  all still mean the real page. The real URL is passed as the *base* URI too:
+  without it the error page is `about:blank` to itself and its Reload link
+  goes nowhere (refused outright for a `file:` page).
+- **A hang raises a modal** ("This page isn't responding": Stop page / Wait).
+  Stop kills the process with `webkit_web_view_terminate_web_process`, which
+  lands in the error page above. Wait (or Escape) is remembered per tab until
+  the page answers again. **Enter does not stop**: the question can appear
+  mid-typing, and an Enter aimed at the page must not destroy what was typed.
+- **WebKit's own responsiveness timer misses the commonest hang.** Pointer
+  events are queued behind an unacknowledged one, and a *move* — which always
+  precedes a click — does not start the timer, so the clicks behind it are
+  never even sent. Keys and the wheel are caught; move-then-click was not.
+  Every page press therefore also sends a no-op script in a private world
+  (`ping`), and a ping unanswered for `HANG_GRACE` (3s) is a hang. A one-shot
+  GLib timeout wakes the loop when the grace runs out, since a hung page
+  sends nothing that would.
+
 ## The chrome is hand-rolled
 
 There are **no `cce-ui` widgets in this app**. The whole utility bar is emitted as
