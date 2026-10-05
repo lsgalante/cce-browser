@@ -117,9 +117,9 @@ fn chrome_step(t: f32, target: f32, dt: f32, animate: bool) -> f32 {
 }
 /// Radius of the corner control, drawn and hit. The DE's dot
 /// (`plate_dock::CORNER_R`) is sized for a pane's corner; the browser's is
-/// the whole chrome while folded, so it is half again as big — the same
-/// plain plate-border disc, just easier to see and to hit.
-const DOT_R: f32 = 1.5 * plate_dock::CORNER_R;
+/// the whole chrome while folded, so it is drawn bigger — a circular
+/// plate rather than a pane's dot, easier to see and to hit.
+const DOT_R: f32 = 1.75 * plate_dock::CORNER_R;
 /// Centre inset from the bar's corner, on both axes: the DE's margin
 /// between the dot and the plate edge, kept as the dot grew.
 const DOT_INSET: f32 = plate_dock::CORNER_INSET + (DOT_R - plate_dock::CORNER_R);

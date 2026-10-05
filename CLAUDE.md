@@ -379,8 +379,8 @@ the terminal window), but drawn as a **circular plate**: the bar's own material
 (`BAR_FILL`) and rolled bevel, `plate_shaped` with corner exponent 2 — sitting
 in the **bar's corner nearest
 the window corner it is anchored to** (`dot_center()`: top-right for a top bar,
-bottom-right for a bottom one). It is drawn here at **1.5x the DE's size**
-(`DOT_R`, 12px radius against `plate_dock::CORNER_R`'s 8, with `DOT_INSET`
+bottom-right for a bottom one). It is drawn here at **1.75x the DE's size**
+(`DOT_R`, 14px radius against `plate_dock::CORNER_R`'s 8, with `DOT_INSET`
 keeping the DE's margin to the plate edge): folded, it is the whole chrome, and
 the pane-corner size was too small to find. The size lives in this crate, not
 in `cce-ui` — the shared constant is every other app's dot too — so the drawing
