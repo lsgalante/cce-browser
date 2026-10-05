@@ -498,6 +498,36 @@ Wheel events pass **winit-signed deltas** (positive = up) with no separate scrol
 event: the engine hit-tests the wheel, gives the page its `preventDefault` chance, and
 applies the inverted delta itself.
 
+### An input method composes into the chrome's fields
+
+The URL bar, the bookmarks search and a dialog's fields are each a cce-ui
+`LineEdit`, and an input method (fcitx5, IBus) composes into whichever has the
+keyboard (`keyboard_field`: a dialog's focused field, else the open bookmarks
+search, else a focused URL bar — `focused_edit` is the same answer). Three
+things make that work, all against cce-ui's `ime` model:
+
+- **Before each frame `sync_ime` hands the composition over.** The field with
+  the keyboard takes it up (`LineEdit::sync_ime`); the one that just lost the
+  keyboard drops what it showed (`drop_composition`, which cancels it in the
+  input method too). A field that went away with the keyboard — a dialog
+  answered, the menu closed — cannot drop anything, so a composition still up
+  at the handover is cancelled there: the new field has not taken it yet.
+- **A field draws `display()`, never its text**: the composition spliced in at
+  the caret (bullets in a password field), underlined, with the caret where
+  the input method has its cursor. `FieldMarks::of` measures all of it on the
+  run `paint_field` draws, and a press is hit-tested on the same string and
+  carried back with `text_index`. The composition is never in `text`, so
+  nothing that reads a field — navigation, the bookmark filter, the dialog's
+  answer — sees it until it is committed, when it arrives as typed keys.
+- **The field with the keyboard reports its caret as it paints**
+  (`ime::report_caret`): that is where the candidate window opens, and what
+  tells the shell text is wanted at all. A folded bar paints no URL field, so
+  it asks for nothing.
+
+A page's own fields get none of this: with the page focused no chrome field
+reports a caret, so the toolkit leaves text input off and the page gets
+plain keys. `a_composition_is_drawn_at_the_caret_and_never_held` is the test.
+
 ### The wheel eases; the trackpad does not
 
 A notch used to move the page `LINE_PX` in one step, which is the browser
