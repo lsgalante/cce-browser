@@ -373,16 +373,21 @@ stripped), else the file name; internal pages are refused.
 
 ### The bar is a circle menu
 
-The chrome's persistent element is the **DE's corner control** — the
-plate-border-colored dot `cce_ui::widget::plate_dock::draw_corner_dot` draws on
-a designer pane or the terminal window — sitting in the **bar's corner nearest
+The chrome's persistent element is a **corner control** — in the place of the
+DE's dot (`cce_ui::widget::plate_dock::draw_corner_dot`, on a designer pane or
+the terminal window), but drawn as a **circular plate**: the bar's own material
+(`BAR_FILL`) and rolled bevel, `plate_shaped` with corner exponent 2 — sitting
+in the **bar's corner nearest
 the window corner it is anchored to** (`dot_center()`: top-right for a top bar,
 bottom-right for a bottom one). It is drawn here at **1.5x the DE's size**
 (`DOT_R`, 12px radius against `plate_dock::CORNER_R`'s 8, with `DOT_INSET`
 keeping the DE's margin to the plate edge): folded, it is the whole chrome, and
 the pane-corner size was too small to find. The size lives in this crate, not
 in `cce-ui` — the shared constant is every other app's dot too — so the drawing
-and the hit circle are the browser's own (`dot_hit`), same disc, same color. A
+and the hit circle are the browser's own (`dot_hit`), same disc. Being a plate
+rather than a flat plate-border disc (it was one until 2026-10-05) is what makes
+it read as the bar in miniature: folded, it is exactly the seed shape the bar
+unfolds from; open, it is a raised plate on the bar's corner. A
 circle menu is the corner of the thing it expands into, so the dot sits where
 the bar's corner will be, the bar grows out of the dot's own disc, and open,
 the dot is the bar's corner. It is always drawn and always live: clicking it
@@ -390,7 +395,7 @@ unfolds the two-row bar, clicking it again folds the bar back. `chrome_open` nam
 progress (animated in `tick` over `CHROME_ANIM_S`, or landed in one frame
 when the DE's animations switch, `cce_ui::motion::enabled`, is off), and
 `dot_hover` its hover emphasis, which is a repaint. **Do not decorate the dot** — no glyph, no
-lines, no ring; it is the DE's control, not a browser icon.
+lines, no ring; it is a plate, not a browser icon.
 
 `chrome_plate()` is the one shape draw and hit-test both read — the bar, or
 the lerp from the dot's disc up to the bar — and

@@ -4518,13 +4518,19 @@ impl Application for BrowserApp {
             });
         }
 
-        // The corner control, over the bar: the DE's dot, emphasized while
-        // hovered or while the bar it opens is out.
-        // `plate_dock::draw_corner_dot`'s disc, at the browser's size.
+        // The corner control, over the bar: a circular plate of the bar's
+        // own material — the seed the bar unfolds from, so folded it reads
+        // as the bar in miniature, and open it is a plate on the bar's
+        // corner. Emphasized while hovered or while the bar is out.
         let (cx, cy) = self.dot_center();
         let r = if self.dot_hover || self.chrome_open { DOT_R * 1.15 } else { DOT_R };
-        let fill = cce_ui::color::plate_border_color().unwrap_or([0.55, 0.58, 0.66, 0.85]);
-        pc.circle(cx, cy, r, fill);
+        pc.plate_shaped(
+            Rect { x: cx - r, y: cy - r, width: 2.0 * r, height: 2.0 * r },
+            (r, r, r, r),
+            &cce_ui::scene::Material::from_fill(BAR_FILL),
+            cce_ui::layout::bevel_width().min(3.0),
+            Some(2.0),
+        );
 
         self.paint_bm_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
