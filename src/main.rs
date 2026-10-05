@@ -340,6 +340,120 @@ impl CtxMenu {
     }
 }
 
+/// A page `<select>`'s list, drawn by the chrome at the select.
+///
+/// WPE has no popup of its own — a select nobody answers never opens — so
+/// the engine hands the options over (`take_option_menu`) and waits for a
+/// pick or a close. Like the right-click menu it owns the pointer and the
+/// keyboard while it is up, and a click off it closes it and goes no
+/// further, which is also how clicking the select again folds it.
+#[cfg(feature = "wpe")]
+struct OptMenu {
+    items: Vec<wpe::OptionItem>,
+    /// The select's box, in the chrome's logical pixels.
+    anchor: Rect,
+    /// The select's width, or the widest label's when that is wider.
+    width: f32,
+    /// The highlighted row. The pointer and the arrow keys move the same
+    /// one, as in a native list; it starts on the select's current value.
+    highlight: Option<usize>,
+    /// First visible row, when the list is longer than the room it has.
+    scroll: usize,
+    /// Wheel travel not yet worth a whole row. A trackpad sends pixels a
+    /// few at a time, and rounding each event alone never moves at all.
+    wheel_rest: f64,
+    /// Type-to-find: what has been typed, and when the last key came.
+    typed: String,
+    typed_at: std::time::Instant,
+}
+
+#[cfg(feature = "wpe")]
+const OPT_ROW_H: f32 = 24.0;
+#[cfg(feature = "wpe")]
+const OPT_FONT: f32 = 13.0;
+/// The gutter the current value's dot sits in; an optgroup's options are
+/// indented by it again.
+#[cfg(feature = "wpe")]
+const OPT_INDENT: f32 = 12.0;
+/// Type-to-find starts over after this long without a key.
+#[cfg(feature = "wpe")]
+const OPT_TYPE_RESET: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The select list's plate and rows, from `opt_layout`: the one geometry
+/// draw and hit-test read.
+#[cfg(feature = "wpe")]
+struct OptLayout {
+    plate: Rect,
+    /// `(rect, index into items)` for each row the plate shows.
+    rows: Vec<(Rect, usize)>,
+    /// How many rows fit; more than this and the list scrolls.
+    cap: usize,
+}
+
+#[cfg(feature = "wpe")]
+impl OptMenu {
+    /// A row that can be picked: an enabled option, not a group heading.
+    fn pickable(&self, i: usize) -> bool {
+        self.items.get(i).is_some_and(|it| it.enabled && !it.group_label)
+    }
+
+    /// The pickable row `steps` pickable rows away from the highlight,
+    /// stopping at the ends rather than wrapping, as a native list does.
+    fn step(&mut self, steps: isize) {
+        let mut at = self.highlight;
+        for _ in 0..steps.unsigned_abs() {
+            let next = if steps > 0 {
+                let from = at.map_or(0, |h| h + 1);
+                (from..self.items.len()).find(|&i| self.pickable(i))
+            } else {
+                let to = at.unwrap_or(self.items.len());
+                (0..to).rev().find(|&i| self.pickable(i))
+            };
+            match next {
+                Some(i) => at = Some(i),
+                None => break,
+            }
+        }
+        self.highlight = at;
+    }
+
+    /// Type-to-find. Letters typed in quick succession are one prefix
+    /// ("1", "0" finds "10"); the same letter again cycles through the rows
+    /// starting with it.
+    fn find_typed(&mut self, text: &str) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.typed_at) > OPT_TYPE_RESET {
+            self.typed.clear();
+        }
+        self.typed_at = now;
+        self.typed.push_str(&text.to_lowercase());
+        let first = self.typed.chars().next().unwrap_or(' ');
+        let cycling = self.typed.chars().all(|c| c == first);
+        let (prefix, from) = if cycling {
+            (first.to_string(), self.highlight.map_or(0, |h| h + 1))
+        } else {
+            (self.typed.clone(), self.highlight.unwrap_or(0))
+        };
+        let n = self.items.len();
+        if let Some(i) = (0..n).map(|k| (from + k) % n).find(|&i| {
+            self.pickable(i)
+                && self.items[i].label.trim_start().to_lowercase().starts_with(&prefix)
+        }) {
+            self.highlight = Some(i);
+        }
+    }
+
+    /// Scroll just far enough that the highlighted row is in view.
+    fn reveal(&mut self, cap: usize) {
+        let Some(h) = self.highlight else { return };
+        if h < self.scroll {
+            self.scroll = h;
+        } else if h >= self.scroll + cap {
+            self.scroll = h + 1 - cap;
+        }
+    }
+}
+
 /// The bookmarks menu: the bar's list of saved pages, open under (or over)
 /// the "B" button in the controls row.
 ///
@@ -658,6 +772,8 @@ struct BrowserApp {
     /// Open right-click menu, if any.
     #[cfg(feature = "wpe")]
     ctx_menu: Option<CtxMenu>,
+    #[cfg(feature = "wpe")]
+    opt_menu: Option<OptMenu>,
     /// Kept so the WPE backend's calloop sources can fire `Spin`; Servo
     /// wakes the loop itself through its `EventLoopWaker`.
     #[cfg(feature = "wpe")]
@@ -1886,6 +2002,131 @@ impl BrowserApp {
         }
     }
 
+    /// Put a select's list up at the select, highlighting its current value.
+    #[cfg(feature = "wpe")]
+    fn open_opt_menu(&mut self, info: wpe::OptionMenuInfo) {
+        let (sans, ..) = cce_ui::layout::read_preferred_fonts();
+        let widest = info
+            .items
+            .iter()
+            .map(|it| {
+                let indent = if it.group_child { OPT_INDENT } else { 0.0 };
+                measure_text_width(&it.label, &sans, OPT_FONT) + indent
+            })
+            .fold(0.0, f32::max);
+        let (x, y, width, height) = info.anchor;
+        // Room for the dot's gutter, the text padding, the row inset and a
+        // scroll thumb on top of the widest label.
+        let menu_w = (widest + OPT_INDENT + 2.0 * text_pad() + 12.0).max(width).max(80.0);
+        let mut menu = OptMenu {
+            highlight: info.items.iter().position(|it| it.selected),
+            items: info.items,
+            anchor: Rect { x, y, width, height },
+            width: menu_w,
+            scroll: 0,
+            wheel_rest: 0.0,
+            typed: String::new(),
+            typed_at: std::time::Instant::now(),
+        };
+        if menu.highlight.is_some_and(|h| !menu.pickable(h)) {
+            menu.highlight = None;
+        }
+        self.opt_menu = Some(menu);
+        self.opt_reveal();
+    }
+
+    /// Take the select's list down without a pick.
+    #[cfg(feature = "wpe")]
+    fn close_opt_menu(&mut self) {
+        if self.opt_menu.take().is_some() {
+            self.host.close_option_menu();
+        }
+    }
+
+    /// Pick row `index`, if it can be picked. A heading or a disabled
+    /// option does nothing and leaves the list up.
+    #[cfg(feature = "wpe")]
+    fn pick_opt(&mut self, index: usize) {
+        if self.opt_menu.as_ref().is_some_and(|m| m.pickable(index)) {
+            self.opt_menu = None;
+            self.host.pick_option(index);
+        }
+    }
+
+    /// Keep the highlighted row in view.
+    #[cfg(feature = "wpe")]
+    fn opt_reveal(&mut self) {
+        let Some(cap) = self.opt_layout().map(|l| l.cap) else { return };
+        if let Some(m) = self.opt_menu.as_mut() {
+            m.reveal(cap);
+        }
+    }
+
+    /// The select list's plate and rows, or `None` when it is closed.
+    ///
+    /// Under the select, or over it when there is more room above — never
+    /// covering the select itself, and never past the window: a list longer
+    /// than the room scrolls.
+    #[cfg(feature = "wpe")]
+    fn opt_layout(&self) -> Option<OptLayout> {
+        let m = self.opt_menu.as_ref()?;
+        let n = m.items.len();
+        if n == 0 {
+            return None;
+        }
+        let margin = bar_margin();
+        // style: deliberate — 2px off the select, so the list reads as
+        // attached to it; the select is page content, not a plate sibling.
+        let below = self.win.1 - margin - (m.anchor.y + m.anchor.height + 2.0);
+        let above = m.anchor.y - 2.0 - margin;
+        let need = 2.0 * plate_pad() + n as f32 * OPT_ROW_H;
+        let down = need <= below || below >= above;
+        let room = if down { below } else { above };
+        let cap = (((room - 2.0 * plate_pad()) / OPT_ROW_H).floor().max(1.0) as usize).min(n);
+        let height = 2.0 * plate_pad() + cap as f32 * OPT_ROW_H;
+        let y = if down {
+            m.anchor.y + m.anchor.height + 2.0
+        } else {
+            m.anchor.y - 2.0 - height
+        }
+        .max(0.0);
+        let width = m.width.min(self.win.0 - 2.0 * margin);
+        let x = m.anchor.x.clamp(0.0, (self.win.0 - width).max(0.0));
+        let plate = Rect { x, y, width, height };
+        let first = m.scroll.min(n - cap);
+        // style: deliberate — the 2px hairline keeps a row's highlight off
+        // the plate's roll.
+        let rows = (0..cap)
+            .map(|k| {
+                let r = Rect {
+                    x: plate.x + 2.0,
+                    y: plate.y + plate_pad() + k as f32 * OPT_ROW_H,
+                    width: plate.width - 4.0,
+                    height: OPT_ROW_H,
+                };
+                (r, first + k)
+            })
+            .collect();
+        Some(OptLayout { plate, rows, cap })
+    }
+
+    /// The select list's row at a pointer position, if any.
+    #[cfg(feature = "wpe")]
+    fn opt_hit(&self, x: f32, y: f32) -> Option<usize> {
+        let l = self.opt_layout()?;
+        l.rows.iter().find(|(r, _)| r.contains(x, y)).map(|(_, i)| *i)
+    }
+
+    /// Scroll the select list by `rows`, positive down.
+    #[cfg(feature = "wpe")]
+    fn opt_scroll(&mut self, rows: isize) {
+        let Some(cap) = self.opt_layout().map(|l| l.cap) else { return };
+        if let Some(m) = self.opt_menu.as_mut() {
+            let max = m.items.len().saturating_sub(cap) as isize;
+            m.scroll = (m.scroll.min(max as usize) as isize + rows).clamp(0, max) as usize;
+        }
+    }
+
     /// Build the right-click menu from what the hit test found, placed at
     /// the pointer and clamped to the window.
     #[cfg(feature = "wpe")]
@@ -2109,6 +2350,11 @@ impl BrowserApp {
 
     /// Close a tab; returns `Message::Quit` when it was the last one.
     fn close_tab(&mut self, index: usize) -> Option<Message> {
+        // The host closes the list's engine side with the tab.
+        #[cfg(feature = "wpe")]
+        {
+            self.opt_menu = None;
+        }
         if !self.host.close_tab(index) {
             // Deliberately emptied: save the empty set so the next launch
             // starts on the homepage instead of restoring what was closed.
@@ -2130,6 +2376,8 @@ impl BrowserApp {
             self.ac_menu = None;
             self.last_field = None;
             self.host.clear_form_events();
+            // The host closes the list's engine side as it switches.
+            self.opt_menu = None;
         }
         self.host.activate(index);
         self.url_focused = false;
@@ -2584,6 +2832,61 @@ impl BrowserApp {
         );
     }
 
+    /// Draw a select's list: its options, the current value marked with a
+    /// dot, optgroup headings dim and their options indented under them.
+    #[cfg(feature = "wpe")]
+    fn paint_opt_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
+        let Some(l) = self.opt_layout() else { return };
+        let Some(m) = self.opt_menu.as_ref() else { return };
+        pc.plate(
+            l.plate,
+            (8.0, 8.0, 8.0, 8.0),
+            &cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]),
+            cce_ui::layout::bevel_width().min(3.0),
+        );
+        let n = m.items.len();
+        let scrolls = n > l.cap;
+        for (r, i) in &l.rows {
+            let Some(it) = m.items.get(*i) else { continue };
+            if m.highlight == Some(*i) && m.pickable(*i) {
+                pc.rounded_rect(*r, 5.0, (true, true, true, true), TAB_ACTIVE_BG);
+            }
+            let gutter = r.x + text_pad();
+            if it.selected {
+                let t = TEXT.map(|c| c as f32 / 255.0);
+                pc.circle(gutter + OPT_INDENT / 2.0 - 2.0, r.y + r.height / 2.0, 2.5, [t[0], t[1], t[2], 1.0]);
+            }
+            let x = gutter + OPT_INDENT + if it.group_child { OPT_INDENT } else { 0.0 };
+            let avail = r.x + r.width - x - text_pad() - if scrolls { 6.0 } else { 0.0 };
+            let color = if m.pickable(*i) { TEXT } else { TEXT_DIM };
+            pc.text(
+                Self::fit_text(&it.label, sans, OPT_FONT, avail),
+                x,
+                cce_ui::layout::align_text_y(r.y, r.height, OPT_FONT, 0.0),
+                OPT_FONT,
+                color,
+            );
+        }
+        // A long list says where in it the view is.
+        if scrolls {
+            let track = l.plate.height - 2.0 * plate_pad();
+            let thumb = (track * l.cap as f32 / n as f32).max(12.0);
+            let first = l.rows.first().map_or(0, |(_, i)| *i);
+            let at = (track - thumb) * first as f32 / (n - l.cap) as f32;
+            pc.rounded_rect(
+                Rect {
+                    x: l.plate.x + l.plate.width - 7.0,
+                    y: l.plate.y + plate_pad() + at,
+                    width: 3.0,
+                    height: thumb,
+                },
+                1.5,
+                (true, true, true, true),
+                [0.6, 0.62, 0.66, 0.5],
+            );
+        }
+    }
+
     /// Draw the right-click menu: a small plate at the pointer, rows with a
     /// hover highlight, disabled rows dimmed. Same primitives as everything
     /// else in this chrome.
@@ -2809,6 +3112,8 @@ impl Application for BrowserApp {
             #[cfg(feature = "wpe")]
             ctx_menu: None,
             #[cfg(feature = "wpe")]
+            opt_menu: None,
+            #[cfg(feature = "wpe")]
             sender,
             font_system: cce_ui::create_font_system(),
             session,
@@ -2903,6 +3208,18 @@ impl Application for BrowserApp {
                 #[cfg(feature = "wpe")]
                 if let Some(info) = self.host.take_context_menu() {
                     self.open_ctx_menu(info);
+                    *needs_rebuild = true;
+                }
+                #[cfg(feature = "wpe")]
+                if let Some(info) = self.host.take_option_menu() {
+                    self.open_opt_menu(info);
+                    *needs_rebuild = true;
+                }
+                // The page closed the list itself: the select went away, or
+                // the page navigated.
+                #[cfg(feature = "wpe")]
+                if self.opt_menu.is_some() && !self.host.option_menu_open() {
+                    self.opt_menu = None;
                     *needs_rebuild = true;
                 }
                 if self.host.take_download_started() {
@@ -3080,6 +3397,10 @@ impl Application for BrowserApp {
         // reach us; forget them rather than act on a stale Shift or drag.
         if !focused {
             self.shift_held = false;
+            // A select's list is a transient of the page, and goes with focus
+            // as a native one does.
+            #[cfg(feature = "wpe")]
+            self.close_opt_menu();
             if self.url.dragging() {
                 self.url.release();
                 self.url_entry_press = false;
@@ -3102,6 +3423,11 @@ impl Application for BrowserApp {
     }
 
     fn handle_resize(&mut self, width: f32, height: f32, scale: f64) {
+        // The select the list hangs from is about to move.
+        #[cfg(feature = "wpe")]
+        if self.win != (width, height) {
+            self.close_opt_menu();
+        }
         self.win = (width, height);
         self.scale = scale;
         let (w, h) = self.content_px();
@@ -3152,6 +3478,22 @@ impl Application for BrowserApp {
                 // Moved: the press is a drag, not the click that selects all.
                 self.url_entry_press = false;
                 *_needs_rebuild = true;
+            }
+            return;
+        }
+        // A select's list moves its highlight onto a row the pointer could
+        // pick; off the rows it stays where it was, as a native list's does.
+        // The page under it sees no moves.
+        #[cfg(feature = "wpe")]
+        if self.opt_menu.is_some() {
+            let over = self
+                .opt_hit(pos.x, pos.y)
+                .filter(|&i| self.opt_menu.as_ref().is_some_and(|m| m.pickable(i)));
+            if let (Some(i), Some(m)) = (over, self.opt_menu.as_mut()) {
+                if m.highlight != Some(i) {
+                    m.highlight = Some(i);
+                    *_needs_rebuild = true;
+                }
             }
             return;
         }
@@ -3288,6 +3630,22 @@ impl Application for BrowserApp {
             }
             // Anything else is swallowed: the page must not receive clicks
             // while it is blocked waiting on this.
+            return None;
+        }
+
+        // An open select list owns the next click: on a row it picks, off the
+        // plate it closes — clicking the select again included — and either
+        // way the click goes no further.
+        #[cfg(feature = "wpe")]
+        if let Some(l) = self.opt_layout() {
+            if pressed {
+                *needs_rebuild = true;
+                match self.opt_hit(pos.x, pos.y) {
+                    Some(i) if button == MouseButton::Left => self.pick_opt(i),
+                    _ if !l.plate.contains(pos.x, pos.y) => self.close_opt_menu(),
+                    _ => {}
+                }
+            }
             return None;
         }
 
@@ -3480,6 +3838,33 @@ impl Application for BrowserApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        // A select's list takes the wheel: over it, it scrolls the list;
+        // anywhere else it is swallowed, so the select stays under it.
+        #[cfg(feature = "wpe")]
+        if let Some(l) = self.opt_layout() {
+            if l.plate.contains(pos.x, pos.y) {
+                // Positive is up, cce-ui's winit convention; three rows a
+                // notch, a row per row's height of finger travel.
+                let travel = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -*y as f64 * 3.0,
+                    MouseScrollDelta::PixelDelta(p) => -p.y / OPT_ROW_H as f64,
+                };
+                let Some(m) = self.opt_menu.as_mut() else { return };
+                m.wheel_rest += travel;
+                let rows = m.wheel_rest.trunc();
+                m.wheel_rest -= rows;
+                self.opt_scroll(rows as isize);
+                // The rows moved under a pointer that did not.
+                let over = self.opt_hit(pos.x, pos.y);
+                if let (Some(i), Some(m)) = (over, self.opt_menu.as_mut()) {
+                    if m.pickable(i) {
+                        m.highlight = Some(i);
+                    }
+                }
+                *needs_rebuild = true;
+            }
+            return;
+        }
         // The account list moves with its field, so the page keeps the
         // wheel — but not under the plate itself.
         #[cfg(feature = "wpe")]
@@ -3554,6 +3939,52 @@ impl Application for BrowserApp {
         // Noted, never consumed: Shift still goes wherever keys go.
         if matches!(event.logical_key, Key::Named(NamedKey::Shift)) {
             self.shift_held = event.state == ElementState::Pressed;
+        }
+        // An open select list has the keyboard: arrows and paging move the
+        // highlight, Enter (or Space, before any type-to-find) picks it,
+        // Escape and Tab close, and letters find. Nothing reaches the page or
+        // the chrome's chords while it is up.
+        #[cfg(feature = "wpe")]
+        if self.opt_menu.is_some() && event.state == ElementState::Pressed {
+            *needs_rebuild = true;
+            let cap = self.opt_layout().map_or(1, |l| l.cap) as isize;
+            let typing = self.opt_menu.as_ref().is_some_and(|m| {
+                !m.typed.is_empty() && m.typed_at.elapsed() <= OPT_TYPE_RESET
+            });
+            let Some(m) = self.opt_menu.as_mut() else { return None };
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowDown) => m.step(1),
+                Key::Named(NamedKey::ArrowUp) => m.step(-1),
+                Key::Named(NamedKey::PageDown) => m.step(cap - 1),
+                Key::Named(NamedKey::PageUp) => m.step(1 - cap),
+                Key::Named(NamedKey::End) => m.step(isize::MAX),
+                Key::Named(NamedKey::Home) => m.step(isize::MIN + 1),
+                Key::Named(NamedKey::Escape | NamedKey::Tab) => {
+                    self.close_opt_menu();
+                    return None;
+                }
+                Key::Named(NamedKey::Space) if !typing => {
+                    if let Some(i) = m.highlight {
+                        self.pick_opt(i);
+                    }
+                    return None;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    match m.highlight {
+                        Some(i) => self.pick_opt(i),
+                        None => self.close_opt_menu(),
+                    }
+                    return None;
+                }
+                _ if !event.ctrl && !event.alt => {
+                    if let Some(text) = event.text.as_deref().filter(|t| !t.is_empty()) {
+                        m.find_typed(text);
+                    }
+                }
+                _ => {}
+            }
+            self.opt_reveal();
+            return None;
         }
         #[cfg(feature = "wpe")]
         if self.ctx_menu.is_some() && event.state == ElementState::Pressed {
@@ -4020,6 +4451,8 @@ impl Application for BrowserApp {
         self.paint_ac_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_save_offer(&mut pc, &sans);
+        #[cfg(feature = "wpe")]
+        self.paint_opt_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_ctx_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]

@@ -412,6 +412,42 @@ Menu semantics, all in `handle_mouse_input` / `handle_key_input`:
   keeps eating keystrokes. Wheel and pointer moves over the chrome stay off the
   page, gated by `chrome_hit`, not `bar_rect`.
 
+### Select lists
+
+**WPE draws no `<select>` popup of its own.** A click on a select raises
+`show-option-menu` with the options and the select's box, and a select
+nobody answers simply never opens — which is how every dropdown on every
+page was dead until 2026-10-05. `on_show_option_menu` (`src/wpe/host.rs`)
+holds the `WebKitOptionMenu` and hands the chrome an `OptionMenuInfo`;
+`OptMenu` in `main.rs` draws the list at the select and answers with
+`pick_option` (activate + close: the value changes and `change` fires) or
+`close_option_menu`. Points that are choices:
+
+- **`select_item` is never called.** WebKit's `close` activates whatever is
+  selected, so moving WebKit's selection with the highlight would make
+  Escape commit the row it was on. The highlight is the chrome's alone.
+- **The page can close it too** (the select is removed, the page
+  navigates): the menu's own `close` signal drops the held menu, and the
+  next `Spin` sees `option_menu_open()` false and takes the list down.
+- **The anchor is logical pixels** — the chrome's — at any output scale
+  (verified at 2), like the account list's field rects.
+- **`opt_layout()` is the one geometry**: under the select, or over it when
+  there is more room above, never past the window; a longer list scrolls
+  (wheel, arrows, paging), with a thumb. Wheel travel accumulates in
+  `wheel_rest` — a trackpad's few pixels an event, rounded one at a time,
+  never moved it.
+- It **owns the pointer and the keyboard** while up, like the right-click
+  menu: a click off it closes it and goes no further (so clicking the
+  select again folds it), and no key reaches the page or the chrome's
+  chords. Up/Down/PageUp/PageDown/Home/End skip disabled options and
+  optgroup headings; Enter (or Space, outside type-to-find) picks; Escape
+  and Tab close; letters find (`find_typed`: "1","0" finds 10, a repeated
+  letter cycles).
+- A tab switch, a tab close, losing window focus and a resize all close it.
+
+`examples/wpe_options.rs` proves the engine side against the real engine.
+
+### Middle-click is a background tab
 ### Key routing
 
 `handle_key_input` is a three-stage funnel and the order is load-bearing: Ctrl chords

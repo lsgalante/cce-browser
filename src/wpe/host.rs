@@ -735,6 +735,14 @@ impl WebKitHost {
                 on_context_menu as *const () as usize,
                 &self.prompts,
             );
+            // A `<select>` asking to open. WPE draws no popup of its own: a
+            // select nobody answers here simply never opens.
+            connect_raw(
+                wv,
+                "show-option-menu",
+                on_show_option_menu as *const () as usize,
+                &self.prompts,
+            );
             let (lw, lh) = self.logical_size();
             wpe_view_resized(view, lw, lh);
             wpe_view_set_visible(view, 1);
@@ -804,6 +812,7 @@ impl WebKitHost {
         }
         let was_active = index == self.active;
         let old_active = self.active;
+        self.close_option_menu();
         // Anything still held belongs to a view that may be the one about to
         // be destroyed; hand it back while it is still safe to. Losing that
         // frame costs a repaint, which the tab change causes anyway.
@@ -847,6 +856,8 @@ impl WebKitHost {
                 wpe_view_set_visible(old.view, 0);
             }
             self.active = index;
+            // A select's list belongs to the page going away.
+            self.close_option_menu();
             // Login fields reported by, and fill asks from, the tab going
             // away: a list must not open over the next one, and a pick made
             // there must have nowhere to land.
@@ -1427,6 +1438,54 @@ impl WebKitHost {
         self.prompts.borrow_mut().context_menu.take()
     }
 
+    /// One-shot: the `<select>` list the page just asked to show, if any.
+    /// The menu itself stays held until [`Self::pick_option`] or
+    /// [`Self::close_option_menu`] answers it, or the page closes it.
+    pub fn take_option_menu(&self) -> Option<OptionMenuInfo> {
+        self.prompts.borrow_mut().option_menu_new.take()
+    }
+
+    /// Whether a select's list is still waiting on an answer. False once the
+    /// page has closed it itself — the select was removed, the page
+    /// navigated — which is how the chrome learns to take its list down.
+    pub fn option_menu_open(&self) -> bool {
+        self.prompts.borrow().option_menu.is_some()
+    }
+
+    /// Choose option `index` and close the list. The select changes value
+    /// and fires its `input`/`change` as for any pick.
+    pub fn pick_option(&self, index: usize) {
+        let Some(menu) = self.prompts.borrow_mut().option_menu.take() else { return };
+        unsafe {
+            webkit_option_menu_activate_item(menu, index as u32);
+            webkit_option_menu_close(menu);
+            g_object_unref(menu as *mut _);
+        }
+    }
+
+    /// Close the list without choosing. Nothing is selected on the way
+    /// (`select_item` is never called), so closing leaves the value as it was.
+    pub fn close_option_menu(&self) {
+        let menu = {
+            let mut p = self.prompts.borrow_mut();
+            p.option_menu_new = None;
+            p.option_menu.take()
+        };
+        // Taken out first: `close` emits the menu's own close signal, whose
+        // handler borrows the prompts too.
+        if let Some(menu) = menu {
+            unsafe {
+                webkit_option_menu_close(menu);
+                g_object_unref(menu as *mut _);
+            }
+        }
+    }
+
+    /// Links the pages asked to open in background tabs since the last call.
+    pub fn take_background_opens(&self) -> Vec<Url> {
+        std::mem::take(&mut self.prompts.borrow_mut().background_opens)
+    }
+
     /// Fetch `uri` through WebKit's download pipeline — same signals, same
     /// store, same `cce://downloads` page as a navigated download. This is
     /// what "Download Link/Image" in the context menu dispatches to.
@@ -1919,6 +1978,14 @@ pub(super) struct Prompts {
     auth: Option<(*mut WebKitAuthenticationRequest, PendingAuth)>,
     /// The page asked for a context menu; the chrome draws its own.
     context_menu: Option<ContextMenuInfo>,
+    /// The `<select>` list waiting on an answer, reffed until it gets one or
+    /// the page closes it. Never more than one: a newer one closes the last.
+    option_menu: Option<*mut WebKitOptionMenu>,
+    /// What that list holds, until the chrome takes it to draw.
+    option_menu_new: Option<OptionMenuInfo>,
+    /// Links middle-clicked in a page, oldest first, for the chrome to open
+    /// as background tabs.
+    background_opens: Vec<Url>,
     /// Login fields the account watcher reported, oldest first. A queue and
     /// not a slot: a blur followed by a focus is two different states, and
     /// collapsing them would leave the list open over the wrong field.
@@ -1939,6 +2006,28 @@ pub struct ContextMenuInfo {
     pub image_uri: Option<String>,
     pub is_selection: bool,
     pub is_editable: bool,
+}
+
+/// A `<select>`'s option list, for the chrome to draw at the select.
+#[derive(Debug, Clone)]
+pub struct OptionMenuInfo {
+    pub items: Vec<OptionItem>,
+    /// The select's box — `(x, y, width, height)` in the view's logical
+    /// pixels, which are the chrome's.
+    pub anchor: (f32, f32, f32, f32),
+}
+
+/// One row of a select's list: an `<option>`, or an `<optgroup>`'s label.
+#[derive(Debug, Clone)]
+pub struct OptionItem {
+    pub label: String,
+    /// An `<optgroup>` heading: drawn, never picked.
+    pub group_label: bool,
+    /// An option inside an `<optgroup>`, drawn indented under its heading.
+    pub group_child: bool,
+    pub enabled: bool,
+    /// The select's current value.
+    pub selected: bool,
 }
 
 /// A page's `alert` / `confirm` / `prompt`, waiting on the chrome.
@@ -2143,4 +2232,79 @@ unsafe extern "C" fn on_context_menu(
     }
     prompts.borrow_mut().context_menu = Some(info);
     1
+}
+
+/// A `<select>` asked to open. Read its options and where it is, hold the
+/// menu, and claim it: the chrome draws the list and answers with
+/// `pick_option` or `close_option_menu`. Returning FALSE would leave it to
+/// WebKit's default, which on WPE is nothing at all.
+unsafe extern "C" fn on_show_option_menu(
+    _wv: *mut WebKitWebView,
+    menu: *mut WebKitOptionMenu,
+    rect: *mut WebKitRectangle,
+    data: gpointer,
+) -> gboolean {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    let items = (0..webkit_option_menu_get_n_items(menu))
+        .map(|i| {
+            let item = webkit_option_menu_get_item(menu, i);
+            OptionItem {
+                label: from_cstr(webkit_option_menu_item_get_label(item)).unwrap_or_default(),
+                group_label: webkit_option_menu_item_is_group_label(item) != 0,
+                group_child: webkit_option_menu_item_is_group_child(item) != 0,
+                enabled: webkit_option_menu_item_is_enabled(item) != 0,
+                selected: webkit_option_menu_item_is_selected(item) != 0,
+            }
+        })
+        .collect();
+    let anchor = if rect.is_null() {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        let r = &*rect;
+        (r.x as f32, r.y as f32, r.width as f32, r.height as f32)
+    };
+    g_object_ref(menu as *mut _);
+    // The page can close the list itself (the select goes away, the page
+    // navigates); hearing that is how the chrome's copy comes down too.
+    let name = cstr("close");
+    g_signal_connect_data(
+        menu as *mut _,
+        name.as_ptr(),
+        Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(
+            on_option_menu_close as *const () as usize,
+        )),
+        // The close handler's own reference, dropped with the connection.
+        {
+            Rc::increment_strong_count(data as *const RefCell<Prompts>);
+            data
+        },
+        Some(drop_prompts_ref),
+        0,
+    );
+    let previous = {
+        let mut p = prompts.borrow_mut();
+        p.option_menu_new = Some(OptionMenuInfo { items, anchor });
+        p.option_menu.replace(menu)
+    };
+    // Closed outside the borrow: its close handler borrows the prompts.
+    if let Some(old) = previous {
+        webkit_option_menu_close(old);
+        g_object_unref(old as *mut _);
+    }
+    1
+}
+
+/// A held list was closed — by the page, or by our own `close`. Only the
+/// first case finds it still held; ours took it out before closing. WebKit
+/// keeps its own reference across the emission, so dropping ours here is
+/// safe.
+unsafe extern "C" fn on_option_menu_close(menu: *mut WebKitOptionMenu, data: gpointer) {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    let mut p = prompts.borrow_mut();
+    if p.option_menu == Some(menu) {
+        p.option_menu = None;
+        p.option_menu_new = None;
+        drop(p);
+        g_object_unref(menu as *mut _);
+    }
 }
