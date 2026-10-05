@@ -112,10 +112,18 @@ fn chrome_step(t: f32, target: f32, dt: f32, animate: bool) -> f32 {
         (t - step).max(target)
     }
 }
+/// Radius of the corner control, drawn and hit. The DE's dot
+/// (`plate_dock::CORNER_R`) is sized for a pane's corner; the browser's is
+/// the whole chrome while folded, so it is half again as big — the same
+/// plain plate-border disc, just easier to see and to hit.
+const DOT_R: f32 = 1.5 * plate_dock::CORNER_R;
+/// Centre inset from the bar's corner, on both axes: the DE's margin
+/// between the dot and the plate edge, kept as the dot grew.
+const DOT_INSET: f32 = plate_dock::CORNER_INSET + (DOT_R - plate_dock::CORNER_R);
 /// Width reserved at the right end of the row the corner control sits on
 /// (the tab row for a top bar, the controls row for a bottom one), so the
 /// "+" or the bookmark star clears the dot in the bar's corner.
-const DOT_COL: f32 = 2.0 * plate_dock::CORNER_INSET;
+const DOT_COL: f32 = 2.0 * DOT_INSET;
 
 /// The reservation a row makes for the corner control: `DOT_COL` on the
 /// row in the bar's anchored corner, nothing on the other.
@@ -1362,7 +1370,7 @@ impl BrowserApp {
         let width = SAVE_W.min(self.win.0 - 2.0 * bar_margin()).max(220.0);
         let height = plate_pad() * 2.0 + 20.0 + 18.0 + 18.0 + inner_gap() + BTN_H;
         let (cx, cy) = self.dot_center();
-        let edge = cx + plate_dock::CORNER_R;
+        let edge = cx + DOT_R;
         let x = (edge - width).clamp(0.0, (self.win.0 - width).max(0.0));
         let gap = item_gap();
         let y = match self.settings.bar_position {
@@ -1371,7 +1379,7 @@ impl BrowserApp {
                     let (bar, _) = self.chrome_plate();
                     bar.y + bar.height
                 } else {
-                    cy + plate_dock::CORNER_R
+                    cy + DOT_R
                 };
                 below + gap
             }
@@ -1379,7 +1387,7 @@ impl BrowserApp {
                 let above = if self.chrome_t > 0.0 {
                     self.chrome_plate().0.y
                 } else {
-                    cy - plate_dock::CORNER_R
+                    cy - DOT_R
                 };
                 (above - gap - height).max(0.0)
             }
@@ -1820,7 +1828,7 @@ impl BrowserApp {
     /// stays there when the bar is out.
     fn dot_center(&self) -> (f32, f32) {
         let bar = self.bar();
-        let inset = plate_dock::CORNER_INSET;
+        let inset = DOT_INSET;
         let cy = match self.settings.bar_position {
             settings::BarPosition::Top => bar.y + inset,
             settings::BarPosition::Bottom => bar.y + bar.height - inset,
@@ -1829,7 +1837,9 @@ impl BrowserApp {
     }
 
     fn dot_hit(&self, x: f32, y: f32) -> bool {
-        plate_dock::corner_hit(self.dot_center(), x, y)
+        let (cx, cy) = self.dot_center();
+        let (dx, dy) = (x - cx, y - cy);
+        dx * dx + dy * dy <= DOT_R * DOT_R
     }
 
     /// Unfold progress with easing applied — what the plate is drawn from.
@@ -1845,7 +1855,7 @@ impl BrowserApp {
     fn chrome_plate(&self) -> (Rect, f32) {
         let e = self.chrome_ease();
         let (cx, cy) = self.dot_center();
-        let seed = plate_dock::CORNER_R;
+        let seed = DOT_R;
         let bar = self.bar();
         let lerp = |a: f32, b: f32| a + (b - a) * e;
         let plate = Rect {
@@ -4444,7 +4454,11 @@ impl Application for BrowserApp {
 
         // The corner control, over the bar: the DE's dot, emphasized while
         // hovered or while the bar it opens is out.
-        plate_dock::draw_corner_dot(&mut pc, self.dot_center(), self.dot_hover || self.chrome_open);
+        // `plate_dock::draw_corner_dot`'s disc, at the browser's size.
+        let (cx, cy) = self.dot_center();
+        let r = if self.dot_hover || self.chrome_open { DOT_R * 1.15 } else { DOT_R };
+        let fill = cce_ui::color::plate_border_color().unwrap_or([0.55, 0.58, 0.66, 0.85]);
+        pc.circle(cx, cy, r, fill);
 
         self.paint_bm_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
