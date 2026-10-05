@@ -4037,7 +4037,35 @@ impl Application for BrowserApp {
     }
 }
 
+/// Turn off Intel's CCS compression for this process and everything it
+/// spawns.
+///
+/// Mesa's iris driver can deadlock two threads against each other through
+/// the aux map CCS needs: one adds a mapping and wants the buffer manager's
+/// lock, the other reuses a cached buffer under that lock and wants the aux
+/// map's. WebKit's two GPU painting threads hit exactly that and froze a
+/// page for good (2026-10-05; CLAUDE.md, "A dead or hung page"). Without CCS
+/// the aux-map code never runs. The cost is uncompressed surfaces — more
+/// memory bandwidth on the iGPU.
+///
+/// Set first, before anything has started a thread or opened a GPU device:
+/// WebKit's page processes inherit it through their sandbox, and the chrome's
+/// own Vulkan device reads it too. `CCE_BROWSER_CCS=1` keeps compression, for
+/// measuring what this costs.
+fn disable_intel_ccs() {
+    if std::env::var_os("CCE_BROWSER_CCS").is_some_and(|v| v == "1") {
+        return;
+    }
+    let current = std::env::var("INTEL_DEBUG").unwrap_or_default();
+    if current.split(',').any(|f| f.trim() == "noccs") {
+        return;
+    }
+    let value = if current.is_empty() { "noccs".to_string() } else { format!("{current},noccs") };
+    std::env::set_var("INTEL_DEBUG", value);
+}
+
 fn main() {
+    disable_intel_ccs();
     env_logger::init();
     // A read-only look at what a Raindrop sync would do (RAINDROP-SYNC.md).
     // Ahead of the instance hand-off: it is a tool, not a launch, and must

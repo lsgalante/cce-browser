@@ -55,6 +55,76 @@ struct TabState {
     /// When the outstanding [`WebKitHost::ping`] went out, if one has not
     /// been answered yet.
     ping_since: Cell<Option<std::time::Instant>>,
+    /// The process is being stopped as a deadlock, so its termination should
+    /// reload the page rather than show the error page.
+    auto_reload: Cell<bool>,
+    /// When this tab was last recovered that way.
+    last_auto: Cell<Option<std::time::Instant>>,
+}
+
+/// How long every page process must sit idle while the active tab is
+/// unresponsive before the hang is taken for a deadlock and recovered
+/// without asking.
+const DEADLOCK_WATCH: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A tab is recovered automatically at most this often. A page that
+/// deadlocks on every load is left to the prompt instead of reloading in a
+/// loop.
+const AUTO_RECOVER_GAP: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A deadlock in progress: when the watch began, on which tab, and every
+/// page process's CPU time at that moment.
+struct DeadlockWatch {
+    tab: Rc<TabState>,
+    since: std::time::Instant,
+    ticks: std::collections::HashMap<i32, u64>,
+}
+
+/// CPU time (user + system, in `/proc` clock ticks) of every WPEWebProcess
+/// below this one — they sit under bubblewrap, so not as direct children.
+///
+/// WebKit has no API that says which process serves which tab, so the
+/// watch reads all of them. That is what makes it conservative: one busy
+/// process anywhere is enough to leave the hang to the prompt.
+fn web_process_ticks() -> std::collections::HashMap<i32, u64> {
+    let me = std::process::id() as i32;
+    let stat = |pid: i32| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+    // The fields after the parenthesized command name, which may hold spaces.
+    let fields = |s: &str| -> Vec<String> {
+        s.rsplit_once(')').map_or_else(Vec::new, |(_, rest)| {
+            rest.split_whitespace().map(str::to_string).collect()
+        })
+    };
+    let mut out = std::collections::HashMap::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else { continue };
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if comm.trim() != "WPEWebProcess" {
+            continue;
+        }
+        let Some(s) = stat(pid) else { continue };
+        let f = fields(&s);
+        let mut parent = f.get(1).and_then(|p| p.parse::<i32>().ok());
+        let mut ours = false;
+        for _ in 0..4 {
+            match parent {
+                Some(p) if p == me => {
+                    ours = true;
+                    break;
+                }
+                Some(p) if p > 1 => {
+                    parent = stat(p).and_then(|s| fields(&s).get(1).and_then(|p| p.parse().ok()));
+                }
+                _ => break,
+            }
+        }
+        // utime and stime are fields 14 and 15; `f` starts at field 3.
+        let ticks = |i: usize| f.get(i).and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
+        if ours {
+            out.insert(pid, ticks(11) + ticks(12));
+        }
+    }
+    out
 }
 
 /// How long a page may leave a ping unanswered before it counts as hung —
@@ -302,6 +372,8 @@ pub struct WebKitHost {
     /// press-drag-release over text selected nothing (and dragged nothing)
     /// while every move went out with an empty mask.
     held_buttons: Cell<WPEModifiers::Type>,
+    /// A hang being watched to see whether it is a deadlock.
+    deadlock_watch: Option<DeadlockWatch>,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -457,6 +529,7 @@ impl WebKitHost {
                 spare: None,
                 window_focused: false,
                 held_buttons: Cell::new(0),
+                deadlock_watch: None,
             };
             // The account watcher's channel, in its own script world. Both
             // halves are registered here, once, on the shared content
@@ -864,6 +937,7 @@ impl WebKitHost {
         if let Some(p) = &mut self.poll {
             p.sync();
         }
+        self.watch_deadlock();
         // Nothing has drawn the last frame yet, so reading another would be
         // copying over a picture that was never shown. Leave the buffer held:
         // the engine's next frame supersedes it and hands it back unread.
@@ -982,26 +1056,38 @@ impl WebKitHost {
                 continue;
             }
             if let Some(reason) = tab.state.terminated.take() {
-                // Loading anything respawns a WebProcess; this loads the
-                // error page under the dead page's URL. Reload — the chrome's
-                // or the page's link — then fetches the real one.
-                log::warn!(
-                    "web process for {} terminated (reason {reason})",
-                    tab.url.as_ref().map_or("<no url>", |u| u.as_str())
-                );
-                unsafe {
-                    let html = cstr(&terminated_page(tab.url.as_ref(), reason));
-                    let uri = tab.url.as_ref().map(|u| cstr(u.as_str()));
-                    webkit_web_view_load_alternate_html(
-                        tab.webview,
-                        html.as_ptr(),
-                        uri.as_ref().map_or(std::ptr::null(), |u| u.as_ptr()),
-                        // The page's own URL as the base too: without one the
-                        // error page is `about:blank` to itself, so its
-                        // Reload link — refused outright when the dead page
-                        // was a `file:` — had nowhere real to go.
-                        uri.as_ref().map_or(std::ptr::null(), |u| u.as_ptr()),
+                // Stopped as a deadlock: just load the page again. A plain
+                // load, not a reload, so a page that came from a form post
+                // is not posted twice.
+                let reload = tab.state.auto_reload.take().then_some(tab.url.as_ref()).flatten();
+                if let Some(u) = reload {
+                    log::warn!("reloading {u} after stopping its deadlocked web process");
+                    unsafe {
+                        let c = cstr(u.as_str());
+                        webkit_web_view_load_uri(tab.webview, c.as_ptr());
+                    }
+                } else {
+                    // Loading anything respawns a WebProcess; this loads the
+                    // error page under the dead page's URL. Reload — the chrome's
+                    // or the page's link — then fetches the real one.
+                    log::warn!(
+                        "web process for {} terminated (reason {reason})",
+                        tab.url.as_ref().map_or("<no url>", |u| u.as_str())
                     );
+                    unsafe {
+                        let html = cstr(&terminated_page(tab.url.as_ref(), reason));
+                        let uri = tab.url.as_ref().map(|u| cstr(u.as_str()));
+                        webkit_web_view_load_alternate_html(
+                            tab.webview,
+                            html.as_ptr(),
+                            uri.as_ref().map_or(std::ptr::null(), |u| u.as_ptr()),
+                            // The page's own URL as the base too: without one the
+                            // error page is `about:blank` to itself, so its
+                            // Reload link — refused outright when the dead page
+                            // was a `file:` — had nowhere real to go.
+                            uri.as_ref().map_or(std::ptr::null(), |u| u.as_ptr()),
+                        );
+                    }
                 }
             }
             tab.title = tab.state.title.borrow().clone();
@@ -1036,10 +1122,96 @@ impl WebKitHost {
     /// The active tab's WebProcess has stopped answering, and the person has
     /// not already chosen to wait on it.
     pub fn active_unresponsive(&self) -> bool {
-        self.tabs.get(self.active).is_some_and(|t| {
-            let ping_overdue = t.state.ping_since.get().is_some_and(|at| at.elapsed() >= HANG_GRACE);
-            (t.state.unresponsive.get() || ping_overdue) && !t.state.hang_waived.get()
-        })
+        self.tabs.get(self.active).is_some_and(|t| self.hung(t) && !t.state.hang_waived.get())
+    }
+
+    /// The tab's process has stopped answering — by WebKit's timer or an
+    /// overdue ping. Never while a page dialog or auth challenge is up: the
+    /// process is blocked on *us* then, and a ping sent just before it
+    /// opened goes unanswered for as long as it stays open.
+    fn hung(&self, t: &Tab) -> bool {
+        let p = self.prompts.borrow();
+        if p.dialog.is_some() || p.auth.is_some() {
+            return false;
+        }
+        let ping_overdue = t.state.ping_since.get().is_some_and(|at| at.elapsed() >= HANG_GRACE);
+        t.state.unresponsive.get() || ping_overdue
+    }
+
+    /// Recover a deadlocked page without asking.
+    ///
+    /// A deadlock and a busy page look alike from here — both stop
+    /// answering — but a deadlocked process burns no CPU (the 2026-10-05
+    /// one sat at zero, every thread parked on a lock) and a spinning script
+    /// burns a whole core. So while the active tab is hung, every page
+    /// process's CPU time is sampled; if none of them has used more than a
+    /// sliver of it across `DEADLOCK_WATCH`, the process is stopped and the
+    /// page loaded again. Anything busier is left to the prompt, as is a
+    /// hang the person chose to wait on, and a tab recovered within
+    /// `AUTO_RECOVER_GAP`.
+    fn watch_deadlock(&mut self) {
+        let state = self
+            .tabs
+            .get(self.active)
+            .filter(|t| self.hung(t) && !t.state.hang_waived.get())
+            .map(|t| t.state.clone());
+        let Some(state) = state else {
+            self.deadlock_watch = None;
+            return;
+        };
+        if state.last_auto.get().is_some_and(|at| at.elapsed() < AUTO_RECOVER_GAP) {
+            return;
+        }
+        let watching = self.deadlock_watch.as_ref().filter(|w| Rc::ptr_eq(&w.tab, &state));
+        let Some(watch) = watching else {
+            self.deadlock_watch = Some(DeadlockWatch {
+                tab: state,
+                since: std::time::Instant::now(),
+                ticks: web_process_ticks(),
+            });
+            return;
+        };
+        let elapsed = watch.since.elapsed();
+        if elapsed < DEADLOCK_WATCH {
+            return;
+        }
+        let now = web_process_ticks();
+        // 5% of one core, at /proc's 100 ticks a second. A process that
+        // appeared mid-watch is measured from zero, which counts its whole
+        // startup against it — on the side of not stopping anything.
+        let budget = (elapsed.as_secs_f64() * 100.0 * 0.05) as u64;
+        let idle = !now.is_empty()
+            && now.iter().all(|(pid, t)| {
+                t.saturating_sub(watch.ticks.get(pid).copied().unwrap_or(0)) <= budget
+            });
+        if !idle {
+            // Busy: a script, most likely. Watch again from here, so a page
+            // that stops spinning and then deadlocks is still caught.
+            self.deadlock_watch = Some(DeadlockWatch {
+                tab: state,
+                since: std::time::Instant::now(),
+                ticks: now,
+            });
+            return;
+        }
+        self.deadlock_watch = None;
+        log::warn!(
+            "{} has not answered in {:.0}s and no page process is running; \
+             stopping it as deadlocked",
+            self.tabs[self.active].url.as_ref().map_or("<no url>", |u| u.as_str()),
+            (elapsed + HANG_GRACE).as_secs_f64(),
+        );
+        state.auto_reload.set(true);
+        state.last_auto.set(Some(std::time::Instant::now()));
+        self.stop_unresponsive();
+    }
+
+    /// A dialog or auth challenge was answered: whatever ping was waiting
+    /// behind it was waiting on the person, not on a hung page.
+    fn forget_ping(&self) {
+        if let Some(t) = self.tabs.get(self.active) {
+            t.state.ping_since.set(None);
+        }
     }
 
     /// Ask the active page's main thread for an answer, to learn whether it
@@ -1275,6 +1447,7 @@ impl WebKitHost {
         let Some((dialog, pending)) = self.prompts.borrow_mut().dialog.take() else {
             return;
         };
+        self.forget_ping();
         unsafe {
             if pending.prompt_default.is_some() {
                 // A cancelled prompt must return null, not "" — a page
@@ -1301,6 +1474,7 @@ impl WebKitHost {
         let Some((request, _)) = self.prompts.borrow_mut().auth.take() else {
             return;
         };
+        self.forget_ping();
         unsafe {
             match credentials {
                 Some((user, password)) => {

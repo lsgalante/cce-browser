@@ -10,6 +10,10 @@
 //! * the dead tab shows the error page **under its own URL**, so the URL
 //!   bar and the saved session still mean the real page;
 //! * a reload from there fetches the real page again;
+//! * a page that spins is never stopped without asking, but a process that
+//!   is hung *and idle* — what a deadlock looks like, simulated with SIGSTOP —
+//!   is stopped and reloaded on its own;
+//! * a page waiting in `alert()` is not taken for hung;
 //! * a WebProcess that dies outright (SIGKILL) gets the crash page.
 //!
 //! `cargo run --release -p cce-browser --example wpe_crash`
@@ -39,6 +43,10 @@ const HANG: &str = "<!doctype html><title>hang</title><p>spinning\
 <script>setTimeout(() => { for (;;) {} }, 300)</script>";
 #[cfg(feature = "wpe")]
 const FINE: &str = "<!doctype html><title>recovered</title><p>fine";
+/// Opens an alert on the first click.
+#[cfg(feature = "wpe")]
+const ALERT: &str = "<!doctype html><title>alert</title><p>click me\
+<script>addEventListener('mousedown', () => alert('hi'), {once: true})</script>";
 
 /// The first request gets the hanging page, every later one the fine one.
 #[cfg(feature = "wpe")]
@@ -52,12 +60,16 @@ fn serve() -> u16 {
             let Ok(mut s) = stream else { continue };
             let mut buf = [0u8; 4096];
             let n = s.read(&mut buf).unwrap_or(0);
-            if !String::from_utf8_lossy(&buf[..n]).starts_with("GET /page") {
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = if req.starts_with("GET /alert") {
+                ALERT
+            } else if req.starts_with("GET /page") {
+                served += 1;
+                if served == 1 { HANG } else { FINE }
+            } else {
                 let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 continue;
-            }
-            let body = if served == 0 { HANG } else { FINE };
-            served += 1;
+            };
             let _ = write!(
                 s,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -135,6 +147,15 @@ fn main() {
     settle(&mut host, 4000);
     check("unanswered input reports a hang", host.active_unresponsive(), String::new());
 
+    // Well past the deadlock watch: a spinning page burns a core, so it is
+    // left to the person to stop.
+    settle(&mut host, 7000);
+    check(
+        "a busy page is never stopped unasked",
+        host.active_unresponsive() && host.title().as_deref() == Some("hang"),
+        format!("{:?}", host.title()),
+    );
+
     host.wait_unresponsive();
     check("waiting quiets the question", !host.active_unresponsive(), String::new());
 
@@ -156,6 +177,52 @@ fn main() {
     host.mouse_button_ui(MouseButton::Left, false, 120.0, 120.0);
     settle(&mut host, 4000);
     check("a live page is not reported", !host.active_unresponsive(), String::new());
+
+    // A deadlock, simulated: every page process frozen, so nothing answers
+    // and nothing burns CPU.
+    let frozen = web_processes();
+    for &pid in &frozen {
+        unsafe { libc_kill(pid, 19) }; // SIGSTOP
+    }
+    host.mouse_move(130.0, 130.0);
+    host.mouse_button_ui(MouseButton::Left, true, 130.0, 130.0);
+    host.mouse_button_ui(MouseButton::Left, false, 130.0, 130.0);
+    settle(&mut host, 4000);
+    check("an idle hang is reported first", host.active_unresponsive(), String::new());
+    settle(&mut host, 6000);
+    let title = host.title().unwrap_or_default();
+    check(
+        "then stopped and reloaded on its own",
+        title == "recovered" && !host.active_unresponsive(),
+        format!("{title:?}"),
+    );
+    check("under the same URL", host.url().as_ref() == Some(&page), String::new());
+    // Whatever was frozen and not stopped (the spare) goes back to work.
+    for &pid in &frozen {
+        unsafe { libc_kill(pid, 18) }; // SIGCONT
+    }
+    settle(&mut host, 500);
+
+    // A page blocked in alert() is waiting on the chrome, not hung — even
+    // though the ping sent with the click that opened it goes unanswered.
+    let alert = url::Url::parse(&format!("http://127.0.0.1:{port}/alert")).unwrap();
+    host.load(alert);
+    settle(&mut host, 1500);
+    host.mouse_move(140.0, 140.0);
+    host.mouse_button_ui(MouseButton::Left, true, 140.0, 140.0);
+    host.mouse_button_ui(MouseButton::Left, false, 140.0, 140.0);
+    settle(&mut host, 4500);
+    check(
+        "a page in alert() is not hung",
+        host.pending_dialog().is_some() && !host.active_unresponsive(),
+        format!("dialog={:?}", host.pending_dialog().map(|d| d.message)),
+    );
+    host.respond_dialog(true, None);
+    check("nor right after it is answered", !host.active_unresponsive(), String::new());
+    settle(&mut host, 1000);
+    check("and it is still the same page", host.title().as_deref() == Some("alert"), format!("{:?}", host.title()));
+    host.load(page.clone());
+    settle(&mut host, 1500);
 
     let victims = web_processes();
     // SIGKILL rather than SIGSEGV: JavaScriptCore installs its own SEGV

@@ -259,7 +259,27 @@ against the real engine. Points that are choices:
   Every page press therefore also sends a no-op script in a private world
   (`ping`), and a ping unanswered for `HANG_GRACE` (3s) is a hang. A one-shot
   GLib timeout wakes the loop when the grace runs out, since a hung page
-  sends nothing that would.
+  sends nothing that would. A pending `alert()` or auth challenge is never a
+  hang — the page is blocked on *us* — and answering one forgets the ping
+  that was waiting behind it.
+- **A deadlock is recovered without asking** (`watch_deadlock`). A hung page
+  and a spinning script look alike from here; the difference is CPU: the
+  2026-10-05 deadlock sat at zero, a script burns a core. WebKit says nothing
+  about which process serves which tab, so every WPEWebProcess under the
+  browser is sampled from `/proc`, and only if *all* of them stay under 5% of
+  a core for `DEADLOCK_WATCH` (5s) is the process stopped and the page loaded
+  again — a plain load, so a form post is not resubmitted. Busy, waited on
+  ("Wait"), or already recovered within `AUTO_RECOVER_GAP` (2 min) is left to
+  the prompt, so a page that deadlocks on every load cannot reload-loop.
+- **The deadlock itself is a Mesa iris bug, still on Mesa `main`**: a lock-order
+  inversion between the aux-map mutex and `bufmgr->lock`, hit by WebKit's two
+  Skia GPU painting threads allocating textures at once (one adds an aux
+  mapping and needs a new table page; the other reuses a cached BO and unmaps
+  its old aux range). `main()` therefore sets `INTEL_DEBUG=noccs` before
+  anything starts (`disable_intel_ccs`): without CCS the aux map is never
+  used. Page processes inherit it through bubblewrap. Measured in a scale-2
+  shadow scrolling 24 large images: no difference in frame rate or CPU.
+  `CCE_BROWSER_CCS=1` turns compression back on.
 
 ## The chrome is hand-rolled
 
