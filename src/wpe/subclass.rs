@@ -215,6 +215,9 @@ unsafe extern "C" fn display_class_init(class: *mut c_void, _data: *mut c_void) 
     // Without this, WebKit has no clipboard at all: Ctrl+V in a page reads
     // nothing and Ctrl+C writes nowhere, silently.
     (*c).get_clipboard = Some(display_get_clipboard);
+    // How a page says a text field has focus: without it, the browser cannot
+    // tell the compositor to raise the on-screen keyboard (`ime.rs`).
+    (*c).create_input_method_context = Some(super::ime::create_context);
 }
 
 // ---- clipboard ----

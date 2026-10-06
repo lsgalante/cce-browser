@@ -29,6 +29,7 @@ Nineteen files, ~14.8k lines. The twelve that carry the design:
 | `src/settings.rs` | the per-app KDL config |
 | `src/vi.rs` | vi mode, after qutebrowser: the modes, the bindings and their parser, hint labels, `:` commands, and the page scripts |
 | `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, which entries a host earns, saving a new login, and the never-save list |
+| `src/wpe/ime.rs` | which page text field is open, as WebKit reports it to the input-method context our display hands out — what `display_list` claims for the on-screen keyboard |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
 | `src/wpe/damage.rs` | what a frame changed: damage accumulated per view across skipped frames, turned into the regions `pump` reads back |
 | `src/raindrop/` | bookmark sync with Raindrop.io's Unsorted: the three-way merge (`mod.rs`), the REST client (`api.rs`), the worker and status line (`sync.rs`) — design in RAINDROP-SYNC.md |
@@ -569,9 +570,44 @@ things make that work, all against cce-ui's `ime` model:
   tells the shell text is wanted at all. A folded bar paints no URL field, so
   it asks for nothing.
 
-A page's own fields get none of this: with the page focused no chrome field
-reports a caret, so the toolkit leaves text input off and the page gets
-plain keys. `a_composition_is_drawn_at_the_caret_and_never_held` is the test.
+`a_composition_is_drawn_at_the_caret_and_never_held` is the test.
+
+### A page's own fields claim text input too
+
+A focused field in the page — `<input>`, `<textarea>`, `contenteditable`, in
+any frame — is claimed from `display_list` as well
+(`cce_ui::text_input::claim`, before the chrome draws, so an open chrome field
+claims last and wins). That is what raises the compositor's on-screen keyboard
+(cce-compositor `osk.rs`) when the field was tapped. WebKit itself says which
+field is open: the display hands it our own input-method context
+(`create_input_method_context`, `src/wpe/ime.rs`), whose `focus_in` /
+`focus_out` / `set_cursor_area` record the field and its caret per view. No
+script is injected, and nothing else of the context is overridden, so keys
+still reach the page unfiltered. Points that are choices:
+
+- **A press into the page holds back the toolkit's re-announcement**
+  (`defer_page_press`). cce-ui announces an open field again after every press
+  so a tap on an already-focused field raises the board — but it would do so
+  before WebKit has seen the press, so a tap on a link or beside the field
+  (or anywhere, on a page that autofocused its search box) would flash the
+  board up. The browser takes the announcement back and makes it
+  `PAGE_PRESS_SETTLE` (150 ms) later only if the field is still open. A tap
+  that moves the caret is announced at once anyway, as a moved caret.
+- **Not gated on `window_focused`**: the toolkit only enables text input while
+  the compositor gives the surface text-input focus, and `window_focused`
+  follows `wl_keyboard`, which a seat with no keyboard device (a headless
+  shadow) never enters.
+- **`inputmode="none"` is not honoured yet**: the field is skipped when WebKit
+  sets `INHIBIT_OSK`, but WebKit 2.52 sends only `SPELLCHECK` for it.
+- **A composition is not shown in the page.** With an input method running,
+  a committed string should arrive as typed keys, as it does for the chrome
+  (not yet tried with fcitx5/IBus); the preedit is not drawn (WebKit would take it through the same context's
+  `get_preedit_string` and its signals, which nothing emits yet).
+
+Verified in shadows at scale 1 and 2 with `ctl touch tap`: a tapped field
+spawns `cce-keyboard show`, a tap or click elsewhere `hide`, a pointer click
+shows nothing, a tap away from a mouse-focused field shows nothing, and a
+tap on the field that already has focus shows the board.
 
 ### The wheel eases; the trackpad does not
 

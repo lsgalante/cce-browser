@@ -780,6 +780,29 @@ impl WebKitHost {
         self.prompts.borrow_mut().vi_focus.take()
     }
 
+    /// The page text field open for typing in the active tab: its caret in
+    /// window logical px, or the whole page until WebKit has placed the
+    /// caret. What `display_list` claims, so a tap on a page field raises
+    /// the on-screen keyboard.
+    ///
+    /// Not gated on `window_focused`: the toolkit enables text input only
+    /// while the compositor has given this surface the text-input focus,
+    /// which already says the same thing — and `window_focused` follows
+    /// `wl_keyboard`, which a seat with no keyboard device never enters.
+    pub fn page_text_field(&self) -> Option<(f32, f32, f32, f32)> {
+        let tab = self.tabs.get(self.active)?;
+        let field = super::ime::field(tab.view)?;
+        let (w, h) = self.logical_size();
+        let (x, y, cw, ch) = field.unwrap_or((0, 0, w, h));
+        Some((x as f32, y as f32, cw.max(1) as f32, ch.max(1) as f32))
+    }
+
+    /// Whether a page field opened, closed or moved since the last call:
+    /// the frame that claims it has to be built.
+    pub fn take_page_text_field_changed(&self) -> bool {
+        super::ime::take_changed()
+    }
+
     /// Run `script` in the active tab's top frame, in the vi world, and queue
     /// its result as a string under `tag` for [`Self::take_vi_result`]. A
     /// failed script answers with an empty string, so a caller waiting on

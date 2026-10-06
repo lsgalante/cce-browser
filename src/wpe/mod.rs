@@ -12,6 +12,8 @@ pub mod ffi {
 mod subclass;
 /// What a frame changed, so only that much is read back and uploaded.
 mod damage;
+/// Which page text field is open, for the on-screen keyboard.
+mod ime;
 mod input;
 mod glib_source;
 mod host;

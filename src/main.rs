@@ -100,6 +100,12 @@ const CHROME_ANIM_S: f32 = 0.18;
 /// How long the bar stays out after a tab opens in the background — long
 /// enough to see the new tab land in the strip — before folding itself.
 const CHROME_PEEK: std::time::Duration = std::time::Duration::from_millis(1500);
+/// How long a press into the page has to reach WebKit and move its focus
+/// before an open page field is announced again (`defer_page_press`). Well
+/// inside the compositor's 800 ms touch window, which the announcement has
+/// to land in to raise the on-screen keyboard.
+#[cfg(feature = "wpe")]
+const PAGE_PRESS_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// One frame of the bar's unfold: `t` moves `dt` worth toward `target`
 /// (0 folded, 1 open), or straight onto it when the DE's animations switch
@@ -896,6 +902,10 @@ struct BrowserApp {
     /// opened in the background — and when it folds again. Anything the
     /// person does with the bar makes it theirs (`None`), and then it stays.
     chrome_peek: Option<std::time::Instant>,
+    /// When a press into an open page field is announced again
+    /// (`defer_page_press`).
+    #[cfg(feature = "wpe")]
+    page_press_settle: Option<std::time::Instant>,
     /// Where the pointer was when the peek began. Still there is not a
     /// hover: a link middle-clicked near the top of the page sits under
     /// the bar it unfolds, and must not hold it out.
@@ -2444,8 +2454,46 @@ impl BrowserApp {
         if !self.page_buttons.contains(&button) {
             self.page_buttons.push(button);
         }
+        #[cfg(feature = "wpe")]
+        self.defer_page_press();
         let s = self.scale as f32;
         self.host.mouse_button_ui(button, true, pos.x * s, pos.y * s);
+    }
+
+    /// A press into the page while one of its text fields is open. The
+    /// toolkit announces an open field again after every press
+    /// (`ime::note_press`), which is what lets a tap on a field that already
+    /// has focus raise the on-screen keyboard — but here it would announce
+    /// the field before WebKit has even seen the press, so a tap that is
+    /// about to take focus away (a link, the page around the field, a page
+    /// that autofocused its search box) would flash the board up. The
+    /// announcement is taken back and made once the page has had
+    /// `PAGE_PRESS_SETTLE` to answer, and only if the field is still open.
+    /// A tap that moves the caret is announced without waiting, as a moved
+    /// caret.
+    #[cfg(feature = "wpe")]
+    fn defer_page_press(&mut self) {
+        if self.host.page_text_field().is_none() || !cce_ui::ime::take_press() {
+            return;
+        }
+        self.page_press_settle = Some(std::time::Instant::now() + PAGE_PRESS_SETTLE);
+        let tx = self.sender.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(PAGE_PRESS_SETTLE);
+            let _ = tx.send(Message::Spin);
+        });
+    }
+
+    /// Make the announcement `defer_page_press` held back, once its time is
+    /// up. Returns whether a frame is needed to make it.
+    #[cfg(feature = "wpe")]
+    fn settle_page_press(&mut self) -> bool {
+        let Some(at) = self.page_press_settle else { return false };
+        if std::time::Instant::now() < at {
+            return false;
+        }
+        self.page_press_settle = None;
+        self.host.page_text_field().is_some() && cce_ui::ime::note_press()
     }
 
     /// Give the page the release it is owed, wherever the pointer ended up
@@ -4007,6 +4055,8 @@ impl Application for BrowserApp {
             chrome_open: false,
             chrome_t: 0.0,
             chrome_peek: None,
+            #[cfg(feature = "wpe")]
+            page_press_settle: None,
             peek_pointer: (0.0, 0.0),
             dot_hover: false,
             loading: true,
@@ -4125,6 +4175,16 @@ impl Application for BrowserApp {
         match msg {
             Message::Spin => {
                 let (new_frame, dirty) = self.host.pump();
+                // A page field opening or closing has to reach the frame
+                // that claims it, even when the page repaints nothing.
+                #[cfg(feature = "wpe")]
+                if self.host.take_page_text_field_changed() {
+                    *needs_rebuild = true;
+                }
+                #[cfg(feature = "wpe")]
+                if self.settle_page_press() {
+                    *needs_rebuild = true;
+                }
                 #[cfg(feature = "wpe")]
                 if self.sync_modal() {
                     *needs_rebuild = true;
@@ -5225,6 +5285,13 @@ impl Application for BrowserApp {
                 settings::BarPosition::Bottom => bar_margin(),
             };
             pc.text("Loading...", bar_margin(), y, 13.0, TEXT_DIM);
+        }
+        // A text field in the page has focus: claim its caret, so a tap on it
+        // raises the on-screen keyboard. First, so a chrome field drawn over
+        // the page (URL bar, dialog, vi line) claims last and wins.
+        #[cfg(feature = "wpe")]
+        if let Some((x, y, w, h)) = self.host.page_text_field() {
+            cce_ui::text_input::claim(x, y, w, h);
         }
 
         // The bar plate — or the shape it is unfolding through. Nothing but
