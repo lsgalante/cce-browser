@@ -941,6 +941,16 @@ struct BrowserApp {
     /// wakes the loop itself through its `EventLoopWaker`.
     #[cfg(feature = "wpe")]
     sender: calloop::channel::Sender<Message>,
+    /// Whether calloop watches the GLib fd (`register_sources`); without it,
+    /// pumps come on the heartbeat alone.
+    #[cfg(feature = "wpe")]
+    glib_fd_watched: bool,
+    /// When `update` last pumped GLib, which a heartbeat is measured from.
+    #[cfg(feature = "wpe")]
+    last_pump: std::time::Instant,
+    /// A `Spin` sent from `tick` and not yet pumped: one is enough.
+    #[cfg(feature = "wpe")]
+    spin_queued: bool,
     /// App-side bundled-fonts `FontSystem` (the same set the toolkit renders
     /// with) for URL-bar caret/click metrics via `shaped_cluster_offsets` —
     /// `measure_text_width`'s inked-extent numbers drift off the drawn glyphs.
@@ -3982,6 +3992,25 @@ impl BrowserApp {
     }
 }
 
+impl BrowserApp {
+    /// When GLib next needs a pump nothing else will cause: its own timeout
+    /// as of the last pump, or a heartbeat while one is needed (no fd
+    /// watched, or the deadlock watch running). `None`: sleep until an
+    /// event — an idle static page used to be pumped four times a second
+    /// regardless (a fixed timer, 100 ms when GLib asked for no timeout and
+    /// never more than 250 ms, re-armed from the timeout of the pump BEFORE
+    /// the one it triggered).
+    #[cfg(feature = "wpe")]
+    fn next_glib_pump(&self) -> Option<std::time::Instant> {
+        const HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(250);
+        let heartbeat = (!self.glib_fd_watched || self.host.wants_heartbeat()).then(|| self.last_pump + HEARTBEAT);
+        match (self.host.glib_deadline(), heartbeat) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 impl Application for BrowserApp {
     type Message = Message;
 
@@ -4123,6 +4152,12 @@ impl Application for BrowserApp {
             vi_swallowed: Vec::new(),
             vi_search: None,
             vi_searching: false,
+            #[cfg(feature = "wpe")]
+            glib_fd_watched: false,
+            #[cfg(feature = "wpe")]
+            last_pump: std::time::Instant::now(),
+            #[cfg(feature = "wpe")]
+            spin_queued: false,
         }
     }
 
@@ -4130,9 +4165,10 @@ impl Application for BrowserApp {
     ///
     /// Servo pushed `Message::Spin` into calloop from its own threads; WPE
     /// runs a GLib main context, so we register the epoll fd carrying its
-    /// pollfd set plus a timer for the timeout GLib asks for. Both just fire
-    /// `Spin`, which lands in `update` and calls `pump` — the same path the
-    /// Servo waker used, so nothing downstream changes.
+    /// pollfd set; it fires `Spin`, which lands in `update` and calls `pump`
+    /// — the same path the Servo waker used. GLib's own timeouts, which no
+    /// fd reports, are kept by the runner's idle sleep instead
+    /// (`idle_poll_interval` / `tick`, from [`Self::next_glib_pump`]).
     #[cfg(feature = "wpe")]
     fn register_sources(&mut self, handle: &calloop::LoopHandle<'_, EngineState<Self>>) {
         use calloop::{generic::Generic, Interest, Mode, PostAction};
@@ -4142,35 +4178,19 @@ impl Application for BrowserApp {
             // Level-triggered: `pump` drains the epoll, so an un-consumed
             // socket re-arms rather than being missed.
             let source = Generic::new(fd, Interest::READ, Mode::Level);
-            if let Err(e) = handle.insert_source(source, move |_, _, _| {
+            match handle.insert_source(source, move |_, _, _| {
                 let _ = tx.send(Message::Spin);
                 Ok(PostAction::Continue)
             }) {
-                log::warn!("could not watch the GLib fd ({e}); falling back to the timer alone");
+                Ok(_) => self.glib_fd_watched = true,
+                Err(e) => log::warn!("could not watch the GLib fd ({e}); pumping on the heartbeat alone"),
             }
         }
-
-        // GLib also asks to be woken on its own schedule (timeouts, animation
-        // frames), which no fd reports. Re-armed from `poll_timeout` each
-        // fire, so an idle page settles to long sleeps instead of a fixed tick.
-        let tx = self.sender.clone();
-        let timer = calloop::timer::Timer::from_duration(std::time::Duration::from_millis(16));
-        if let Err(e) = handle.insert_source(timer, move |_, _, state| {
-            let _ = tx.send(Message::Spin);
-            let next = state
-                .inner
-                .as_ref()
-                .and_then(|app| app.host.poll_timeout())
-                .unwrap_or(std::time::Duration::from_millis(100))
-                .clamp(
-                    std::time::Duration::from_millis(4),
-                    std::time::Duration::from_millis(250),
-                );
-            calloop::timer::TimeoutAction::ToDuration(next)
-        }) {
-            log::warn!("could not arm the GLib timer ({e})");
-        }
+        // The first pump, which sets GLib's first deadline.
+        self.spin_queued = true;
+        let _ = self.sender.send(Message::Spin);
     }
+
 
     fn settings(&self) -> WindowSettings {
         WindowSettings {
@@ -4186,6 +4206,11 @@ impl Application for BrowserApp {
     fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
         match msg {
             Message::Spin => {
+                #[cfg(feature = "wpe")]
+                {
+                    self.spin_queued = false;
+                    self.last_pump = std::time::Instant::now();
+                }
                 let (new_frame, dirty) = self.host.pump();
                 // A page field opening or closing has to reach the frame
                 // that claims it, even when the page repaints nothing.
@@ -4389,6 +4414,13 @@ impl Application for BrowserApp {
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
+        // GLib's deadline (or the heartbeat) has come: pump. Through the
+        // sender, so the pump runs in `update` like every other.
+        #[cfg(feature = "wpe")]
+        if !self.spin_queued && self.next_glib_pump().is_some_and(|t| t <= std::time::Instant::now()) {
+            self.spin_queued = true;
+            let _ = self.sender.send(Message::Spin);
+        }
         // The page's wheel glide, one frame's worth. It feeds the engine, so
         // the frame it produces is what actually redraws; asking for a
         // rebuild here is what keeps the loop turning until it lands.
@@ -4401,6 +4433,14 @@ impl Application for BrowserApp {
             // Keeps the runner's warm loop alive until the morph lands.
             *needs_rebuild = true;
         }
+    }
+
+    /// Sleep no longer than GLib's next deadline (`next_glib_pump`); the
+    /// `tick` that wakes then sends the pump.
+    #[cfg(feature = "wpe")]
+    fn idle_poll_interval(&self) -> Option<std::time::Duration> {
+        self.next_glib_pump()
+            .map(|t| t.saturating_duration_since(std::time::Instant::now()).max(std::time::Duration::from_millis(1)))
     }
 
     fn handle_focus_change(&mut self, focused: bool, needs_rebuild: &mut bool) {

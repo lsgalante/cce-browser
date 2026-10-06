@@ -1,9 +1,9 @@
 //! Demonstrates the calloop integration pattern: **block on GLib's fds**
 //! rather than pumping on a timer.
 //!
-//! This is what `Application::register_sources` will do — register
-//! `host.poll_fd()` as a calloop `Generic` and a timer for
-//! `host.poll_timeout()`, both firing a `Message::Spin` that calls `pump`.
+//! This is what the app does — `Application::register_sources` registers
+//! `host.poll_fd()` as a calloop `Generic` firing a `Message::Spin` that
+//! calls `pump`, and the runner's idle sleep ends at `host.glib_deadline()`.
 //! Here the same thing is done with a bare `poll(2)` so the behaviour can be
 //! measured without a compositor.
 //!
@@ -51,8 +51,8 @@ fn main() {
         if blocking {
             // Sleep until GLib has work, or until it asked to be woken.
             let ms = host
-                .poll_timeout()
-                .map(|d| d.as_millis() as i32)
+                .glib_deadline()
+                .map(|t| t.saturating_duration_since(Instant::now()).as_millis() as i32)
                 .unwrap_or(1000)
                 .clamp(0, 1000);
             if let Some(fd) = host.poll_fd() {

@@ -30,6 +30,10 @@ pub(super) struct GlibPoll {
     fds: Vec<GPollFD>,
     /// GLib's requested timeout in ms; `None` means "no timer needed".
     pub(super) timeout: Option<u32>,
+    /// When GLib next wants dispatching with no fd to say so — its own
+    /// timeout, measured from the moment it was asked (`sync`). `None`:
+    /// nothing scheduled, so only an fd (or the app) wakes it.
+    pub(super) deadline: Option<std::time::Instant>,
 }
 
 fn flags_of(events: u16) -> epoll::EventFlags {
@@ -58,6 +62,7 @@ impl GlibPoll {
             registered: Vec::new(),
             fds: Vec::new(),
             timeout: None,
+            deadline: None,
         };
         this.sync();
         Ok(this)
@@ -98,6 +103,11 @@ impl GlibPoll {
             };
             self.fds.truncate(n.max(0) as usize);
             self.timeout = (timeout >= 0).then_some(timeout as u32);
+            // At least 4 ms out: a source that is ready again at once (a
+            // repeating idle) must not turn the loop into a spin.
+            self.deadline = self.timeout.map(|ms| {
+                std::time::Instant::now() + std::time::Duration::from_millis(u64::from(ms).max(4))
+            });
         }
 
         let want: Vec<(i32, epoll::EventFlags)> = self

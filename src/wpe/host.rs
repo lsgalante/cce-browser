@@ -1156,12 +1156,18 @@ impl WebKitHost {
         rustix::io::dup(fd).ok()
     }
 
-    /// How long calloop may sleep before pumping anyway, per GLib.
-    pub fn poll_timeout(&self) -> Option<std::time::Duration> {
-        self.poll
-            .as_ref()
-            .and_then(|p| p.timeout)
-            .map(|ms| std::time::Duration::from_millis(ms as u64))
+    /// When GLib next needs a pump that no fd will announce, as of the last
+    /// pump (`GlibPoll::deadline`); `None` when nothing is scheduled.
+    pub fn glib_deadline(&self) -> Option<std::time::Instant> {
+        self.poll.as_ref().and_then(|p| p.deadline)
+    }
+
+    /// Whether pumps must keep coming even with GLib quiet: no GLib poll to
+    /// watch at all, or the deadlock watch timing a hung tab (it only
+    /// advances when pumped, and a hung tab is exactly the one producing no
+    /// GLib activity).
+    pub fn wants_heartbeat(&self) -> bool {
+        self.poll.is_none() || self.deadlock_watch.is_some()
     }
 
     /// Drain GLib's pending work, then upload any frame it produced.

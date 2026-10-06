@@ -258,6 +258,12 @@ undocumented-protocol ones were expensive.
 4. ~~**GLib main loop vs `calloop`.**~~ Done. `register_sources` registers the epoll fd
    carrying GLib's pollfd set, plus a timer from `poll_timeout`. Measured at **63
    wakeups per 8s against 495** for the fixed-interval version it replaced.
+   Since 2026-10-06 there is no timer: each pump records GLib's own next deadline
+   (`glib_deadline`) and the runner's idle sleep ends there
+   (`idle_poll_interval`/`tick`), with a 250 ms heartbeat only while the deadlock
+   watch runs. The timer had read the timeout of the pump *before* the one it fired,
+   so it clamped to 100–250 ms: an idle static page woke the UI thread 82 times in
+   20 s, now 23 (the runner's 1 s cap); JS timers, rAF and navigation unchanged.
 5. **Cloudflare remains unproven**, and is no longer on the critical path — see below.
 
 **The real cost was none of these.** It was the object graph: that `WebKitWebView`
