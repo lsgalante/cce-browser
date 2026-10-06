@@ -49,6 +49,7 @@ fn main() {
             host.back();
         }
         let (new_frame, dirty) = host.pump();
+        host.frame_drawn();
         if new_frame {
             frames += 1;
             println!(

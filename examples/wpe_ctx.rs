@@ -29,7 +29,7 @@ fn main() {
     let url = "http://127.0.0.1:8795/ctx.html";
     let mut host = wpe::WebKitHost::new(url::Url::parse(url).unwrap(), (1200, 800));
     let settle = |h: &mut wpe::WebKitHost, n: u32| {
-        for _ in 0..n { h.pump(); std::thread::sleep(std::time::Duration::from_millis(50)); }
+        for _ in 0..n { h.pump(); h.frame_drawn(); std::thread::sleep(std::time::Duration::from_millis(50)); }
     };
     settle(&mut host, 30);
     println!("loaded: {:?}", host.title());

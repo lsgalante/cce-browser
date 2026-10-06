@@ -364,10 +364,9 @@ pub struct WebKitHost {
     /// A frame has been uploaded that nothing has drawn yet.
     ///
     /// The readback is paced by this: while it is set, a finished buffer is
-    /// left *held* instead of being copied, and the next engine frame hands it
-    /// back unread. An animating page in a window nobody is drawing — occluded,
-    /// on another desktop — therefore costs nothing, where before it copied
-    /// its full window size sixty times a second into a picture no one saw.
+    /// left *held* instead of being copied over a picture nobody saw — and
+    /// since a held buffer is not yet acknowledged, the engine waits on it
+    /// too (see `frame_drawn`).
     pending_draw: Cell<bool>,
     /// The injected account watcher, kept so the setting can take it away
     /// again. `None` when account autocomplete is off, which is also when no
@@ -515,7 +514,10 @@ impl WebKitHost {
                 // several frames can be dispatched inside a single pump's
                 // drain, and only the last of them will ever be shown, so the
                 // rest are not worth 35 MB of copying each.
+                // It will never be shown, so it is as done as it will get:
+                // say both halves, or that view composites nothing again.
                 if let Some((old_view, old_buffer)) = slot.held.replace((view, buffer)) {
+                    wpe_view_buffer_rendered(old_view, old_buffer);
                     wpe_view_buffer_released(old_view, old_buffer);
                 }
                 if frame_debug() {
@@ -1081,7 +1083,10 @@ impl WebKitHost {
     /// Give back an unread buffer, if one is being held.
     fn release_held(&self) {
         if let Some((view, buffer)) = self.pending.borrow_mut().held.take() {
-            unsafe { wpe_view_buffer_released(view, buffer) };
+            unsafe {
+                wpe_view_buffer_rendered(view, buffer);
+                wpe_view_buffer_released(view, buffer);
+            }
         }
     }
 
@@ -1194,8 +1199,10 @@ impl WebKitHost {
         }
         self.watch_deadlock();
         // Nothing has drawn the last frame yet, so reading another would be
-        // copying over a picture that was never shown. Leave the buffer held:
-        // the engine's next frame supersedes it and hands it back unread.
+        // copying over a picture that was never shown. Leave the buffer held
+        // until the draw. (Its view is waiting on `rendered` meanwhile, so it
+        // is not followed by another; one from a different view supersedes
+        // it and hands it back unread.)
         if self.pending_draw.get() {
             return (false, self.sync_page_state());
         }
@@ -1211,11 +1218,22 @@ impl WebKitHost {
         // one on screen. A view no tab owns is the prewarmed spare, or a tab
         // closed since: nothing shows it.
         let Some(index) = self.tabs.iter().position(|t| t.view == view) else {
-            unsafe { wpe_view_buffer_released(view, buffer) };
+            unsafe {
+                wpe_view_buffer_rendered(view, buffer);
+                wpe_view_buffer_released(view, buffer);
+            }
             return (false, dirty);
         };
         let read = unsafe {
             let read = self.read_frame(index, buffer, damage);
+            // Read now and drawn at the next frame: as good as on screen, so
+            // the engine may start on the next one while this one waits for
+            // the draw. That next one is then held, unacknowledged, until
+            // the draw has happened — which is what keeps the engine to the
+            // chrome's rate. (Said at the draw instead, the two never
+            // overlapped, and a Muji banner animating at 60 fps in a visible
+            // window dropped to 30.)
+            wpe_view_buffer_rendered(view, buffer);
             // The pixels are ours now; the memory can go back.
             wpe_view_buffer_released(view, buffer);
             read
@@ -1348,8 +1366,23 @@ impl WebKitHost {
 
     /// The chrome drew: whatever was uploaded is on screen, so the next
     /// engine frame is worth reading. Called from `display_list`.
-    pub fn frame_drawn(&self) {
+    ///
+    /// Returns whether a frame is already waiting to be read. Its view is
+    /// held up until it is (`pump` says `rendered` as it reads), and having
+    /// been held up it makes no noise that would turn the loop — so the
+    /// caller must wake a pump, or the page sits on that frame until GLib's
+    /// next timeout.
+    ///
+    /// This is what paces the engine to the chrome: one frame being drawn,
+    /// one more finished and waiting, and nothing composited beyond that. So
+    /// the page runs at the output's refresh while the window is up, at the
+    /// runner's starvation fallback (~4 a second) with the display off, and
+    /// not at all where nothing draws. Anything that reads frames without a
+    /// chrome (the examples) must call this too, or the page stops after its
+    /// second frame.
+    pub fn frame_drawn(&self) -> bool {
         self.pending_draw.set(false);
+        self.pending.borrow().held.is_some()
     }
 
     /// Fold each tab's signal-written state into the fields the chrome reads.

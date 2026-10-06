@@ -66,6 +66,7 @@ fn main() {
         if host.pump().0 {
             frames += 1;
         }
+        host.frame_drawn();
     }
 
     println!(

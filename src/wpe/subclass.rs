@@ -90,9 +90,10 @@ pub(super) unsafe fn types() -> &'static Types {
 /// frame before, in buffer pixels as `(x, y, width, height)` — and is empty
 /// when the engine did not say.
 ///
-/// Returns whether the sink is **keeping** the buffer. If it is, releasing it
-/// is the sink's job — it reads the pixels out at the next pump and hands the
-/// memory back then.
+/// Returns whether the sink is **keeping** the buffer. If it is, both halves
+/// of the answer are the sink's job: `released` once the pixels are copied
+/// out, `rendered` once the chrome is ready for the next frame (see
+/// `view_render_buffer`).
 #[allow(clippy::type_complexity)]
 pub(super) static mut FRAME_SINK: Option<
     Box<dyn FnMut(*mut WPEView, *mut WPEBuffer, &[(i32, i32, i32, i32)]) -> bool>,
@@ -105,18 +106,20 @@ unsafe extern "C" fn view_render_buffer(
     n_damage: u32,
     _error: *mut *mut GError,
 ) -> gboolean {
-    // The two halves mean different things and are no longer said together.
-    // `rendered` means *displayed*: said at once, so the engine's own frame
-    // pacing never waits on our readback. `released` means *the memory is
-    // yours again*, and that has to wait until the pixels have been copied
-    // out of it — so the sink says it, at the pump that reads the buffer.
+    // Neither half is said here. `released` means *the memory is yours
+    // again*: said once the pixels are copied out. `rendered` means *it is
+    // on screen*, and it is the engine's pacing: until it is said WebKit
+    // composites nothing new for this view, and its main thread runs no
+    // rendering update either (rAF, style, layout and paint all wait on the
+    // composite). WebKit's own Wayland backend says it from the compositor's
+    // frame callback. Here it is said when the frame is read, and a frame is
+    // read only once the chrome has drawn the one before it (`pump`,
+    // `frame_drawn`), so the page runs at the rate the window is drawn.
     // (Saying neither is what stalls the engine after exactly one frame.)
     //
-    // Holding the buffer until then is also the backpressure: the engine
-    // cannot run arbitrarily far ahead of a browser that is not keeping up,
-    // and a frame superseded before anyone read it is handed back unread
-    // rather than copied.
-    wpe_view_buffer_rendered(view, buffer);
+    // Said at once, as it was until 2026-10-05, a window nobody was drawing
+    // (display off, minimized) still had its page composited sixty times a
+    // second, every frame handed back unread.
     let damage: Vec<(i32, i32, i32, i32)> = if damage.is_null() {
         Vec::new()
     } else {
@@ -128,6 +131,7 @@ unsafe extern "C" fn view_render_buffer(
     #[allow(static_mut_refs)]
     let held = FRAME_SINK.as_mut().is_some_and(|sink| sink(view, buffer, &damage));
     if !held {
+        wpe_view_buffer_rendered(view, buffer);
         wpe_view_buffer_released(view, buffer);
     }
     1

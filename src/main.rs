@@ -5261,9 +5261,13 @@ impl Application for BrowserApp {
     fn display_list(&mut self, size: LogicalSize, _scale: f64) -> Option<DisplayList> {
         // Whatever the engine last handed over is about to be on screen. That
         // is what lets the next one be read: until a frame is drawn, reading
-        // another would be copying over a picture nobody saw.
+        // another would be copying over a picture nobody saw. One already
+        // waiting has to be fetched: its page is held up until it is read,
+        // and a held-up page makes no noise that would turn the loop.
         #[cfg(feature = "wpe")]
-        self.host.frame_drawn();
+        if self.host.frame_drawn() {
+            let _ = self.sender.send(Message::Spin);
+        }
         self.win = (size.width, size.height);
         self.sync_ime();
         let mut pc = PaintCtx::new();

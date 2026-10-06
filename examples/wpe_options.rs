@@ -48,7 +48,7 @@ fn main() {
     host.resize(2400, 1600, 2.0);
     let settle = |h: &mut wpe::WebKitHost, n: u32| {
         for _ in 0..n {
-            h.pump();
+            h.pump(); h.frame_drawn();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     };

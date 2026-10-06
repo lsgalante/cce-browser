@@ -42,7 +42,7 @@ fn main() {
     let mut host = wpe::WebKitHost::new(url::Url::parse(page).unwrap(), (400, 300));
     let settle = |h: &mut wpe::WebKitHost, n: u32| {
         for _ in 0..n {
-            h.pump();
+            h.pump(); h.frame_drawn();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     };

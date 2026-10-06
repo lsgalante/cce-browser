@@ -188,35 +188,48 @@ animations stop, as its `requestAnimationFrame` already does. Its timers still
 run — WebKit has no hidden-page timer throttling here — which is most of what a
 heavy page costs in the background.
 
-### The readback is paced to draws
+### The engine is paced to draws
 
-`render_buffer` says the two halves of the buffer protocol at different times,
-and that is the pacing. `wpe_view_buffer_rendered` — *displayed* — is said at
-once, so the engine's own frame pacing never waits on us.
-`wpe_view_buffer_released` — *the memory is yours again* — waits until the
-pixels have been copied out, which happens in `pump`, not in the callback.
-(Saying neither is what stalls the engine after exactly one frame; that is what
-the old comment here warned about.)
+Neither half of the buffer protocol is said in `render_buffer`.
+`wpe_view_buffer_released` — *the memory is yours again* — is said once the
+pixels are copied out, in `pump`. `wpe_view_buffer_rendered` — *displayed* —
+is the engine's pacing: until it is said, WebKit composites nothing new for
+that view, and its main thread runs no rendering update (rAF, style, layout,
+paint all wait on the composite). WebKit's own Wayland backend says it from
+the compositor's frame callback. Here it is said **when the frame is read**,
+and a frame is read only once the chrome has drawn the one before it
+(`pending_draw`, cleared by `frame_drawn` from `display_list`). So the page
+runs at the rate the window is drawn: one frame on screen, one finished and
+waiting, nothing composited beyond that. (Saying neither stalls the engine
+after exactly one frame.)
 
-Holding the buffer buys two things. A frame superseded before anyone read it is
-handed back **unread**, so several frames dispatched inside one pump's drain
-cost one copy rather than N. And `pending_draw` gates the readback on the
-chrome having actually drawn (`frame_drawn`, called from `display_list`): while
-nothing has drawn the last frame, the next one is left held rather than copied
-over a picture nobody saw.
+Points that are choices:
 
-That second half is where the win is, and it is not the one first expected.
-Measured in a shadow against a page animating at 63 fps: **visible and drawing,
-62 of 63 frames are read — the pacing changes nothing**, because `pump` is what
-dispatches the engine's frames and it dispatches them promptly, so the engine
-never gets ahead. **Minimized, 4 of 64 are read** — 60 handed back unread, a
-page that used to cost its full window size sixty times a second while nobody
-was looking. Restoring recovers the full rate within a second, with live
-content.
+- **Not at the draw.** Saying `rendered` only once the frame was drawn left
+  the engine no overlap with the chrome, and Muji's banner, animating at
+  60 fps in a visible window, dropped to 30.
+- **A frame held behind an undrawn one has to be fetched.** Its view is waiting
+  on `rendered`, so it makes no noise that would turn the loop; `frame_drawn`
+  returns whether one is waiting, and `display_list` sends `Spin` for it.
+- **Every buffer gets both halves.** One superseded unread (another view's
+  frame arrived), released with `release_held`, or unreadable is answered
+  `rendered` too on the spot — a view never answered never composites again.
+- **Headless callers must call `frame_drawn`** after `pump` (the examples do),
+  or the page stops after its second frame.
 
-`CCE_BROWSER_FRAME_DEBUG=1` logs the two counts once a second; the gap between
-them is invisible from the outside, since a browser that skips nine frames in
-ten looks exactly like one that copies all ten.
+Until 2026-10-05 `rendered` was said at once in `render_buffer`, and only the
+*readback* was paced. Measured in a scale-2 shadow with Muji in the active tab:
+display off, the engine still composited 90-105 frames a second of which 4
+were read, the browser and its web processes using 37-40% of a core; paced,
+it composites the 4 it shows and uses 13%. Visible, 50 frames/s shown at
+45-48% against 46 at 58-63% before. With a plain tall page and the display
+off, the overlay scrollbar's fade now costs 4 frames/s instead of 60 for its
+~5 seconds. (The fade is WebKit's: timer-driven, 2s delay then 3s, and it
+ends on its own drawn or not. A report of it looping forever while undrawn
+did not reproduce.)
+
+`CCE_BROWSER_FRAME_DEBUG=1` logs frames produced against frames read once a
+second; paced, the two match, and the rate is the draw rate.
 
 ## Tabs
 

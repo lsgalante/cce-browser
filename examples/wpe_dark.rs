@@ -29,7 +29,7 @@ fn main() {
     let url = "data:text/html,<body style='background:%23ffffff'><h1 style='color:%23000'>hello</h1></body>";
     let mut host = wpe::WebKitHost::new(url::Url::parse(url).unwrap(), (400, 300));
     let settle = |h: &mut wpe::WebKitHost, n: u32| {
-        for _ in 0..n { h.pump(); std::thread::sleep(std::time::Duration::from_millis(50)); }
+        for _ in 0..n { h.pump(); h.frame_drawn(); std::thread::sleep(std::time::Duration::from_millis(50)); }
     };
 
     settle(&mut host, 30);

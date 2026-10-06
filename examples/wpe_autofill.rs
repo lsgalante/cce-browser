@@ -117,7 +117,7 @@ fn main() {
     host.focus(true);
     let settle = |h: &mut wpe::WebKitHost, n: u32| {
         for _ in 0..n {
-            h.pump();
+            h.pump(); h.frame_drawn();
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     };
