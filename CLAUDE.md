@@ -30,6 +30,7 @@ Nineteen files, ~14.8k lines. The twelve that carry the design:
 | `src/vi.rs` | vi mode, after qutebrowser: the modes, the bindings and their parser, hint labels, `:` commands, and the page scripts |
 | `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, which entries a host earns, saving a new login, and the never-save list |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
+| `src/wpe/damage.rs` | what a frame changed: damage accumulated per view across skipped frames, turned into the regions `pump` reads back |
 | `src/raindrop/` | bookmark sync with Raindrop.io's Unsorted: the three-way merge (`mod.rs`), the REST client (`api.rs`), the worker and status line (`sync.rs`) — design in RAINDROP-SYNC.md |
 
 ## Build

@@ -145,6 +145,9 @@ pub struct Tab {
     pub url: Option<Url>,
     pub loading: bool,
     image: Option<(u32, u32, u32)>,
+    /// Under `CCE_BROWSER_DAMAGE_CHECK` only: the picture `image` should
+    /// hold, patched region by region alongside it.
+    mirror: Option<Vec<u8>>,
 }
 
 impl Drop for Tab {
@@ -288,6 +291,26 @@ fn terminated_page(url: Option<&Url>, reason: WebKitWebProcessTerminationReason:
 struct FrameCounts {
     produced: u64,
     read: u64,
+    /// Of `read`, how many copied only their damage.
+    partial: u64,
+    /// Bytes copied out of the engine's buffers.
+    bytes: u64,
+}
+
+/// Read whole frames only, ignoring damage. The escape hatch if a page is
+/// ever drawn stale; `CCE_BROWSER_DAMAGE_CHECK` is how to find out.
+fn full_frames() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CCE_BROWSER_FULL_FRAMES").is_some())
+}
+
+/// Check every region read against the whole frame: each tab keeps a CPU
+/// copy of its picture, patched exactly as its image is, and any pixel that
+/// disagrees with the engine's buffer is logged. Costs a full copy and a
+/// compare per frame, so it is a test switch, not a mode.
+fn damage_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CCE_BROWSER_DAMAGE_CHECK").is_some())
 }
 
 fn frame_debug() -> bool {
@@ -302,6 +325,10 @@ struct Pending {
     /// hands this one back **unread** — that skipped copy is the whole point
     /// of holding it rather than copying in the callback.
     held: Option<(*mut WPEView, *mut WPEBuffer)>,
+    /// Per view, what its frames changed since the last one that was read —
+    /// including every frame handed back unread in between, whose changes
+    /// the next readback still has to carry. No entry: nothing changed.
+    damage: std::collections::HashMap<usize, super::damage::Damage>,
     counts: FrameCounts,
     /// When the counters were last reported.
     reported: Option<std::time::Instant>,
@@ -477,8 +504,12 @@ impl WebKitHost {
             let prompts = Rc::new(RefCell::new(Prompts::default()));
             let pending = Rc::new(std::cell::RefCell::new(Pending::default()));
             let sink = pending.clone();
-            FRAME_SINK = Some(Box::new(move |view: *mut WPEView, buffer: *mut WPEBuffer| {
+            FRAME_SINK = Some(Box::new(move |view: *mut WPEView, buffer: *mut WPEBuffer, damage: &[(i32, i32, i32, i32)]| {
                 let mut slot = sink.borrow_mut();
+                slot.damage
+                    .entry(view as usize)
+                    .or_insert_with(|| super::damage::Damage::Rects(Vec::new()))
+                    .add(damage);
                 // Replace, never accumulate: the newest frame wins. The one it
                 // supersedes goes back to the engine **without being read** —
                 // several frames can be dispatched inside a single pump's
@@ -840,6 +871,7 @@ impl WebKitHost {
                 self.session,
                 std::ptr::null::<c_char>(),
             ) as *mut WebKitWebView;
+            set_features(wv);
             let view = webkit_web_view_get_wpe_view(wv);
             wpe_view_set_toplevel(view, self.toplevel);
             // Signals, not polling: a background tab has to be able to report
@@ -981,6 +1013,7 @@ impl WebKitHost {
             url: Some(url),
             loading: true,
             image: None,
+            mirror: None,
         });
         if show {
             self.activate(self.tabs.len() - 1);
@@ -1150,36 +1183,91 @@ impl WebKitHost {
         let Some((view, buffer)) = held else {
             return (false, dirty);
         };
-        let frame = unsafe {
-            let f = read_shm(buffer);
+        let damage = self.pending.borrow_mut().damage.remove(&(view as usize));
+        // The frame belongs to the tab that drew it, which is not always the
+        // one on screen. A view no tab owns is the prewarmed spare, or a tab
+        // closed since: nothing shows it.
+        let Some(index) = self.tabs.iter().position(|t| t.view == view) else {
+            unsafe { wpe_view_buffer_released(view, buffer) };
+            return (false, dirty);
+        };
+        let read = unsafe {
+            let read = self.read_frame(index, buffer, damage);
             // The pixels are ours now; the memory can go back.
             wpe_view_buffer_released(view, buffer);
-            f
+            read
         };
         if frame_debug() {
             let mut p = self.pending.borrow_mut();
             p.counts.read += 1;
+            if let Some((bytes, partial)) = read {
+                p.counts.bytes += bytes as u64;
+                p.counts.partial += partial as u64;
+            }
             let now = std::time::Instant::now();
             let due = p.reported.is_none_or(|t| now.duration_since(t).as_secs_f32() >= 1.0);
             if due {
                 p.reported = Some(now);
-                let (produced, read) = (p.counts.produced, p.counts.read);
-                p.counts = FrameCounts::default();
+                let c = std::mem::take(&mut p.counts);
                 log::info!(
-                    "frames: engine produced {produced}, read back {read} \
-                     ({} handed back unread)",
-                    produced.saturating_sub(read)
+                    "frames: engine produced {}, read back {} ({} handed back unread), \
+                     {} of them only their damage; {:.1} MB copied",
+                    c.produced,
+                    c.read,
+                    c.produced.saturating_sub(c.read),
+                    c.partial,
+                    c.bytes as f64 / 1e6
                 );
             }
         }
-        let Some((px, w, h)) = frame else {
-            return (false, dirty);
-        };
+        if read.is_none() || index != self.active {
+            return (false, true);
+        }
+        self.pending_draw.set(true);
+        (true, true)
+    }
+
+    /// Copy a finished frame into tab `index`'s image: only the damaged
+    /// regions when the image already holds the frame before them, the
+    /// whole frame otherwise. Returns the bytes copied and whether it was
+    /// regions, or `None` for a buffer that could not be read.
+    unsafe fn read_frame(
+        &mut self,
+        index: usize,
+        buffer: *mut WPEBuffer,
+        damage: Option<super::damage::Damage>,
+    ) -> Option<(usize, bool)> {
+        let shm = ShmFrame::of(buffer)?;
+        let (w, h) = (shm.width, shm.height);
         // The one pixel anything actually reads back (see `sample_pixel`),
         // kept instead of a copy of the whole frame. Cloning 35 MB per frame
         // to serve a three-byte question cost 7 ms of every frame.
-        self.last_pixel = (px.len() >= 4).then(|| (px[2], px[1], px[0]));
-        let tab = &mut self.tabs[self.active];
+        let p0 = std::slice::from_raw_parts(shm.data, 4);
+        self.last_pixel = Some((p0[2], p0[1], p0[0]));
+        let tab = &mut self.tabs[index];
+        // Regions only make sense against the picture they change: this
+        // tab's image, at this size. No damage at all means nothing changed.
+        let current = tab.image.is_some_and(|(_, iw, ih)| (iw, ih) == (w, h));
+        let regions = match damage {
+            _ if full_frames() || !current => None,
+            None => Some(Vec::new()),
+            Some(d) => d.regions(w, h),
+        };
+        if let (Some(regions), Some((id, ..))) = (regions, tab.image) {
+            let len = super::damage::packed_len(&regions);
+            let mut px = cce_ui::vk::recycle_buffer(len);
+            super::damage::pack(shm.data, shm.stride, &regions, &mut px);
+            if let Some(mirror) = tab.mirror.as_mut() {
+                check_regions(mirror, &shm, &px, &regions, index);
+            }
+            cce_ui::vk::update_pixel_regions(id, px, w, h, cce_ui::vk::PixelFormat::Bgra, regions);
+            return Some((len, true));
+        }
+        let px = shm.copy_all();
+        let len = px.len();
+        if damage_check() {
+            tab.mirror = Some(px.clone());
+        }
         match tab.image {
             // Same tab, same size: replace the contents of the image that is
             // already there. No allocation, no descriptor, and above all no
@@ -1193,11 +1281,9 @@ impl WebKitHost {
                 if let Some((old, ..)) = tab.image.replace((id, w, h)) {
                     cce_ui::vk::free_image(old);
                 }
-                tab.image = Some((id, w, h));
             }
         }
-        self.pending_draw.set(true);
-        (true, true)
+        Some((len, false))
     }
 
     /// Re-paint the page into a renderer that has just replaced the one the
@@ -1966,35 +2052,125 @@ impl WebKitHost {
 /// before the next pump is never read at all.
 ///
 /// The stride is not assumed to equal `width * 4`.
-unsafe fn read_shm(buffer: *mut WPEBuffer) -> Option<(Vec<u8>, u32, u32)> {
-    if g_type_check_instance_is_a(buffer as *mut GTypeInstance, wpe_buffer_shm_get_type()) == 0 {
-        return None;
-    }
-    let shm = buffer as *mut WPEBufferSHM;
-    let (w, h) = (
-        wpe_buffer_get_width(buffer) as u32,
-        wpe_buffer_get_height(buffer) as u32,
-    );
-    let mut len: u64 = 0;
-    let src = g_bytes_get_data(wpe_buffer_shm_get_data(shm), &mut len as *mut u64) as *const u8;
-    if src.is_null() || w == 0 || h == 0 {
-        return None;
-    }
-    let stride = wpe_buffer_shm_get_stride(shm) as usize;
-    let row = w as usize * 4;
-    let need = row * h as usize;
-    if (len as usize) < stride * (h as usize - 1) + row {
-        return None;
-    }
-    let mut out = cce_ui::vk::recycle_buffer(need);
-    if stride == row {
-        std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), need);
-    } else {
-        for y in 0..h as usize {
-            std::ptr::copy_nonoverlapping(src.add(y * stride), out.as_mut_ptr().add(y * row), row);
+/// WebKit features every webview runs with, off by default in this build.
+///
+/// * `PropagateDamagingInformation` — each frame reports what it repainted,
+///   so `pump` copies only that (see `damage.rs`). Without it a page that
+///   can scroll costs a whole-window copy sixty times a second while it sits
+///   still, for an overlay scrollbar WebKit never stops repainting.
+/// * `HiddenPageCSSAnimationSuspension` — a background tab's CSS animations
+///   stop. WebKit already stops its `requestAnimationFrame` (checked: 0 a
+///   second hidden), but not this, and not its timers. A hidden Muji page
+///   measured 67% of a core with it off and 43% on.
+const FEATURES: &[(&str, bool)] =
+    &[("PropagateDamagingInformation", true), ("HiddenPageCSSAnimationSuspension", true)];
+
+unsafe fn set_features(wv: *mut WebKitWebView) {
+    let settings = webkit_web_view_get_settings(wv);
+    let list = webkit_settings_get_all_features();
+    for &(name, on) in FEATURES {
+        let found = (0..webkit_feature_list_get_length(list))
+            .map(|i| webkit_feature_list_get(list, i))
+            .find(|&f| from_cstr(webkit_feature_get_identifier(f)).as_deref() == Some(name));
+        match found {
+            Some(f) => webkit_settings_set_feature_enabled(settings, f, on as gboolean),
+            // A WebKit upgrade renamed or dropped it: the browser still
+            // works, it just loses what the feature bought.
+            None => log::warn!("WebKit has no feature {name}; leaving it as it is"),
         }
     }
-    Some((out, w, h))
+    webkit_feature_list_unref(list);
+}
+
+/// A mapped SHM frame: where its pixels are, and how they are laid out.
+/// Borrowed from the buffer, so it must not outlive the buffer's release.
+struct ShmFrame {
+    data: *const u8,
+    stride: usize,
+    width: u32,
+    height: u32,
+}
+
+impl ShmFrame {
+    /// The buffer's pixels, if it is an SHM buffer with all its rows there.
+    unsafe fn of(buffer: *mut WPEBuffer) -> Option<Self> {
+        if g_type_check_instance_is_a(buffer as *mut GTypeInstance, wpe_buffer_shm_get_type()) == 0 {
+            return None;
+        }
+        let shm = buffer as *mut WPEBufferSHM;
+        let (width, height) = (
+            wpe_buffer_get_width(buffer) as u32,
+            wpe_buffer_get_height(buffer) as u32,
+        );
+        let mut len: u64 = 0;
+        let data = g_bytes_get_data(wpe_buffer_shm_get_data(shm), &mut len as *mut u64) as *const u8;
+        if data.is_null() || width == 0 || height == 0 {
+            return None;
+        }
+        let stride = wpe_buffer_shm_get_stride(shm) as usize;
+        if (len as usize) < stride * (height as usize - 1) + width as usize * 4 {
+            return None;
+        }
+        Some(Self { data, stride, width, height })
+    }
+
+    /// The whole frame, tightly packed, in a recycled buffer.
+    unsafe fn copy_all(&self) -> Vec<u8> {
+        let row = self.width as usize * 4;
+        let need = row * self.height as usize;
+        let mut out = cce_ui::vk::recycle_buffer(need);
+        if self.stride == row {
+            std::ptr::copy_nonoverlapping(self.data, out.as_mut_ptr(), need);
+        } else {
+            for y in 0..self.height as usize {
+                std::ptr::copy_nonoverlapping(
+                    self.data.add(y * self.stride),
+                    out.as_mut_ptr().add(y * row),
+                    row,
+                );
+            }
+        }
+        out
+    }
+}
+
+/// `CCE_BROWSER_DAMAGE_CHECK`: patch the tab's CPU copy with the regions just
+/// read, as its image is being patched, and compare the result with the
+/// engine's whole frame. A mismatch means the damage left something out and
+/// the page on screen is stale there; the copy is then resynced so one miss
+/// is not reported on every frame after it.
+unsafe fn check_regions(
+    mirror: &mut [u8],
+    shm: &ShmFrame,
+    packed: &[u8],
+    regions: &[super::damage::Rect],
+    tab: usize,
+) {
+    let row = shm.width as usize * 4;
+    let mut at = 0usize;
+    for &(x, y, w, h) in regions {
+        let len = w as usize * 4;
+        for r in 0..h as usize {
+            let dst = (y as usize + r) * row + x as usize * 4;
+            mirror[dst..dst + len].copy_from_slice(&packed[at..at + len]);
+            at += len;
+        }
+    }
+    let truth = shm.copy_all();
+    let wrong = mirror
+        .chunks_exact(4)
+        .zip(truth.chunks_exact(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    if wrong > 0 {
+        log::warn!(
+            "damage check: tab {tab} is stale in {wrong} pixels after reading {} region(s) {regions:?}",
+            regions.len()
+        );
+        mirror.copy_from_slice(&truth);
+    } else {
+        log::info!("damage check: tab {tab} exact after {} region(s)", regions.len());
+    }
 }
 
 unsafe fn from_cstr(p: *const c_char) -> Option<String> {

@@ -86,17 +86,23 @@ pub(super) unsafe fn types() -> &'static Types {
 /// Set by the host before it creates a webview; `render_buffer` hands frames
 /// here. One host per process for now (see `WebKitHost::new`).
 ///
+/// The third argument is the frame's damage — what it repainted since the
+/// frame before, in buffer pixels as `(x, y, width, height)` — and is empty
+/// when the engine did not say.
+///
 /// Returns whether the sink is **keeping** the buffer. If it is, releasing it
 /// is the sink's job — it reads the pixels out at the next pump and hands the
 /// memory back then.
-pub(super) static mut FRAME_SINK: Option<Box<dyn FnMut(*mut WPEView, *mut WPEBuffer) -> bool>> =
-    None;
+#[allow(clippy::type_complexity)]
+pub(super) static mut FRAME_SINK: Option<
+    Box<dyn FnMut(*mut WPEView, *mut WPEBuffer, &[(i32, i32, i32, i32)]) -> bool>,
+> = None;
 
 unsafe extern "C" fn view_render_buffer(
     view: *mut WPEView,
     buffer: *mut WPEBuffer,
-    _damage: *const WPERectangle,
-    _n_damage: u32,
+    damage: *const WPERectangle,
+    n_damage: u32,
     _error: *mut *mut GError,
 ) -> gboolean {
     // The two halves mean different things and are no longer said together.
@@ -111,8 +117,16 @@ unsafe extern "C" fn view_render_buffer(
     // and a frame superseded before anyone read it is handed back unread
     // rather than copied.
     wpe_view_buffer_rendered(view, buffer);
+    let damage: Vec<(i32, i32, i32, i32)> = if damage.is_null() {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(damage, n_damage as usize)
+            .iter()
+            .map(|r| (r.x, r.y, r.width, r.height))
+            .collect()
+    };
     #[allow(static_mut_refs)]
-    let held = FRAME_SINK.as_mut().is_some_and(|sink| sink(view, buffer));
+    let held = FRAME_SINK.as_mut().is_some_and(|sink| sink(view, buffer, &damage));
     if !held {
         wpe_view_buffer_released(view, buffer);
     }

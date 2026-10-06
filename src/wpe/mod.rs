@@ -10,6 +10,8 @@ pub mod ffi {
 }
 
 mod subclass;
+/// What a frame changed, so only that much is read back and uploaded.
+mod damage;
 mod input;
 mod glib_source;
 mod host;
