@@ -210,6 +210,99 @@ const SEL_BG: [f32; 4] = [0.24, 0.38, 0.60, 0.95];
 const ACCENT: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
 const TEXT: [u8; 3] = [220, 220, 225];
 const TEXT_DIM: [u8; 3] = [120, 122, 128];
+/// A line field's caret, and the underline under an input method's
+/// composition.
+const CARET: [f32; 4] = [0.85, 0.87, 0.92, 1.0];
+
+/// One of the chrome's line fields. The one with the keyboard
+/// (`BrowserApp::keyboard_field`) is the one keys edit and an input method
+/// composes into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LineField {
+    Url,
+    BmSearch,
+    /// The vi command line (`:` or `/`), while it is open.
+    ViCmd,
+    /// The open dialog's field at this index.
+    #[cfg(feature = "wpe")]
+    Dialog(usize),
+}
+
+/// What a line field draws, and where on it its caret, selection and an
+/// input method's composition fall — x offsets from the text's origin, read
+/// off the same shaped run the text is drawn as.
+struct FieldMarks {
+    /// `LineEdit::display`: the text with a composition at the caret,
+    /// bullets for a password.
+    shown: String,
+    caret: f32,
+    selection: Option<(f32, f32)>,
+    composition: Option<(f32, f32)>,
+}
+
+impl FieldMarks {
+    /// Measure `edit` as it will be drawn. Every offset the field holds is
+    /// into its text, so each goes through `display_index` onto `shown`.
+    fn of(fs: &mut cce_ui::cosmic_text::FontSystem, edit: &cce_ui::widget::LineEdit) -> Self {
+        let shown = edit.display();
+        let mut x = |byte: usize| x_of_boundary_in(fs, &shown, byte);
+        let caret = x(edit.display_index(edit.cursor));
+        let selection = edit
+            .selection
+            .filter(|&(a, b)| a < b)
+            .map(|(a, b)| (x(edit.display_index(a)), x(edit.display_index(b))));
+        let composition = edit.composition_range().map(|(a, b)| (x(a), x(b)));
+        Self { shown, caret, selection, composition }
+    }
+}
+
+/// Draw a line field's text in `f` with its marks: the selection under the
+/// text, `placeholder` dimmed in place of an empty field, the composition
+/// underlined, and the caret when `caret` is set. Returns the caret's rect,
+/// which the field with the keyboard reports to the input method.
+///
+/// style: deliberate — caret and selection stand 4px inside the rim: the
+/// glyph box's inset, not a gap.
+fn paint_field(pc: &mut PaintCtx, f: Rect, marks: &FieldMarks, placeholder: &str, caret: bool) -> Rect {
+    let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
+    let x0 = f.x + text_pad();
+    let caret_rect = Rect { x: x0 + marks.caret, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 };
+    pc.clip(f, |pc| {
+        if let Some((a, b)) = marks.selection {
+            pc.quad(Rect { x: x0 + a, y: f.y + 4.0, width: b - a, height: f.height - 8.0 }, SEL_BG);
+        }
+        if marks.shown.is_empty() && !placeholder.is_empty() {
+            pc.text(placeholder.to_string(), x0, ty, URL_FONT, TEXT_DIM);
+        } else {
+            pc.text(marks.shown.clone(), x0, ty, URL_FONT, TEXT);
+        }
+        if let Some((a, b)) = marks.composition {
+            pc.quad(Rect { x: x0 + a, y: f.y + f.height - 5.0, width: b - a, height: 1.0 }, CARET);
+        }
+        if caret {
+            pc.quad(caret_rect, CARET);
+        }
+    });
+    caret_rect
+}
+
+/// Tell the input method where the caret is: where its candidates open, and
+/// that text is wanted at all. Only the field with the keyboard calls it,
+/// as it paints.
+fn report_caret(r: Rect) {
+    cce_ui::ime::report_caret(r.x, r.y, r.width, r.height);
+}
+
+/// X offset (text-origin relative) of byte `byte` of `text`, on the shaped
+/// run a field draws (`URL_FONT`, font=None, matching `pc.text`).
+fn x_of_boundary_in(fs: &mut cce_ui::cosmic_text::FontSystem, text: &str, byte: usize) -> f32 {
+    cce_ui::engine::shaped_cluster_offsets(fs, text, URL_FONT, None)
+        .iter()
+        .rev()
+        .find(|&&(b, _)| b <= byte)
+        .map(|&(_, x)| x)
+        .unwrap_or(0.0)
+}
 
 /// A page-blocking prompt drawn over the content.
 ///
@@ -831,6 +924,9 @@ struct BrowserApp {
     /// with) for URL-bar caret/click metrics via `shaped_cluster_offsets` —
     /// `measure_text_width`'s inked-extent numbers drift off the drawn glyphs.
     font_system: cce_ui::cosmic_text::FontSystem,
+    /// The line field that had the keyboard when the last frame was built,
+    /// so the frame it loses it can drop a composition it was showing.
+    ime_field: Option<LineField>,
     /// The open-tab set, persisted across restarts (see `session.rs`).
     session: session::Session,
     /// The favorites store, shared with the host (and so with the
@@ -1732,8 +1828,9 @@ impl BrowserApp {
     /// Byte of the search query under pointer x `x`.
     fn bm_query_index_at(&mut self, x: f32) -> Option<usize> {
         let field = self.bm_layout()?.search;
-        let text = self.bm_menu.as_ref()?.query.text.clone();
-        Some(self.boundary_at_x(&text, x - field.x - text_pad()))
+        let shown = self.bm_menu.as_ref()?.query.display();
+        let at = self.boundary_at_x(&shown, x - field.x - text_pad());
+        Some(self.bm_menu.as_ref()?.query.text_index(at))
     }
 
     /// The menu's geometry for the current window, bar edge and item count:
@@ -2617,21 +2714,22 @@ impl BrowserApp {
             TEXT_DIM,
         );
 
-        // The focused field's caret and selection, measured on what it draws
-        // (bullets for a password) before the fields are borrowed to paint.
-        let focus_marks = m.fields.get(m.focused).map(|(_, edit)| {
-            let shown = edit.display();
-            let sel = edit.selection.filter(|&(a, b)| a < b);
-            (m.focused, shown, edit.display_index(edit.cursor), sel.map(|(a, b)| (edit.display_index(a), edit.display_index(b))))
-        });
-        let focus_marks = focus_marks.map(|(i, shown, caret, sel)| {
-            let caret_x = self.x_of_boundary(&shown, caret);
-            let sel_x = sel.map(|(a, b)| (self.x_of_boundary(&shown, a), self.x_of_boundary(&shown, b)));
-            (i, caret_x, sel_x)
-        });
-        let Some(m) = self.modal.as_ref() else { return };
+        // What each field draws (bullets for a password) and where its marks
+        // fall; only the focused field shows a selection.
+        let marks: Vec<FieldMarks> = m
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, (_, edit))| {
+                let mut marks = FieldMarks::of(&mut self.font_system, edit);
+                if i != m.focused {
+                    marks.selection = None;
+                }
+                marks
+            })
+            .collect();
 
-        for (i, (label, edit)) in m.fields.iter().enumerate() {
+        for (i, ((label, _), marks)) in m.fields.iter().zip(&marks).enumerate() {
             let f = m.field_rect(&r, i);
             let focused = i == m.focused;
             pc.rounded_rect(
@@ -2641,32 +2739,13 @@ impl BrowserApp {
                 if focused { RIM_FOCUS } else { RIM },
             );
             pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
-            let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
             // `display()` masks a password field; the text itself never
-            // reaches the paint list.
-            let shown = edit.display();
-            let marks = focus_marks.filter(|&(fi, ..)| fi == i);
-            // style: deliberate — caret and selection 4px inside the rim, as
-            // the URL bar draws them.
-            pc.clip(f, |pc| {
-                if let Some((_, _, Some((x0, x1)))) = marks {
-                    pc.quad(
-                        Rect { x: f.x + text_pad() + x0, y: f.y + 4.0, width: x1 - x0, height: f.height - 8.0 },
-                        SEL_BG,
-                    );
-                }
-                if shown.is_empty() && !label.is_empty() {
-                    pc.text(*label, f.x + text_pad(), ty, URL_FONT, TEXT_DIM);
-                } else {
-                    pc.text(shown, f.x + text_pad(), ty, URL_FONT, TEXT);
-                }
-                if let Some((_, caret_x, _)) = marks {
-                    pc.quad(
-                        Rect { x: f.x + text_pad() + caret_x, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
-                        [0.85, 0.87, 0.92, 1.0],
-                    );
-                }
-            });
+            // reaches the paint list. The dialog blocks everything else, so
+            // its focused field is the one with the keyboard.
+            let caret = paint_field(pc, f, marks, label, focused);
+            if focused {
+                report_caret(caret);
+            }
         }
 
         let (ok, cancel) = m.button_rects(&r);
@@ -2824,24 +2903,21 @@ impl BrowserApp {
     /// pages already saved, and the way out to the full collection.
     fn paint_bm_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
         let Some(l) = self.bm_layout() else { return };
-        let (total, items, hover, scroll, searching, query, caret, sel, selected) = match self.bm_menu.as_ref() {
+        // The field's marks are measured here, before painting borrows
+        // anything, on the same shaped run it draws.
+        let (total, items, hover, scroll, searching, marks, selected) = match self.bm_menu.as_ref() {
             Some(m) => (
                 m.all.len(),
                 m.items.clone(),
                 m.hover,
                 m.scroll,
                 !m.query.text.is_empty(),
-                m.query.text.clone(),
-                m.query.cursor,
-                m.query.selection.filter(|&(a, b)| a < b),
+                FieldMarks::of(&mut self.font_system, &m.query),
                 m.selected,
             ),
             None => return,
         };
-        // Measured before painting borrows anything: the field's caret and
-        // selection, on the same shaped run it draws.
-        let caret_x = self.x_of_boundary(&query, caret);
-        let sel_x = sel.map(|(a, b)| (self.x_of_boundary(&query, a), self.x_of_boundary(&query, b)));
+        let has_keyboard = self.bm_search_has_keyboard();
         pc.plate(
             l.plate,
             (8.0, 8.0, 8.0, 8.0),
@@ -2859,26 +2935,10 @@ impl BrowserApp {
             RIM_FOCUS,
         );
         pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
-        let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
-        // style: deliberate — caret and selection 4px inside the rim, as the
-        // URL bar and the dialog fields draw them.
-        pc.clip(f, |pc| {
-            if let Some((x0, x1)) = sel_x {
-                pc.quad(
-                    Rect { x: f.x + text_pad() + x0, y: f.y + 4.0, width: x1 - x0, height: f.height - 8.0 },
-                    SEL_BG,
-                );
-            }
-            if query.is_empty() {
-                pc.text("Search bookmarks", f.x + text_pad(), ty, URL_FONT, TEXT_DIM);
-            } else {
-                pc.text(query.clone(), f.x + text_pad(), ty, URL_FONT, TEXT);
-            }
-            pc.quad(
-                Rect { x: f.x + text_pad() + caret_x, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
-                [0.85, 0.87, 0.92, 1.0],
-            );
-        });
+        let caret = paint_field(pc, f, &marks, "Search bookmarks", true);
+        if has_keyboard {
+            report_caret(caret);
+        }
 
         let text_at = |pc: &mut PaintCtx, r: &Rect, s: String, color: [u8; 3]| {
             pc.text(
@@ -3081,15 +3141,13 @@ impl BrowserApp {
         }
     }
 
+    /// The byte of the URL under pointer x `click_x`. The bar draws
+    /// `display()` — with a composition in it while one is up — so the hit
+    /// lands in that and `text_index` carries it back to the text.
     fn cursor_from_click(&mut self, click_x: f32, field: &Rect) -> usize {
-        let text = self.url.text.clone();
-        self.boundary_at_x(&text, click_x - field.x - text_pad())
-    }
-
-    /// X offset (text-origin relative) of a byte index in the URL.
-    fn x_offset(&mut self, byte: usize) -> f32 {
-        let text = self.url.text.clone();
-        self.x_of_boundary(&text, byte)
+        let shown = self.url.display();
+        let at = self.boundary_at_x(&shown, click_x - field.x - text_pad());
+        self.url.text_index(at)
     }
 
     /// The char boundary of `text` nearest `rel_x` (text-origin relative),
@@ -3106,19 +3164,6 @@ impl BrowserApp {
             .unwrap_or(text.len())
     }
 
-    /// X offset (text-origin relative) of byte `byte` of `text`, off the same
-    /// shaped run as `boundary_at_x`.
-    fn x_of_boundary(&mut self, text: &str, byte: usize) -> f32 {
-        let offsets =
-            cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, text, URL_FONT, None);
-        offsets
-            .iter()
-            .rev()
-            .find(|&&(b, _)| b <= byte)
-            .map(|&(_, x)| x)
-            .unwrap_or(0.0)
-    }
-
     /// The byte of dialog field `i`'s text under pointer x `x`. The field
     /// draws `display()` — bullets, for a password — so the hit lands in
     /// that and `text_index` carries it back to the text.
@@ -3131,11 +3176,6 @@ impl BrowserApp {
         Some(self.modal.as_ref()?.fields[i].1.text_index(at))
     }
 
-    /// Caret x offset for the current byte cursor.
-    fn caret_offset(&mut self) -> f32 {
-        self.x_offset(self.url.cursor)
-    }
-
     /// Select the whole URL, caret at the end — what entering the bar does,
     /// whether from a click, Ctrl+L or Ctrl+A. No-op on an empty field.
     fn select_all_url(&mut self) {
@@ -3146,31 +3186,66 @@ impl BrowserApp {
     /// while one is up (it blocks everything else), else the URL bar while
     /// it is focused. Undo and redo act on this.
     fn focused_edit(&mut self) -> Option<&mut cce_ui::widget::LineEdit> {
+        let field = self.keyboard_field()?;
+        self.line_field(field)
+    }
+
+    /// Which line field has the keyboard: a dialog's focused field while
+    /// one is up, else the vi command line while it is open, else the
+    /// bookmarks menu's search while it is open, else the URL bar while it
+    /// is focused.
+    fn keyboard_field(&self) -> Option<LineField> {
         #[cfg(feature = "wpe")]
-        if let Some(m) = self.modal.as_mut() {
-            let i = m.focused;
-            return m.fields.get_mut(i).map(|(_, e)| e);
+        if let Some(m) = self.modal.as_ref() {
+            return (m.focused < m.fields.len()).then_some(LineField::Dialog(m.focused));
         }
         if self.settings.vi_mode && self.vi_mode == vi::Mode::Command {
-            return Some(&mut self.vi_cmd);
+            return Some(LineField::ViCmd);
         }
-        if let Some(m) = self.bm_menu.as_mut() {
-            return Some(&mut m.query);
+        if self.bm_menu.is_some() {
+            return Some(LineField::BmSearch);
         }
-        self.url_focused.then_some(&mut self.url)
+        self.url_focused.then_some(LineField::Url)
+    }
+
+    /// The editor behind `field`, while it exists.
+    fn line_field(&mut self, field: LineField) -> Option<&mut cce_ui::widget::LineEdit> {
+        match field {
+            LineField::Url => Some(&mut self.url),
+            LineField::BmSearch => self.bm_menu.as_mut().map(|m| &mut m.query),
+            LineField::ViCmd => Some(&mut self.vi_cmd),
+            #[cfg(feature = "wpe")]
+            LineField::Dialog(i) => self.modal.as_mut()?.fields.get_mut(i).map(|(_, e)| e),
+        }
+    }
+
+    /// Before a frame is drawn: the field with the keyboard takes up the
+    /// input method's composition, and one that has just lost the keyboard
+    /// drops what it was showing. A field that is gone with it — a dialog
+    /// answered, the bookmarks menu closed — cannot, so a composition still
+    /// up once the old field has let go is cancelled here: it was that
+    /// field's, since the new one has not taken anything yet.
+    fn sync_ime(&mut self) {
+        let now = self.keyboard_field();
+        if now != self.ime_field {
+            let before = self.ime_field;
+            if let Some(edit) = before.and_then(|f| self.line_field(f)) {
+                edit.drop_composition();
+            }
+            if cce_ui::ime::preedit().is_some() {
+                cce_ui::ime::request_reset();
+            }
+            self.ime_field = now;
+        }
+        if let Some(edit) = now.and_then(|f| self.line_field(f)) {
+            edit.sync_ime();
+        }
     }
 
     /// Whether `focused_edit` is the bookmarks menu's search field — an undo
     /// there changes the query, so the list has to follow.
     fn bm_search_has_keyboard(&self) -> bool {
-        #[cfg(feature = "wpe")]
-        if self.modal.is_some() {
-            return false;
-        }
-        if self.settings.vi_mode && self.vi_mode == vi::Mode::Command {
-            return false;
-        }
-        self.bm_menu.is_some()
+        self.keyboard_field() == Some(LineField::BmSearch)
     }
 
 
@@ -3773,26 +3848,23 @@ impl BrowserApp {
             let sigil = self.vi_prompt.sigil().to_string();
             let x = r.x + text_pad();
             let ty = cce_ui::layout::align_text_y(r.y, r.height, URL_FONT, 0.0);
-            let text = self.vi_cmd.text.clone();
-            let cursor = self.vi_cmd.cursor;
-            let sel = self
-                .vi_cmd
-                .selection
-                .filter(|&(a, b)| a < b)
-                .map(|(a, b)| (self.x_of_boundary(&text, a), self.x_of_boundary(&text, b)));
-            let caret = self.x_of_boundary(&text, cursor);
+            // What the field shows: an input method's composition at the
+            // caret, underlined (`FieldMarks`, as every chrome field).
+            let marks = FieldMarks::of(&mut self.font_system, &self.vi_cmd);
             let tx = x + measure_text_width(&sigil, sans, URL_FONT) + 3.0;
+            let caret_rect = Rect { x: tx + marks.caret, y: r.y + 5.0, width: 1.0, height: r.height - 10.0 };
             pc.clip(r, |pc| {
                 pc.text(sigil, x, ty, URL_FONT, [150, 190, 240]);
-                if let Some((x0, x1)) = sel {
+                if let Some((x0, x1)) = marks.selection {
                     pc.quad(Rect { x: tx + x0, y: r.y + 5.0, width: x1 - x0, height: r.height - 10.0 }, SEL_BG);
                 }
-                pc.text(text, tx, ty, URL_FONT, TEXT);
-                pc.quad(
-                    Rect { x: tx + caret, y: r.y + 5.0, width: 1.0, height: r.height - 10.0 },
-                    [0.85, 0.87, 0.92, 1.0],
-                );
+                pc.text(marks.shown.clone(), tx, ty, URL_FONT, TEXT);
+                if let Some((x0, x1)) = marks.composition {
+                    pc.quad(Rect { x: tx + x0, y: r.y + r.height - 6.0, width: x1 - x0, height: 1.0 }, CARET);
+                }
+                pc.quad(caret_rect, [0.85, 0.87, 0.92, 1.0]);
             });
+            report_caret(caret_rect);
             return;
         }
 
@@ -3918,6 +3990,7 @@ impl Application for BrowserApp {
             #[cfg(feature = "wpe")]
             sender,
             font_system: cce_ui::create_font_system(),
+            ime_field: None,
             session,
             favorites,
             favs,
@@ -5102,6 +5175,7 @@ impl Application for BrowserApp {
         #[cfg(feature = "wpe")]
         self.host.frame_drawn();
         self.win = (size.width, size.height);
+        self.sync_ime();
         let mut pc = PaintCtx::new();
         let w = size.width;
 
@@ -5285,35 +5359,13 @@ impl Application for BrowserApp {
                 rim,
             );
             pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
-            let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
-            let caret_x = if self.url_focused { Some(self.caret_offset()) } else { None };
-            let sel_x = self
-                .url
-                .selection
-                .filter(|&(a, b)| a < b)
-                .map(|(a, b)| (self.x_offset(a), self.x_offset(b)));
-            // style: deliberate — the caret and selection stand 4px inside
-            // the field's rim: the glyph box's inset, not a gap.
-            pc.clip(f, |pc| {
-                if let Some((x0, x1)) = sel_x {
-                    pc.quad(
-                        Rect {
-                            x: f.x + text_pad() + x0,
-                            y: f.y + 4.0,
-                            width: x1 - x0,
-                            height: f.height - 8.0,
-                        },
-                        SEL_BG,
-                    );
-                }
-                pc.text(self.url.text.clone(), f.x + text_pad(), ty, URL_FONT, TEXT);
-                if let Some(offset) = caret_x {
-                    pc.quad(
-                        Rect { x: f.x + text_pad() + offset, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 },
-                        [0.85, 0.87, 0.92, 1.0],
-                    );
-                }
-            });
+            let marks = FieldMarks::of(&mut self.font_system, &self.url);
+            let caret = paint_field(pc, f, &marks, "", self.url_focused);
+            // Drawn here only while the bar is out, so a folded bar asks
+            // for no text.
+            if self.keyboard_field() == Some(LineField::Url) {
+                report_caret(caret);
+            }
 
             });
         }
@@ -5415,6 +5467,47 @@ mod tests {
     use super::*;
 
     const SEARCH: &str = "https://duckduckgo.com/?q=";
+
+    #[test]
+    fn a_composition_is_drawn_at_the_caret_and_never_held() {
+        use cce_ui::ime::{set_preedit, Preedit};
+        use cce_ui::widget::LineEdit;
+        let mut fs = cce_ui::create_font_system_with_system_fonts();
+        let mut x = |s: &str, b: usize| x_of_boundary_in(&mut fs, s, b);
+        let (ax, axyzb_1, axyzb_2, axyzb_4) = (x("ab", 1), x("axyzb", 1), x("axyzb", 2), x("axyzb", 4));
+        assert!(ax > 0.0 && axyzb_2 > axyzb_1 && axyzb_4 > axyzb_2, "the run has widths to measure");
+
+        let mut fs = cce_ui::create_font_system_with_system_fonts();
+        let mut url = LineEdit::with_text("ab");
+        url.cursor = 1;
+        let before = FieldMarks::of(&mut fs, &url);
+        assert_eq!((before.shown.as_str(), before.caret, before.composition), ("ab", ax, None));
+
+        // "xyz" composing between a and b, the input method's cursor after x.
+        set_preedit(Some(Preedit::new("xyz", Some((1, 1)))));
+        assert!(url.sync_ime());
+        let marks = FieldMarks::of(&mut fs, &url);
+        assert_eq!(marks.shown, "axyzb", "drawn at the caret");
+        assert_eq!(url.text, "ab", "never in what the bar holds");
+        assert_eq!(marks.composition, Some((axyzb_1, axyzb_4)), "underlined where it is drawn");
+        assert_eq!(marks.caret, axyzb_2, "the caret where the input method has it");
+
+        // A press in it drops it, and lands on the text as held.
+        let at = url.text_index(2);
+        url.press(at, false);
+        url.release();
+        assert!(!url.composing() && cce_ui::ime::preedit().is_none());
+        assert_eq!(FieldMarks::of(&mut fs, &url).shown, "ab");
+
+        // A password field's composition is bullets too.
+        let mut password = LineEdit::masked();
+        set_preedit(Some(Preedit::new("pw", None)));
+        password.sync_ime();
+        let marks = FieldMarks::of(&mut fs, &password);
+        assert_eq!(marks.shown, "\u{2022}\u{2022}");
+        assert!(password.text.is_empty());
+        set_preedit(None);
+    }
 
     #[test]
     fn the_bookmarks_search_keeps_entries_matching_every_word() {
