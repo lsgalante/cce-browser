@@ -573,6 +573,8 @@ impl WebKitHost {
             // manager every tab is built against.
             host.register_account_channel();
             host.register_vi_channel();
+            // Which page fields want no on-screen keyboard (`ime.rs`).
+            super::ime::install_watch(host.ucm);
             host.open_tab(url);
             host
         }

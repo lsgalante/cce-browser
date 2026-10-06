@@ -610,8 +610,19 @@ still reach the page unfiltered. Points that are choices:
   the compositor gives the surface text-input focus, and `window_focused`
   follows `wl_keyboard`, which a seat with no keyboard device (a headless
   shadow) never enters.
-- **`inputmode="none"` is not honoured yet**: the field is skipped when WebKit
-  sets `INHIBIT_OSK`, but WebKit 2.52 sends only `SPELLCHECK` for it.
+- **`inputmode="none"` comes from a watcher, not WebKit.** WebKit has a hint
+  for it (`INHIBIT_OSK`, still honoured) but 2.52 sends only `SPELLCHECK`. So
+  `WATCH_JS` runs in every frame in a private world (`cce-ime`, channel
+  `cceIme`) and reports `none`/`text` on each `focusin`, and a field WebKit
+  has just opened is not claimed until that report is in (they land within
+  ms of each other, either order; a report up to `REPORT_EARLY` before the
+  `focus_in` counts) or `REPORT_WAIT` (100 ms) has passed. Claimed at once,
+  the board would be up before the page said it wants none. Moving between
+  fields sends no `focus_in`, only a new report, which applies at once.
+  The watcher speaks only while `document.visibilityState` is visible —
+  that is what keeps background tabs off the shared channel — never
+  `hasFocus()`, which also needs the window to hold the keyboard and is
+  false all through a headless shadow (no keyboard device).
 - **A composition is not shown in the page.** With an input method running,
   a committed string should arrive as typed keys, as it does for the chrome
   (not yet tried with fcitx5/IBus); the preedit is not drawn (WebKit would take it through the same context's
@@ -620,7 +631,10 @@ still reach the page unfiltered. Points that are choices:
 Verified in shadows at scale 1 and 2 with `ctl touch tap`: a tapped field
 spawns `cce-keyboard show`, a tap or click elsewhere `hide`, a pointer click
 shows nothing, a tap away from a mouse-focused field shows nothing, and a
-tap on the field that already has focus shows the board.
+tap on the field that already has focus shows the board; an
+`inputmode="none"` field — top-level or in a frame, tapped fresh, tapped
+again, or moved to from an open field — shows nothing (or hides the board),
+and moving from it to a normal field shows it.
 
 ### The wheel eases; the trackpad does not
 
