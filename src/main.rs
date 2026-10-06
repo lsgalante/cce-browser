@@ -87,12 +87,30 @@ fn inner_gap() -> f32 {
 fn text_pad() -> f32 {
     cce_ui::layout::button_padding()
 }
+
+// Control heights are the toolkit's too, one per kind of control:
+
+/// Every button, tab and favorites pill. The glyph buttons are square at it.
+fn btn_h() -> f32 {
+    cce_ui::layout::button_height()
+}
+
+/// Every line field: the URL field, a dialog's fields, the bookmarks search.
+fn field_h() -> f32 {
+    cce_ui::layout::textbox_height()
+}
+
+/// The controls row holds both kinds, each centred in it.
+fn controls_h() -> f32 {
+    btn_h().max(field_h())
+}
+
 /// Two rows — tab strip on top, nav controls + URL field below — with the
 /// favorites strip between them whenever there is one to show. The bar
 /// does not carry an empty row: no favorites, no strip, two-row bar.
 fn bar_h(favorites: bool) -> f32 {
-    let favs = if favorites { FAV_H + inner_gap() } else { 0.0 };
-    plate_pad() + TAB_H + inner_gap() + favs + BTN_H + plate_pad()
+    let favs = if favorites { btn_h() + inner_gap() } else { 0.0 };
+    plate_pad() + btn_h() + inner_gap() + favs + controls_h() + plate_pad()
 }
 const BAR_RADIUS: f32 = 10.0;
 /// Seconds for the bar to unfold from the corner control (and back).
@@ -142,17 +160,14 @@ fn dot_col(position: settings::BarPosition, tabs_row: bool) -> f32 {
     let dot_on_tabs = matches!(position, settings::BarPosition::Top);
     if dot_on_tabs == tabs_row { DOT_COL } else { 0.0 }
 }
-const TAB_H: f32 = 24.0;
 const TAB_MIN_W: f32 = 56.0;
 const TAB_MAX_W: f32 = 200.0;
 /// Tabs at least this wide get a close (`x` glyph) region on their right edge.
 const TAB_CLOSE_MIN_W: f32 = 72.0;
 const TAB_CLOSE_W: f32 = 18.0;
-const PLUS_W: f32 = 26.0;
 /// The favorites strip: a row of pills, each one page. Pills take their
 /// label's width up to `FAV_MAX_W`, and the strip simply stops at the bar's
 /// edge — favorites are a handful by design, not a scrolling list.
-const FAV_H: f32 = 22.0;
 const FAV_MAX_W: f32 = 150.0;
 const FAV_FONT: f32 = 12.0;
 /// The bookmarks menu: a plate of rows dropped from the controls row's
@@ -177,8 +192,6 @@ const AC_SUB_FONT: f32 = 11.0;
 /// The blurred page is the base and this color tints it at |alpha|
 /// opacity — keep |alpha| low so the frosted content shows through.
 const BAR_FILL: [f32; 4] = [0.11, 0.12, 0.13, -0.28];
-const BTN_W: f32 = 30.0;
-const BTN_H: f32 = 26.0;
 const URL_FONT: f32 = 14.0;
 /// Pixels per wheel notch when the DE reports discrete line deltas.
 const LINE_PX: f64 = 76.0;
@@ -341,8 +354,6 @@ enum ModalKind {
 #[cfg(feature = "wpe")]
 const MODAL_W: f32 = 420.0;
 #[cfg(feature = "wpe")]
-const MODAL_FIELD_H: f32 = 26.0;
-#[cfg(feature = "wpe")]
 const MODAL_BTN_W: f32 = 84.0;
 
 #[cfg(feature = "wpe")]
@@ -351,9 +362,9 @@ impl Modal {
         plate_pad() * 2.0
             + 20.0
             + 22.0
-            + self.fields.len() as f32 * (MODAL_FIELD_H + inner_gap())
+            + self.fields.len() as f32 * (field_h() + inner_gap())
             + inner_gap()
-            + BTN_H
+            + btn_h()
     }
 
     /// Centred, and clamped so it stays on screen on a small window.
@@ -371,9 +382,9 @@ impl Modal {
     fn field_rect(&self, r: &Rect, i: usize) -> Rect {
         Rect {
             x: r.x + plate_pad(),
-            y: r.y + plate_pad() + 42.0 + i as f32 * (MODAL_FIELD_H + inner_gap()),
+            y: r.y + plate_pad() + 42.0 + i as f32 * (field_h() + inner_gap()),
             width: r.width - plate_pad() * 2.0,
-            height: MODAL_FIELD_H,
+            height: field_h(),
         }
     }
 
@@ -387,12 +398,12 @@ impl Modal {
 
     /// (ok, cancel) — cancel is `None` for a bare alert.
     fn button_rects(&self, r: &Rect) -> (Rect, Option<Rect>) {
-        let y = r.y + r.height - plate_pad() - BTN_H;
+        let y = r.y + r.height - plate_pad() - btn_h();
         let ok = Rect {
             x: r.x + r.width - plate_pad() - MODAL_BTN_W,
             y,
             width: MODAL_BTN_W,
-            height: BTN_H,
+            height: btn_h(),
         };
         let cancel = self.has_cancel.then(|| Rect {
             x: ok.x - MODAL_BTN_W - inner_gap(),
@@ -1063,13 +1074,13 @@ fn tabs_y(bar: &Rect) -> f32 {
 /// Y of the favorites strip — under the tabs, where it only exists when
 /// the bar was sized for it.
 fn favs_y(bar: &Rect) -> f32 {
-    bar.y + plate_pad() + TAB_H + inner_gap()
+    bar.y + plate_pad() + btn_h() + inner_gap()
 }
 
 /// Y of the nav-controls row: the bar's bottom row, whether or not the
 /// favorites strip sits above it, so it is measured from the bottom edge.
 fn controls_y(bar: &Rect) -> f32 {
-    bar.y + bar.height - plate_pad() - BTN_H
+    bar.y + bar.height - plate_pad() - controls_h()
 }
 
 /// The favorites strip's pills, one rect per favorite that fits, in strip
@@ -1083,11 +1094,11 @@ fn fav_rects(bar: &Rect, favs: &[pages::Link], sans: &str) -> Vec<Rect> {
     for f in favs {
         let w = (measure_text_width(&f.label, sans, FAV_FONT) + 2.0 * text_pad())
             .min(FAV_MAX_W)
-            .max(FAV_H);
+            .max(btn_h());
         if x + w > right {
             break;
         }
-        rects.push(Rect { x, y: favs_y(bar), width: w, height: FAV_H });
+        rects.push(Rect { x, y: favs_y(bar), width: w, height: btn_h() });
         x += w + item_gap();
     }
     rects
@@ -1095,10 +1106,10 @@ fn fav_rects(bar: &Rect, favs: &[pages::Link], sans: &str) -> Vec<Rect> {
 
 fn plus_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     Rect {
-        x: bar.x + bar.width - plate_pad() - dot_col(position, true) - PLUS_W,
+        x: bar.x + bar.width - plate_pad() - dot_col(position, true) - btn_h(),
         y: tabs_y(bar),
-        width: PLUS_W,
-        height: TAB_H,
+        width: btn_h(),
+        height: btn_h(),
     }
 }
 
@@ -1106,7 +1117,7 @@ fn tab_rect(bar: &Rect, position: settings::BarPosition, count: usize, i: usize)
     let avail = bar.width
         - 2.0 * plate_pad()
         - dot_col(position, true)
-        - PLUS_W
+        - btn_h()
         - item_gap()
         - (count.max(1) - 1) as f32 * item_gap();
     let w = (avail / count.max(1) as f32).clamp(TAB_MIN_W, TAB_MAX_W);
@@ -1114,7 +1125,7 @@ fn tab_rect(bar: &Rect, position: settings::BarPosition, count: usize, i: usize)
         x: bar.x + plate_pad() + i as f32 * (w + item_gap()),
         y: tabs_y(bar),
         width: w,
-        height: TAB_H,
+        height: btn_h(),
     }
 }
 
@@ -1130,10 +1141,10 @@ fn tab_close_rect(pill: &Rect) -> Option<Rect> {
 
 fn btn_rect(bar: &Rect, i: usize) -> Rect {
     Rect {
-        x: bar.x + plate_pad() + i as f32 * (BTN_W + item_gap()),
-        y: controls_y(bar),
-        width: BTN_W,
-        height: BTN_H,
+        x: bar.x + plate_pad() + i as f32 * (btn_h() + item_gap()),
+        y: controls_y(bar) + (controls_h() - btn_h()) / 2.0,
+        width: btn_h(),
+        height: btn_h(),
     }
 }
 
@@ -1141,10 +1152,10 @@ fn btn_rect(bar: &Rect, i: usize) -> Rect {
 /// corner control when that row holds it.
 fn star_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     Rect {
-        x: bar.x + bar.width - plate_pad() - dot_col(position, false) - BTN_W,
-        y: controls_y(bar),
-        width: BTN_W,
-        height: BTN_H,
+        x: bar.x + bar.width - plate_pad() - dot_col(position, false) - btn_h(),
+        y: controls_y(bar) + (controls_h() - btn_h()) / 2.0,
+        width: btn_h(),
+        height: btn_h(),
     }
 }
 
@@ -1152,13 +1163,14 @@ fn star_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
 /// this page's bookmark, this is all of them.
 fn bm_btn_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
     let star = star_rect(bar, position);
-    Rect { x: star.x - item_gap() - BTN_W, ..star }
+    Rect { x: star.x - item_gap() - btn_h(), ..star }
 }
 
 fn url_rect(bar: &Rect, position: settings::BarPosition) -> Rect {
-    let x = bar.x + plate_pad() + 3.0 * (BTN_W + item_gap());
+    let x = bar.x + plate_pad() + 3.0 * (btn_h() + item_gap());
     let right = bm_btn_rect(bar, position).x - item_gap();
-    Rect { x, y: controls_y(bar), width: (right - x).max(60.0), height: BTN_H }
+    let y = controls_y(bar) + (controls_h() - field_h()) / 2.0;
+    Rect { x, y, width: (right - x).max(60.0), height: field_h() }
 }
 
 /// Whether a password filled into this page would leave it in the clear.
@@ -1553,7 +1565,7 @@ impl BrowserApp {
             return None;
         }
         let width = SAVE_W.min(self.win.0 - 2.0 * bar_margin()).max(220.0);
-        let height = plate_pad() * 2.0 + 20.0 + 18.0 + 18.0 + inner_gap() + BTN_H;
+        let height = plate_pad() * 2.0 + 20.0 + 18.0 + 18.0 + inner_gap() + btn_h();
         let (cx, cy) = self.dot_center();
         let edge = cx + DOT_R;
         let x = (edge - width).clamp(0.0, (self.win.0 - width).max(0.0));
@@ -1578,12 +1590,12 @@ impl BrowserApp {
             }
         };
         let plate = Rect { x, y, width, height };
-        let by = plate.y + plate.height - plate_pad() - BTN_H;
+        let by = plate.y + plate.height - plate_pad() - btn_h();
         let at = |k: f32| Rect {
             x: plate.x + plate.width - plate_pad() - (k + 1.0) * SAVE_BTN_W - k * inner_gap(),
             y: by,
             width: SAVE_BTN_W,
-            height: BTN_H,
+            height: btn_h(),
         };
         let buttons = match offer.stage {
             SaveStage::Failed(_) => vec![(at(0.0), SaveButton::Dismiss)],
@@ -1857,9 +1869,9 @@ impl BrowserApp {
         let width = BM_W.min(self.win.0 - 2.0 * bar_margin()).max(160.0);
         let x = (btn.x + btn.width - width)
             .clamp(bar_margin(), (self.win.0 - bar_margin() - width).max(bar_margin()));
-        // The furniture the list is fitted around: the search row and its
+        // The furniture the list is fitted around: the search field and its
         // gap, the toggle row, two rules and the manage row.
-        let fixed = 2.0 * plate_pad() + 3.0 * BM_ROW_H + inner_gap() + 2.0 * BM_SEP_H;
+        let fixed = 2.0 * plate_pad() + field_h() + inner_gap() + 2.0 * BM_ROW_H + 2.0 * BM_SEP_H;
         let avail = match self.settings.bar_position {
             settings::BarPosition::Top => self.win.1 - (bar.y + bar.height + item_gap()) - bar_margin(),
             settings::BarPosition::Bottom => bar.y - item_gap() - bar_margin(),
@@ -1885,7 +1897,7 @@ impl BrowserApp {
             width: width - 4.0,
             height: BM_ROW_H,
         };
-        let toggle_y = BM_ROW_H + inner_gap();
+        let toggle_y = field_h() + inner_gap();
         let list_y = toggle_y + BM_ROW_H + BM_SEP_H;
         let shown = menu.items.len().min(slots);
         let first = menu.scroll.min(menu.items.len().saturating_sub(shown));
@@ -1898,7 +1910,7 @@ impl BrowserApp {
             x: x + plate_pad(),
             y: y + plate_pad(),
             width: width - 2.0 * plate_pad(),
-            height: BM_ROW_H,
+            height: field_h(),
         };
         Some(BmLayout {
             plate,
