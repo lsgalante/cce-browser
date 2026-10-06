@@ -127,7 +127,7 @@ const DOT_R: f32 = 1.75 * plate_dock::CORNER_R;
 const DOT_INSET: f32 = plate_dock::CORNER_INSET + (DOT_R - plate_dock::CORNER_R);
 /// Width reserved at the right end of the row the corner control sits on
 /// (the tab row for a top bar, the controls row for a bottom one), so the
-/// "+" or the bookmark star clears the dot in the bar's corner.
+/// new-tab plus or the bookmark star clears the dot in the bar's corner.
 const DOT_COL: f32 = 2.0 * DOT_INSET;
 
 /// The reservation a row makes for the corner control: `DOT_COL` on the
@@ -139,7 +139,7 @@ fn dot_col(position: settings::BarPosition, tabs_row: bool) -> f32 {
 const TAB_H: f32 = 24.0;
 const TAB_MIN_W: f32 = 56.0;
 const TAB_MAX_W: f32 = 200.0;
-/// Tabs at least this wide get a close "x" region on their right edge.
+/// Tabs at least this wide get a close (`x` glyph) region on their right edge.
 const TAB_CLOSE_MIN_W: f32 = 72.0;
 const TAB_CLOSE_W: f32 = 18.0;
 const PLUS_W: f32 = 26.0;
@@ -149,8 +149,8 @@ const PLUS_W: f32 = 26.0;
 const FAV_H: f32 = 22.0;
 const FAV_MAX_W: f32 = 150.0;
 const FAV_FONT: f32 = 12.0;
-/// The bookmarks menu: a plate of rows dropped from the controls row's "B"
-/// button — the bar's own way to visit and manage what the star saves.
+/// The bookmarks menu: a plate of rows dropped from the controls row's
+/// bookmarks button — the bar's own way to visit and manage what the star saves.
 const BM_W: f32 = 320.0;
 const BM_ROW_H: f32 = 24.0;
 /// Height of the rule between the menu's three sections.
@@ -581,7 +581,7 @@ impl OptMenu {
 }
 
 /// The bookmarks menu: the bar's list of saved pages, open under (or over)
-/// the "B" button in the controls row.
+/// the bookmarks button in the controls row.
 ///
 /// It holds a **snapshot** of the store rather than reading it per frame:
 /// the list a pointer is travelling down must not reorder underneath it,
@@ -1108,7 +1108,7 @@ fn tab_rect(bar: &Rect, position: settings::BarPosition, count: usize, i: usize)
     }
 }
 
-/// The close "x" hit region on a tab pill, when the pill is wide enough.
+/// The close hit region on a tab pill, when the pill is wide enough.
 fn tab_close_rect(pill: &Rect) -> Option<Rect> {
     (pill.width >= TAB_CLOSE_MIN_W).then(|| Rect {
         x: pill.x + pill.width - TAB_CLOSE_W,
@@ -2684,6 +2684,34 @@ impl BrowserApp {
         String::new()
     }
 
+    /// A cce-icons glyph `size` px square, centred in `r` and tinted
+    /// `color` as text is — the one way this chrome draws a symbol, never a
+    /// character standing in for one. Should the icon set be missing,
+    /// `fallback` (a plain word, never a symbol) is drawn small in its
+    /// place, cut to the rect.
+    fn glyph(pc: &mut PaintCtx, sans: &str, name: &str, fallback: &str, r: Rect, size: f32, color: [u8; 3]) {
+        let g = Rect {
+            x: r.x + (r.width - size) / 2.0,
+            y: r.y + (r.height - size) / 2.0,
+            width: size,
+            height: size,
+        };
+        let c = color.map(|v| v as f32 / 255.0);
+        if pc.icon(name, g, [c[0], c[1], c[2], 1.0]) {
+            return;
+        }
+        const FALLBACK_FONT: f32 = 9.0;
+        let word = Self::fit_text(fallback, sans, FALLBACK_FONT, r.width - 2.0);
+        let w = measure_text_width(&word, sans, FALLBACK_FONT);
+        pc.text(
+            word,
+            r.x + (r.width - w) / 2.0,
+            cce_ui::layout::align_text_y(r.y, r.height, FALLBACK_FONT, 0.0),
+            FALLBACK_FONT,
+            color,
+        );
+    }
+
     /// Draw the page-blocking prompt, if one is up. Same primitives as the
     /// utility bar — there are no cce-ui widgets in this app — with a scrim
     /// over the page so it reads as blocked, which it genuinely is.
@@ -2989,16 +3017,18 @@ impl BrowserApp {
                 // saved page is available. Hover is the highlight's job.
                 TEXT,
             );
-            // The remove "x" shows on the hovered row only — always-on x's
+            // The remove glyph shows on the hovered row only — always-on x's
             // down a whole list read as clutter, and as a hazard.
             if hovered {
                 let on_rm = hover == Some(BmHit::Entry(*i, true));
-                let xw = measure_text_width("x", sans, 11.0);
-                pc.text(
+                let rm = Rect { x: r.x + r.width - BM_RM_W, width: BM_RM_W, ..*r };
+                Self::glyph(
+                    pc,
+                    sans,
                     "x",
-                    r.x + r.width - BM_RM_W / 2.0 - xw / 2.0,
-                    cce_ui::layout::align_text_y(r.y, r.height, 11.0, 0.0),
-                    11.0,
+                    "Remove",
+                    rm,
+                    10.0,
                     if on_rm { [212, 155, 155] } else { TEXT_DIM },
                 );
             }
@@ -3057,7 +3087,7 @@ impl BrowserApp {
     }
 
     /// Draw a select's list: its options, the current value marked with a
-    /// dot, optgroup headings dim and their options indented under them.
+    /// check glyph, optgroup headings dim and their options indented under them.
     #[cfg(feature = "wpe")]
     fn paint_opt_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
         let Some(l) = self.opt_layout() else { return };
@@ -3077,8 +3107,8 @@ impl BrowserApp {
             }
             let gutter = r.x + text_pad();
             if it.selected {
-                let t = TEXT.map(|c| c as f32 / 255.0);
-                pc.circle(gutter + OPT_INDENT / 2.0 - 2.0, r.y + r.height / 2.0, 2.5, [t[0], t[1], t[2], 1.0]);
+                let mark = Rect { x: gutter - 2.0, y: r.y, width: OPT_INDENT, height: r.height };
+                Self::glyph(pc, sans, "check", "", mark, 10.0, TEXT);
             }
             let x = gutter + OPT_INDENT + if it.group_child { OPT_INDENT } else { 0.0 };
             let avail = r.x + r.width - x - text_pad() - if scrolls { 6.0 } else { 0.0 };
@@ -5262,26 +5292,13 @@ impl Application for BrowserApp {
                     );
                 }
                 if let Some(cr) = close {
-                    let xw = measure_text_width("x", &sans, 11.0);
-                    pc.text(
-                        "x",
-                        cr.x + (cr.width - xw) / 2.0 - 2.0,
-                        cce_ui::layout::align_text_y(cr.y, cr.height, 11.0, 0.0),
-                        11.0,
-                        TEXT_DIM,
-                    );
+                    let glyph_box = Rect { x: cr.x - 2.0, ..cr };
+                    Self::glyph(pc, &sans, "x", "Close", glyph_box, 9.0, TEXT_DIM);
                 }
             }
             let plus = plus_rect(&bar, pos_edge);
             pc.rounded_rect(plus, 7.0, (true, true, true, true), BTN_BG);
-            let pw = measure_text_width("+", &sans, 14.0);
-            pc.text(
-                "+",
-                plus.x + (plus.width - pw) / 2.0,
-                cce_ui::layout::align_text_y(plus.y, plus.height, 14.0, 0.0),
-                14.0,
-                TEXT,
-            );
+            Self::glyph(pc, &sans, "plus", "New", plus, 12.0, TEXT);
 
             // Favorites strip: label pills, the hovered one lifted like an
             // active tab. Labels are cut to the pill, never the other way.
@@ -5305,21 +5322,14 @@ impl Application for BrowserApp {
                 );
             }
 
-            let labels = ["<", ">", "R"];
+            // (glyph, fallback word) for Back, Forward and Reload.
+            let faces = [("arrow-left", "Back"), ("arrow-right", "Forward"), ("refresh", "Reload")];
             let enabled = [self.host.can_go_back(), self.host.can_go_forward(), true];
-            for (i, label) in labels.iter().enumerate() {
+            for (i, (name, word)) in faces.iter().enumerate() {
                 let r = btn_rect(&bar, i);
                 pc.rounded_rect(r, 6.0, (true, true, true, true), BTN_BG);
                 let color = if enabled[i] { TEXT } else { TEXT_DIM };
-                let (sans, ..) = cce_ui::layout::read_preferred_fonts();
-                let lw = measure_text_width(label, &sans, 14.0);
-                pc.text(
-                    *label,
-                    r.x + (r.width - lw) / 2.0,
-                    cce_ui::layout::align_text_y(r.y, r.height, 14.0, 0.0),
-                    14.0,
-                    color,
-                );
+                Self::glyph(pc, &sans, name, word, r, 14.0, color);
             }
 
             // Bookmark star: accent-lit when the page is bookmarked.
@@ -5327,27 +5337,14 @@ impl Application for BrowserApp {
             pc.rounded_rect(star, 6.0, (true, true, true, true), BTN_BG);
             let starred = self.host.active_bookmarked();
             let star_color: [u8; 3] = if starred { [150, 190, 240] } else { TEXT_DIM };
-            let sw = measure_text_width("*", &sans, 17.0);
-            pc.text(
-                "*",
-                star.x + (star.width - sw) / 2.0,
-                cce_ui::layout::align_text_y(star.y, star.height, 17.0, 0.0) + 3.0,
-                17.0,
-                star_color,
-            );
+            Self::glyph(pc, &sans, "star", "Save", star, 15.0, star_color);
 
             // Bookmarks menu button: all the saved pages, where the star
             // beside it is only this one. Lit while its menu is open.
             let bmb = bm_btn_rect(&bar, pos_edge);
             pc.rounded_rect(bmb, 6.0, (true, true, true, true), BTN_BG);
-            let bw = measure_text_width("B", &sans, 14.0);
-            pc.text(
-                "B",
-                bmb.x + (bmb.width - bw) / 2.0,
-                cce_ui::layout::align_text_y(bmb.y, bmb.height, 14.0, 0.0),
-                14.0,
-                if self.bm_menu.is_some() { [150, 190, 240] } else { TEXT },
-            );
+            let bm_color = if self.bm_menu.is_some() { [150, 190, 240] } else { TEXT };
+            Self::glyph(pc, &sans, "bookmarks", "Saved", bmb, 14.0, bm_color);
 
             // URL field: rim + recess, brighter rim when focused.
             let f = url_rect(&bar, pos_edge);

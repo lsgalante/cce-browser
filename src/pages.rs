@@ -415,6 +415,26 @@ fn default_label(url: &str, title: &str) -> String {
     host.or(file).unwrap_or_else(|| url.to_string())
 }
 
+/// The favorites page's move-up mark: cce-icons' `svg/arrow-up.svg`, copied
+/// inline (an `include_str!` of the sibling crate would break a standalone
+/// clone) with its `#ffffff` made `currentColor`, so it takes the link's
+/// colour — dim, the hover red, the disabled end's — as the text did.
+const ARROW_UP_SVG: &str = "<svg viewBox=\"0 0 40 40\" width=\"1em\" height=\"1em\" \
+     style=\"vertical-align:-.15em\" aria-label=\"up\" xmlns=\"http://www.w3.org/2000/svg\">\
+     <g fill=\"currentColor\" transform=\"rotate(-90 20 20)\">\
+     <rect x=\"4\" y=\"17\" width=\"18\" height=\"6\" rx=\"3\"/>\
+     <path d=\"M22 11 L33 20 L22 29 Z\" stroke=\"currentColor\" stroke-width=\"5\" stroke-linejoin=\"round\"/>\
+     </g></svg>";
+
+/// The move-down mark: cce-icons' `svg/arrow-down.svg`, copied as
+/// [`ARROW_UP_SVG`] is.
+const ARROW_DOWN_SVG: &str = "<svg viewBox=\"0 0 40 40\" width=\"1em\" height=\"1em\" \
+     style=\"vertical-align:-.15em\" aria-label=\"down\" xmlns=\"http://www.w3.org/2000/svg\">\
+     <g fill=\"currentColor\" transform=\"rotate(90 20 20)\">\
+     <rect x=\"4\" y=\"17\" width=\"18\" height=\"6\" rx=\"3\"/>\
+     <path d=\"M22 11 L33 20 L22 29 Z\" stroke=\"currentColor\" stroke-width=\"5\" stroke-linejoin=\"round\"/>\
+     </g></svg>";
+
 /// The favorites: a short, ordered, hand-curated list of places, shown as a
 /// row of pills in the utility bar. Deliberately not the bookmarks — the
 /// star is an archive of everything worth finding again; this is the
@@ -511,14 +531,14 @@ impl Favorites {
             let label = default_label(&e.url, &e.title);
             // Ordering links; the end pill has nowhere further to go.
             let up = if i > 0 {
-                format!("<a class=rm href=\"cce://favorites/up?url={}\">&#9650;</a>", html_escape(&enc))
+                format!("<a class=rm href=\"cce://favorites/up?url={}\">{ARROW_UP_SVG}</a>", html_escape(&enc))
             } else {
-                "<span class=rm>&#9650;</span>".to_string()
+                format!("<span class=rm>{ARROW_UP_SVG}</span>")
             };
             let down = if i < last {
-                format!("<a class=rm href=\"cce://favorites/down?url={}\">&#9660;</a>", html_escape(&enc))
+                format!("<a class=rm href=\"cce://favorites/down?url={}\">{ARROW_DOWN_SVG}</a>", html_escape(&enc))
             } else {
-                "<span class=rm>&#9660;</span>".to_string()
+                format!("<span class=rm>{ARROW_DOWN_SVG}</span>")
             };
             rows.push_str(&format!(
                 "<div class=e><span class=w>{up} {down}</span>\

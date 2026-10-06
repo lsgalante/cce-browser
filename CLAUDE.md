@@ -156,6 +156,36 @@ explained there. **Do not reintroduce a `Vec` allocation, a swizzle, or a
 second copy on this path without measuring** — the numbers above are what each
 one costs.
 
+### Only the damage is read
+
+Every webview runs with WebKit's `PropagateDamagingInformation` feature on
+(`FEATURES` in `host.rs`), so each frame says what it repainted. The sink keeps
+that per view — *including frames handed back unread*, whose changes the next
+read still has to carry — and `read_frame` copies only those rectangles
+(`src/wpe/damage.rs`) and hands them to `cce_ui::vk::update_pixel_regions`,
+which writes them into the tab's existing image in one submission. A whole
+frame is read when the tab has no image at that size yet, when a frame said
+nothing (no rectangles = unknown), or when the damage covers half the frame or
+more. Measured in a shadow: an overlay scrollbar fading costs 0.27 MB a frame
+instead of 15 MB, and on Muji with its sliding banner the browser's own CPU
+went from 15% to 10% of a core.
+
+A frame belongs to **the tab that drew it** (`index` in `pump`), not to the
+active tab; a view no tab owns (the spare) is released unread. Before this the
+newest frame from any view was uploaded as the active tab's picture.
+
+Two switches: `CCE_BROWSER_FULL_FRAMES=1` reads whole frames as before (the
+escape hatch if a page is ever drawn stale), and `CCE_BROWSER_DAMAGE_CHECK=1`
+keeps a CPU copy of each tab patched region by region and compares it with
+the whole frame every time, logging any pixel that disagrees. It was exact on
+every read through loading, idling, scrolling, a resize and Muji. Run it after
+touching any of this.
+
+WebKit also gets `HiddenPageCSSAnimationSuspension`: a background tab's CSS
+animations stop, as its `requestAnimationFrame` already does. Its timers still
+run — WebKit has no hidden-page timer throttling here — which is most of what a
+heavy page costs in the background.
+
 ### The readback is paced to draws
 
 `render_buffer` says the two halves of the buffer protocol at different times,
@@ -290,6 +320,13 @@ every hit test in `handle_mouse_input` re-derives the same rects from the same
 `bar_rect`/`tab_rect`/`btn_rect`/`url_rect`/`fav_rects` helpers. **Draw and hit-test are two
 readings of one geometry** — change a rect helper, not one call site.
 
+**Every symbol the chrome draws is a cce-icons glyph** through `BrowserApp::glyph`
+(`PaintCtx::icon`, tinted like text): Back/Forward/Reload are `arrow-left`/`arrow-right`/
+`refresh`, the tab close and a bookmark row's remove `x`, new tab `plus`, the star `star`
+(accent-lit when saved), the bookmarks button `bookmarks`, a select list's current option
+`check`. Never a character standing in for one (the bar was `<` `>` `R` `*` `B`); the
+fallback, drawn only with the icon set missing, is a plain word.
+
 ### Favorites are not bookmarks
 
 Two stores, two meanings. The **star** (`Ctrl+D`, `cce://bookmarks`) is the
@@ -301,18 +338,18 @@ permanent one-click spot: a **strip of label pills inside the bar**, between
 the tab row and the controls row. Click loads the favorite in the active tab
 and folds the bar (a menu pick); middle-click opens it in a background tab
 and leaves the bar out. Insertion order is strip order; the page reorders
-(▲/▼), renames (a GET form per row — form submissions reach the `cce:`
+(cce-icons' arrow-up/arrow-down, inlined as SVG in `pages.rs`), renames (a GET form per row — form submissions reach the `cce:`
 handler like any other navigation) and removes.
 
 ### The bookmarks menu
 
-The controls row's **"B" button** (immediately left of the star) drops the
+The controls row's **bookmarks button** (immediately left of the star) drops the
 bookmarks menu: the star is *this* page's bookmark, the button beside it is
 all of them. A **search field** on top, then three sections — add/remove
 this page, the saved pages themselves (newest first, the `cce://bookmarks`
 order), and `Manage Bookmarks (n)` which hands the collection to that page. A row visits
 in the active tab and folds everything away, middle-click opens it in a
-background tab and leaves the menu up, and the **remove "x"** on the hovered row prunes
+background tab and leaves the menu up, and the **remove glyph** (`x`) on the hovered row prunes
 in place. It closes on Escape (ahead of the URL bar and the page), on a
 click anywhere off its plate, and with the bar it hangs from.
 
@@ -404,7 +441,7 @@ the lerp from the dot's disc up to the bar — and
 any of it shows). The bar's contents are laid out at their *final* rects and
 clipped to the growing plate, so the unfold is a reveal, not a re-layout. The
 row the dot sits on reserves `DOT_COL` at its right end (`dot_col`: the tab
-row's "+" for a top bar, the controls row's star for a bottom one);
+row's new-tab plus for a top bar, the controls row's star for a bottom one);
 `bar_rect` and the rest of the helpers are otherwise unchanged. The plate is
 drawn through `plate_shaped`, a per-plate corner exponent added to `cce-ui`,
 easing from circular at the seed to the DE's own squircle as it becomes the
@@ -472,7 +509,7 @@ Every "open this in a new tab" that is not the person asking for a fresh tab
 opens **behind** the page: a middle-clicked link in a page, a middle-clicked
 favorite or bookmark-menu row, and the context menu's "Open Link in New Tab".
 The active tab, its focus and the URL bar stay as they were, and the bar
-peeks (above). `Ctrl+T`, the "+" and a forwarded external open still open in
+peeks (above). `Ctrl+T`, the new-tab plus and a forwarded external open still open in
 front — those are asks to *go* somewhere.
 
 A page link reaches the chrome through WebKit's `decide-policy`
