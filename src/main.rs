@@ -15,6 +15,8 @@ mod pages;
 mod raindrop;
 mod session;
 mod settings;
+/// Vi-style modal keys, after qutebrowser (`browser.vi-mode`).
+mod vi;
 /// The retired Servo backend; compiled only under `--features servo`.
 #[cfg(feature = "servo")]
 mod webview;
@@ -117,9 +119,9 @@ fn chrome_step(t: f32, target: f32, dt: f32, animate: bool) -> f32 {
 }
 /// Radius of the corner control, drawn and hit. The DE's dot
 /// (`plate_dock::CORNER_R`) is sized for a pane's corner; the browser's is
-/// the whole chrome while folded, so it is half again as big — the same
-/// plain plate-border disc, just easier to see and to hit.
-const DOT_R: f32 = 1.5 * plate_dock::CORNER_R;
+/// the whole chrome while folded, so it is drawn bigger — a circular
+/// plate rather than a pane's dot, easier to see and to hit.
+const DOT_R: f32 = 1.75 * plate_dock::CORNER_R;
 /// Centre inset from the bar's corner, on both axes: the DE's margin
 /// between the dot and the plate edge, kept as the dot grew.
 const DOT_INSET: f32 = plate_dock::CORNER_INSET + (DOT_R - plate_dock::CORNER_R);
@@ -174,6 +176,26 @@ const BTN_H: f32 = 26.0;
 const URL_FONT: f32 = 14.0;
 /// Pixels per wheel notch when the DE reports discrete line deltas.
 const LINE_PX: f64 = 76.0;
+/// A vi `j`/`k` line, in wheel notches.
+const VI_LINE: f32 = 0.5;
+/// How soon after a click a field taking focus counts as clicked into — what
+/// separates the person entering a field from a page focusing one itself.
+const VI_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+/// How long a vi status message stays up.
+const VI_MSG_TIME: std::time::Duration = std::time::Duration::from_secs(3);
+/// The vi status line: mode, pending keys, messages, the `:` line.
+const VI_LINE_H: f32 = 28.0;
+const VI_FONT: f32 = 13.0;
+/// Hint labels over the page: qutebrowser's yellow, because a label has to
+/// read over any page at all, and the chrome's dark plates vanish into a
+/// dark one.
+const HINT_H: f32 = 19.0;
+const HINT_FONT: f32 = 13.0;
+const HINT_BG: [f32; 4] = [0.98, 0.84, 0.30, 1.0];
+const HINT_RIM: [f32; 4] = [0.45, 0.34, 0.04, 1.0];
+const HINT_TEXT: [u8; 3] = [20, 18, 10];
+/// The part of a label already typed.
+const HINT_TYPED: [u8; 3] = [140, 112, 30];
 
 
 const PAGE_BG: [f32; 4] = [0.10, 0.10, 0.11, 1.0];
@@ -199,6 +221,8 @@ const CARET: [f32; 4] = [0.85, 0.87, 0.92, 1.0];
 enum LineField {
     Url,
     BmSearch,
+    /// The vi command line (`:` or `/`), while it is open.
+    ViCmd,
     /// The open dialog's field at this index.
     #[cfg(feature = "wpe")]
     Dialog(usize),
@@ -805,6 +829,14 @@ struct BmLayout {
     cap: usize,
 }
 
+/// What a vi script evaluation in flight was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViAsk {
+    Hints,
+    FocusInput,
+    ClickCheck,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     /// The accounts worker answered a load: the index, or why it failed.
@@ -950,6 +982,47 @@ struct BrowserApp {
     nav_url: Option<String>,
     /// Hovered pill in the favorites strip — a repaint, like the dot.
     fav_hover: Option<usize>,
+    /// Where an eased scroll the keyboard started is aimed: the middle of
+    /// the page, not wherever the pointer happens to rest. A real wheel
+    /// event takes it back to the pointer.
+    scroll_origin: Option<(f32, f32)>,
+    /// Submitting the URL bar opens a new tab instead of loading here — vi's
+    /// `O` / `gO`.
+    url_new_tab: bool,
+    /// Recently closed tabs' addresses, newest last, for `u` / `:undo`.
+    closed_tabs: Vec<Url>,
+    /// Vi mode (`browser.vi-mode`, `src/vi.rs`). Everything below is idle
+    /// while the setting is off.
+    vi_mode: vi::Mode,
+    /// Count and keys typed toward a normal-mode binding.
+    vi_keys: vi::Keys,
+    /// Labels over the page in hint mode; empty while the page is still
+    /// being asked for them.
+    vi_hints: Vec<vi::Hint>,
+    vi_hint_kind: vi::HintKind,
+    vi_hint_typed: String,
+    /// The script evaluation whose answer is awaited, by tag; an answer
+    /// under any other tag is stale.
+    vi_pending: Option<(u32, ViAsk)>,
+    vi_tag: u32,
+    /// The `:` / `/` / `?` line.
+    vi_cmd: cce_ui::widget::LineEdit,
+    vi_prompt: vi::Prompt,
+    /// Lines submitted, `(is a search, text)`, oldest first; Up/Down walk
+    /// the ones of the open prompt's kind.
+    vi_history: Vec<(bool, String)>,
+    vi_history_at: Option<usize>,
+    /// A status message and when it goes.
+    vi_msg: Option<(String, std::time::Instant)>,
+    /// The last page click (or followed hint) — see `VI_CLICK_WINDOW`.
+    vi_click: Option<std::time::Instant>,
+    /// Keys whose press vi took, so their release is not handed to the page
+    /// unpaired — even when the press changed the mode (`i`).
+    vi_swallowed: Vec<String>,
+    /// The last search, for `n` / `N` and an empty `/`; and whether its
+    /// highlights are up.
+    vi_search: Option<String>,
+    vi_searching: bool,
 }
 
 
@@ -1190,6 +1263,7 @@ impl BrowserApp {
         self.scroll.x.jump_to(0.0);
         self.scroll.y.jump_to(0.0);
         self.scroll_sent = (0.0, 0.0);
+        self.scroll_origin = None;
     }
 
     /// Hand the engine what the glide moved since the last frame.
@@ -1221,12 +1295,8 @@ impl BrowserApp {
         // would tell the engine every frame that a gesture had just ended.
         cce_ui::widget::scroll_motion::set_scroll_phase(cce_ui::widget::ScrollPhase::Wheel);
         let s = self.scale;
-        self.host.wheel(
-            -(dx as f64) * s,
-            -(dy as f64) * s,
-            self.pointer.0 * s as f32,
-            self.pointer.1 * s as f32,
-        );
+        let (px, py) = self.scroll_origin.unwrap_or(self.pointer);
+        self.host.wheel(-(dx as f64) * s, -(dy as f64) * s, px * s as f32, py * s as f32);
         true
     }
 
@@ -2033,6 +2103,7 @@ impl BrowserApp {
     fn close_chrome(&mut self) {
         self.chrome_open = false;
         self.chrome_peek = None;
+        self.url_new_tab = false;
         // The menu hangs off a bar that is going away.
         self.bm_menu = None;
         if self.url_focused {
@@ -2400,7 +2471,12 @@ impl BrowserApp {
 
     fn navigate(&mut self) {
         if let Some(url) = parse_url_input(&self.url.text, &self.settings.search_prefix) {
-            self.host.load(url);
+            if std::mem::take(&mut self.url_new_tab) {
+                self.host.open_tab(url);
+                self.persist_session();
+            } else {
+                self.host.load(url);
+            }
             self.url_focused = false;
             self.url.selection = None;
             self.loading = true;
@@ -2422,6 +2498,15 @@ impl BrowserApp {
             self.host.set_accounts_enabled(new.accounts);
             if !new.accounts {
                 self.ac_menu = None;
+            }
+        }
+        if new.vi_mode != self.settings.vi_mode {
+            self.host.set_vi_enabled(new.vi_mode);
+            self.vi_set_mode(vi::Mode::Normal);
+            self.vi_msg = None;
+            if self.vi_searching {
+                self.host.find_finish();
+                self.vi_searching = false;
             }
         }
         self.raindrop_on.store(new.raindrop, std::sync::atomic::Ordering::SeqCst);
@@ -2502,6 +2587,7 @@ impl BrowserApp {
         self.host.open_tab(url);
         self.url = cce_ui::widget::LineEdit::default();
         self.url_focused = true;
+        self.url_new_tab = false;
         // The focused field has to be on screen, so a new tab unfolds the
         // menu even when it was opened by chord.
         self.open_chrome();
@@ -2515,6 +2601,17 @@ impl BrowserApp {
         #[cfg(feature = "wpe")]
         {
             self.opt_menu = None;
+        }
+        if let Some(url) = self.host.tab(index).and_then(|t| t.url.clone()) {
+            if url.as_str() != "about:blank" {
+                self.closed_tabs.push(url);
+                if self.closed_tabs.len() > 20 {
+                    self.closed_tabs.remove(0);
+                }
+            }
+        }
+        if index == self.host.active_index() {
+            self.vi_page_changed();
         }
         if !self.host.close_tab(index) {
             // Deliberately emptied: save the empty set so the next launch
@@ -2531,6 +2628,9 @@ impl BrowserApp {
     fn switch_tab(&mut self, index: usize) {
         // A glide aimed at this page must not land on the next one.
         self.stop_scroll();
+        if index != self.host.active_index() {
+            self.vi_page_changed();
+        }
         // The other tab has its own fields, and may have none.
         #[cfg(feature = "wpe")]
         {
@@ -3091,12 +3191,16 @@ impl BrowserApp {
     }
 
     /// Which line field has the keyboard: a dialog's focused field while
-    /// one is up, else the bookmarks menu's search while it is open, else
-    /// the URL bar while it is focused.
+    /// one is up, else the vi command line while it is open, else the
+    /// bookmarks menu's search while it is open, else the URL bar while it
+    /// is focused.
     fn keyboard_field(&self) -> Option<LineField> {
         #[cfg(feature = "wpe")]
         if let Some(m) = self.modal.as_ref() {
             return (m.focused < m.fields.len()).then_some(LineField::Dialog(m.focused));
+        }
+        if self.settings.vi_mode && self.vi_mode == vi::Mode::Command {
+            return Some(LineField::ViCmd);
         }
         if self.bm_menu.is_some() {
             return Some(LineField::BmSearch);
@@ -3109,6 +3213,7 @@ impl BrowserApp {
         match field {
             LineField::Url => Some(&mut self.url),
             LineField::BmSearch => self.bm_menu.as_mut().map(|m| &mut m.query),
+            LineField::ViCmd => Some(&mut self.vi_cmd),
             #[cfg(feature = "wpe")]
             LineField::Dialog(i) => self.modal.as_mut()?.fields.get_mut(i).map(|(_, e)| e),
         }
@@ -3153,11 +3258,637 @@ impl BrowserApp {
             cce_ui::widget::EditOutcome::Submit => self.navigate(),
             cce_ui::widget::EditOutcome::Cancel => {
                 self.url_focused = false;
+                self.url_new_tab = false;
                 self.url.selection = None;
                 self.sync_page_state();
             }
             cce_ui::widget::EditOutcome::Edited | cce_ui::widget::EditOutcome::Ignored => {}
         }
+    }
+}
+
+/// A key's identity across its press and release: the logical key, case
+/// folded, since Shift can be let go between the two (`G` comes up as `g`).
+fn key_id(event: &KeyEvent) -> String {
+    format!("{:?}", event.logical_key).to_lowercase()
+}
+
+// ---- vi mode (`src/vi.rs`) ----
+impl BrowserApp {
+    /// Change mode, dropping whatever the old one had up.
+    fn vi_set_mode(&mut self, mode: vi::Mode) {
+        if mode != vi::Mode::Hint {
+            self.vi_hints.clear();
+            self.vi_hint_typed.clear();
+            if matches!(self.vi_pending, Some((_, ViAsk::Hints))) {
+                self.vi_pending = None;
+            }
+        }
+        self.vi_keys.clear();
+        self.vi_mode = mode;
+    }
+
+    /// The page went away under vi: a navigation, or another tab shown.
+    /// Insert mode and hints belonged to it; so did any search highlight.
+    fn vi_page_changed(&mut self) {
+        if matches!(self.vi_mode, vi::Mode::Insert | vi::Mode::Hint) {
+            self.vi_set_mode(vi::Mode::Normal);
+        }
+        self.vi_pending = None;
+        self.vi_searching = false;
+        // A click that navigated must not let the next page's autofocus
+        // count as clicked into.
+        self.vi_click = None;
+    }
+
+    /// Show a message on the status line for a while. The wake is needed for
+    /// the same reason as the peek's: an idle page turns no loop.
+    fn vi_say(&mut self, text: impl Into<String>) {
+        self.vi_msg = Some((text.into(), std::time::Instant::now() + VI_MSG_TIME));
+        let tx = self.sender.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(VI_MSG_TIME);
+            let _ = tx.send(Message::Spin);
+        });
+    }
+
+    /// Ask the page something; the answer arrives in `vi_drain`.
+    fn vi_ask(&mut self, ask: ViAsk, script: &str) {
+        self.vi_tag = self.vi_tag.wrapping_add(1).max(1);
+        self.vi_pending = Some((self.vi_tag, ask));
+        self.host.vi_eval(script, self.vi_tag);
+    }
+
+    /// Take in what the page side said since the last pump: script answers,
+    /// focus moves, a search's outcome, and a message's time running out.
+    /// Returns whether anything shows differently.
+    fn vi_drain(&mut self) -> bool {
+        let mut changed = false;
+        while let Some((tag, text)) = self.host.take_vi_result() {
+            let Some((want, ask)) = self.vi_pending else { continue };
+            if tag != want {
+                continue;
+            }
+            self.vi_pending = None;
+            changed = true;
+            match ask {
+                ViAsk::Hints if self.vi_mode == vi::Mode::Hint => {
+                    self.vi_hints = vi::parse_hints(&text);
+                    if self.vi_hints.is_empty() {
+                        self.vi_set_mode(vi::Mode::Normal);
+                        self.vi_say("No elements found");
+                    }
+                }
+                ViAsk::Hints => {}
+                ViAsk::FocusInput if text == "yes" => self.vi_set_mode(vi::Mode::Insert),
+                ViAsk::FocusInput => self.vi_say("No text field found"),
+                ViAsk::ClickCheck => {
+                    if text == "yes" && self.vi_mode == vi::Mode::Normal {
+                        self.vi_set_mode(vi::Mode::Insert);
+                    }
+                }
+            }
+        }
+        if let Some(editable) = self.host.take_vi_focus() {
+            if self.settings.vi_mode {
+                let clicked = self.vi_click.is_some_and(|t| t.elapsed() < VI_CLICK_WINDOW);
+                match (self.vi_mode, editable) {
+                    (vi::Mode::Normal, true) if clicked => self.vi_set_mode(vi::Mode::Insert),
+                    (vi::Mode::Insert, false) => self.vi_set_mode(vi::Mode::Normal),
+                    _ => {}
+                }
+                changed = true;
+            }
+        }
+        if self.host.take_find_result() == Some(0) {
+            let text = self.vi_search.clone().unwrap_or_default();
+            self.vi_say(format!("Text not found: {text}"));
+            changed = true;
+        }
+        if self.vi_msg.as_ref().is_some_and(|(_, at)| std::time::Instant::now() >= *at) {
+            self.vi_msg = None;
+            changed = true;
+        }
+        changed
+    }
+
+    /// Mark a press as taken, so its release is too.
+    fn vi_swallow(&mut self, event: &KeyEvent) {
+        if self.vi_swallowed.len() >= 16 {
+            self.vi_swallowed.remove(0);
+        }
+        self.vi_swallowed.push(key_id(event));
+    }
+
+    /// The vi stage of `handle_key_input`. `Some` when vi took the key —
+    /// carrying what the key did, which can be quitting — `None` to let it
+    /// go on down the funnel.
+    fn vi_key(&mut self, event: &KeyEvent, needs_rebuild: &mut bool) -> Option<Option<Message>> {
+        use vi::Mode;
+        if !self.settings.vi_mode {
+            return None;
+        }
+        let owns_keyboard = matches!(self.vi_mode, Mode::Hint | Mode::Command);
+        if event.state != ElementState::Pressed {
+            let id = key_id(event);
+            if let Some(i) = self.vi_swallowed.iter().position(|k| *k == id) {
+                self.vi_swallowed.remove(i);
+                return Some(None);
+            }
+            return owns_keyboard.then_some(None);
+        }
+        // A modifier on its own means nothing to vi.
+        if matches!(
+            event.logical_key,
+            Key::Named(NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super)
+        ) {
+            return owns_keyboard.then_some(None);
+        }
+        match self.vi_mode {
+            Mode::Command => {
+                self.vi_swallow(event);
+                *needs_rebuild = true;
+                return Some(self.vi_cmd_key(event));
+            }
+            Mode::Hint => {
+                self.vi_swallow(event);
+                *needs_rebuild = true;
+                self.vi_hint_key(event);
+                return Some(None);
+            }
+            _ => {}
+        }
+        // A field of the chrome's own has the keyboard; vi stays out of it.
+        if self.url_focused || self.bm_menu.is_some() {
+            return None;
+        }
+        let escape = event.logical_key == Key::Named(NamedKey::Escape);
+        match self.vi_mode {
+            Mode::Passthrough => {
+                if escape && event.shift {
+                    self.vi_swallow(event);
+                    self.vi_set_mode(Mode::Normal);
+                    *needs_rebuild = true;
+                } else {
+                    self.host.key_ui(event);
+                }
+                return Some(None);
+            }
+            Mode::Insert => {
+                if !escape {
+                    return None;
+                }
+                self.vi_swallow(event);
+                self.vi_set_mode(Mode::Normal);
+                *needs_rebuild = true;
+                return Some(None);
+            }
+            _ => {}
+        }
+
+        // Normal mode. Escape clears what vi has going — pending keys, a
+        // message, a search's highlights — and only with none of that does
+        // it go on, to fold the bar or reach the page.
+        if escape {
+            let mut used = !self.vi_keys.is_empty() || self.vi_msg.take().is_some();
+            self.vi_keys.clear();
+            if self.vi_searching {
+                self.host.find_finish();
+                self.vi_searching = false;
+                used = true;
+            }
+            if !used {
+                return None;
+            }
+            self.vi_swallow(event);
+            *needs_rebuild = true;
+            return Some(None);
+        }
+        *needs_rebuild = true;
+        // Named keys are never commands: they end a sequence and go on.
+        let Some(token) = vi::token(event) else {
+            self.vi_keys.clear();
+            return None;
+        };
+        // A chord vi has no binding for is the chrome's, or the page's.
+        if (event.ctrl || event.alt) && !self.vi_keys.takes(&token) {
+            self.vi_keys.clear();
+            return None;
+        }
+        self.vi_swallow(event);
+        self.vi_msg = None;
+        match self.vi_keys.feed(&token) {
+            vi::Fed::Run(action, count) => Some(self.vi_run(action, count)),
+            vi::Fed::Pending | vi::Fed::Unbound => Some(None),
+        }
+    }
+
+    /// Do a normal-mode command.
+    fn vi_run(&mut self, action: vi::Action, count: Option<u32>) -> Option<Message> {
+        use vi::Action as A;
+        let n = count.unwrap_or(1).max(1) as usize;
+        let tabs = self.host.tab_count();
+        let cur = self.host.active_index();
+        match action {
+            A::ScrollLines(dx, dy) => self.vi_scroll_lines(dx * n as f32, dy * n as f32),
+            A::ScrollPage(f) => {
+                let js = vi::scroll_js(Some(f * n as f32), None, cce_ui::motion::enabled());
+                self.host.vi_eval(&js, 0);
+            }
+            A::Top | A::Bottom => {
+                let end = if action == A::Top { 0.0 } else { 1.0 };
+                let to = count.map_or(end, |c| c.min(100) as f32 / 100.0);
+                self.host.vi_eval(&vi::scroll_js(None, Some(to), false), 0);
+            }
+            A::Back => self.host.back(),
+            A::Forward => self.host.forward(),
+            A::Reload => self.host.reload(),
+            A::TabNext if tabs > 1 => self.switch_tab((cur + n) % tabs),
+            A::TabPrev if tabs > 1 => self.switch_tab((cur + tabs - n % tabs) % tabs),
+            A::TabGoto => match count {
+                Some(c) => return self.vi_run(A::TabFocus(c as usize), None),
+                None => return self.vi_run(A::TabNext, None),
+            },
+            A::TabFocus(i) if (1..=tabs).contains(&i) => self.switch_tab(i - 1),
+            A::TabFocus(i) => self.vi_say(format!("There is no tab {i}")),
+            A::TabFirst => self.switch_tab(0),
+            A::TabLast => self.switch_tab(tabs.saturating_sub(1)),
+            A::TabNext | A::TabPrev => {}
+            A::TabClose => return self.close_tab(cur),
+            A::TabOnly => {
+                for i in (0..tabs).rev().filter(|&i| i != cur) {
+                    self.close_tab(i);
+                }
+            }
+            A::UndoClose => match self.closed_tabs.pop() {
+                Some(url) => {
+                    self.host.open_tab(url);
+                    self.sync_page_state();
+                    self.persist_session();
+                }
+                None => self.vi_say("No closed tabs"),
+            },
+            A::Open { tab, edit } => {
+                self.open_chrome();
+                let text = if edit {
+                    self.host.url().map(|u| u.to_string()).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                self.url = cce_ui::widget::LineEdit::with_text(text);
+                self.url_focused = true;
+                self.url_new_tab = tab;
+            }
+            A::Hint(kind) => {
+                self.vi_set_mode(vi::Mode::Hint);
+                self.vi_hint_kind = kind;
+                self.vi_ask(ViAsk::Hints, &vi::hints_js(kind != vi::HintKind::Follow));
+            }
+            A::YankUrl => match self.host.url() {
+                Some(u) => {
+                    cce_ui::widget::clipboard::copy_to_clipboard(u.as_str());
+                    self.vi_say(format!("Yanked {u}"));
+                }
+                None => self.vi_say("No address to yank"),
+            },
+            A::YankTitle => match self.title.clone().filter(|t| !t.is_empty()) {
+                Some(t) => {
+                    cce_ui::widget::clipboard::copy_to_clipboard(&t);
+                    self.vi_say(format!("Yanked {t}"));
+                }
+                None => self.vi_say("No title to yank"),
+            },
+            A::Paste { tab } => {
+                let url = cce_ui::widget::clipboard::read_from_clipboard()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .and_then(|t| parse_url_input(&t, &self.settings.search_prefix));
+                match url {
+                    Some(url) if tab => {
+                        self.host.open_tab(url);
+                        self.sync_page_state();
+                        self.persist_session();
+                    }
+                    Some(url) => {
+                        self.host.load(url);
+                        self.loading = true;
+                    }
+                    None => self.vi_say("Nothing to open in the clipboard"),
+                }
+            }
+            A::Insert => self.vi_set_mode(vi::Mode::Insert),
+            A::FocusInput => self.vi_ask(ViAsk::FocusInput, &vi::focus_input_js()),
+            A::Passthrough => self.vi_set_mode(vi::Mode::Passthrough),
+            A::Prompt(p) => {
+                self.vi_set_mode(vi::Mode::Command);
+                self.vi_prompt = p;
+                self.vi_cmd = cce_ui::widget::LineEdit::default();
+                self.vi_history_at = None;
+            }
+            A::SearchNext | A::SearchPrev => {
+                if self.vi_searching {
+                    for _ in 0..n {
+                        if action == A::SearchNext {
+                            self.host.find_next();
+                        } else {
+                            self.host.find_prev();
+                        }
+                    }
+                } else if let Some(text) = self.vi_search.clone() {
+                    // A search from before a navigation: start it again here.
+                    self.host.find(&text, action == A::SearchPrev);
+                    self.vi_searching = true;
+                } else {
+                    self.vi_say("No previous search");
+                }
+            }
+            A::Bookmark => {
+                self.host.toggle_bookmark();
+                let on = self.host.active_bookmarked();
+                self.vi_say(if on { "Bookmarked" } else { "Bookmark removed" });
+            }
+            A::Page(page) => self.open_internal_page(page),
+            A::Up | A::Root => {
+                let to = self.host.url().and_then(|u| {
+                    if action == A::Up { vi::url_up(&u) } else { vi::url_root(&u) }
+                });
+                if let Some(url) = to {
+                    self.host.load(url);
+                    self.loading = true;
+                }
+            }
+        }
+        None
+    }
+
+    /// `j`/`k`/`h`/`l`: a wheel's worth of lines through the same eased
+    /// model a notch takes, aimed at the middle of the page.
+    fn vi_scroll_lines(&mut self, dx: f32, dy: f32) {
+        let center = (self.win.0 / 2.0, self.win.1 / 2.0);
+        // Lines down are a negative wheel delta (winit: positive = up).
+        let (lx, ly) = (-dx * VI_LINE, -dy * VI_LINE);
+        if cce_ui::widget::scroll_motion::scroll_settings().smooth {
+            use cce_ui::widget::scroll_motion::Bounds;
+            self.scroll_origin = Some(center);
+            self.scroll.apply(
+                &MouseScrollDelta::LineDelta(lx, ly),
+                (LINE_PX as f32, LINE_PX as f32),
+                Bounds::UNBOUNDED,
+                Bounds::UNBOUNDED,
+            );
+        } else {
+            cce_ui::widget::scroll_motion::set_scroll_phase(cce_ui::widget::ScrollPhase::Wheel);
+            let s = self.scale;
+            self.host.wheel(
+                lx as f64 * LINE_PX * s,
+                ly as f64 * LINE_PX * s,
+                center.0 * s as f32,
+                center.1 * s as f32,
+            );
+        }
+    }
+
+    /// Keys while the labels are up: letters narrow them down, a whole label
+    /// picks, Backspace takes a letter back, Escape gives up.
+    fn vi_hint_key(&mut self, event: &KeyEvent) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.vi_set_mode(vi::Mode::Normal),
+            Key::Named(NamedKey::Backspace) => {
+                self.vi_hint_typed.pop();
+            }
+            Key::Character(c) if !event.ctrl && !event.alt => {
+                let next = format!("{}{}", self.vi_hint_typed, c.to_lowercase());
+                // A letter no label continues with is ignored, not an error.
+                if self.vi_hints.iter().any(|h| h.label.starts_with(&next)) {
+                    let hit = self.vi_hints.iter().find(|h| h.label == next).cloned();
+                    self.vi_hint_typed = next;
+                    if let Some(h) = hit {
+                        self.vi_follow(h);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn vi_follow(&mut self, hint: vi::Hint) {
+        let kind = self.vi_hint_kind;
+        self.vi_set_mode(vi::Mode::Normal);
+        match kind {
+            // A real click, at the element: the page sees a person's click
+            // (popups allowed, focus moved, cross-origin frames and all), and
+            // a field picked this way is clicked into.
+            vi::HintKind::Follow => {
+                self.vi_click = Some(std::time::Instant::now());
+                self.click_page(MouseButton::Left, hint.at);
+                self.vi_ask(ViAsk::ClickCheck, &vi::active_editable_js());
+            }
+            // A middle-click: the link becomes a background tab by the same
+            // route a pointer's middle-click takes.
+            vi::HintKind::Background => self.click_page(MouseButton::Middle, hint.at),
+            vi::HintKind::Yank => match hint.href {
+                Some(href) => {
+                    cce_ui::widget::clipboard::copy_to_clipboard(&href);
+                    self.vi_say(format!("Yanked {href}"));
+                }
+                None => self.vi_say("That has no link to yank"),
+            },
+        }
+    }
+
+    /// Press and release `button` on the page at `at` (logical pixels).
+    fn click_page(&mut self, button: MouseButton, at: (f32, f32)) {
+        let s = self.scale as f32;
+        let (x, y) = (at.0 * s, at.1 * s);
+        self.host.mouse_move(x, y);
+        self.host.mouse_button_ui(button, true, x, y);
+        self.host.mouse_button_ui(button, false, x, y);
+    }
+
+    /// Keys for the `:` / `/` / `?` line. Editing is the shared `LineEdit`;
+    /// Up/Down walk earlier lines of the same kind, and Backspace on an empty
+    /// line leaves it, as in vim.
+    fn vi_cmd_key(&mut self, event: &KeyEvent) -> Option<Message> {
+        let search = self.vi_prompt != vi::Prompt::Command;
+        match event.logical_key {
+            Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown) => {
+                let up = event.logical_key == Key::Named(NamedKey::ArrowUp);
+                let past: Vec<String> = self
+                    .vi_history
+                    .iter()
+                    .filter(|(s, _)| *s == search)
+                    .map(|(_, t)| t.clone())
+                    .collect();
+                if past.is_empty() {
+                    return None;
+                }
+                let at = match (self.vi_history_at, up) {
+                    (None, true) => Some(past.len() - 1),
+                    (None, false) => None,
+                    (Some(i), true) => Some(i.saturating_sub(1)),
+                    (Some(i), false) => (i + 1 < past.len()).then_some(i + 1),
+                };
+                self.vi_history_at = at;
+                self.vi_cmd = cce_ui::widget::LineEdit::with_text(at.map_or(String::new(), |i| past[i].clone()));
+                return None;
+            }
+            Key::Named(NamedKey::Backspace) if self.vi_cmd.text.is_empty() => {
+                self.vi_set_mode(vi::Mode::Normal);
+                return None;
+            }
+            _ => {}
+        }
+        match self.vi_cmd.handle_key(event) {
+            cce_ui::widget::EditOutcome::Submit => {
+                let line = self.vi_cmd.text.clone();
+                self.vi_set_mode(vi::Mode::Normal);
+                if !line.trim().is_empty() {
+                    self.vi_history.retain(|(s, t)| !(*s == search && *t == line));
+                    self.vi_history.push((search, line.clone()));
+                    if self.vi_history.len() > 100 {
+                        self.vi_history.remove(0);
+                    }
+                }
+                self.vi_submit(&line)
+            }
+            cce_ui::widget::EditOutcome::Cancel => {
+                self.vi_set_mode(vi::Mode::Normal);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn vi_submit(&mut self, line: &str) -> Option<Message> {
+        match self.vi_prompt {
+            vi::Prompt::Search | vi::Prompt::SearchBack => {
+                // An empty search repeats the last one, as in vim.
+                let text = Some(line.to_string()).filter(|l| !l.is_empty()).or_else(|| self.vi_search.clone());
+                if let Some(text) = text {
+                    self.host.find(&text, self.vi_prompt == vi::Prompt::SearchBack);
+                    self.vi_search = Some(text);
+                    self.vi_searching = true;
+                }
+                None
+            }
+            vi::Prompt::Command => match vi::parse_command(line) {
+                Ok(vi::Cmd::Run(action)) => self.vi_run(action, None),
+                Ok(vi::Cmd::Open { target, tab, background }) => {
+                    match parse_url_input(&target, &self.settings.search_prefix) {
+                        Some(url) if background => self.open_background_tab(url),
+                        Some(url) if tab => {
+                            self.host.open_tab(url);
+                            self.sync_page_state();
+                            self.persist_session();
+                        }
+                        Some(url) => {
+                            self.host.load(url);
+                            self.loading = true;
+                        }
+                        None => self.vi_say(format!("Cannot open {target}")),
+                    }
+                    None
+                }
+                // Like closing the window: the tabs are kept for next time.
+                Ok(vi::Cmd::Quit) => Some(Message::Quit),
+                Ok(vi::Cmd::Empty) => None,
+                Err(why) => {
+                    self.vi_say(why);
+                    None
+                }
+            },
+        }
+    }
+
+    /// Where the status line goes: the bottom-left corner, clear of the
+    /// dot (which is on the right), lifted over a bottom bar while it shows.
+    fn vi_line_rect(&self, width: f32) -> Rect {
+        let mut y = self.win.1 - bar_margin() - VI_LINE_H;
+        if self.settings.bar_position == settings::BarPosition::Bottom && self.chrome_ease() > 0.0 {
+            y = y.min(self.chrome_plate().0.y - item_gap() - VI_LINE_H);
+        }
+        let width = width.min(self.win.0 - 2.0 * bar_margin()).max(0.0);
+        Rect { x: bar_margin(), y, width, height: VI_LINE_H }
+    }
+
+    /// Hint labels over the page, and the status line: the mode, pending
+    /// keys, a message, or the `:` line being typed. Normal mode with
+    /// nothing to say draws nothing — the chrome stays a dot.
+    fn paint_vi(&mut self, pc: &mut PaintCtx, sans: &str) {
+        if !self.settings.vi_mode {
+            return;
+        }
+        if self.vi_mode == vi::Mode::Hint {
+            let typed = self.vi_hint_typed.clone();
+            let typed_w = measure_text_width(&typed, sans, HINT_FONT);
+            for h in self.vi_hints.iter().filter(|h| h.label.starts_with(&typed)) {
+                let w = measure_text_width(&h.label, sans, HINT_FONT) + 8.0;
+                let x = h.rect.0.clamp(0.0, (self.win.0 - w).max(0.0));
+                let y = h.rect.1.clamp(0.0, (self.win.1 - HINT_H).max(0.0));
+                pc.rounded_rect(
+                    Rect { x: x - 1.0, y: y - 1.0, width: w + 2.0, height: HINT_H + 2.0 },
+                    5.0,
+                    (true, true, true, true),
+                    HINT_RIM,
+                );
+                pc.rounded_rect(Rect { x, y, width: w, height: HINT_H }, 4.0, (true, true, true, true), HINT_BG);
+                let ty = cce_ui::layout::align_text_y(y, HINT_H, HINT_FONT, 0.0);
+                if !typed.is_empty() {
+                    pc.text(typed.clone(), x + 4.0, ty, HINT_FONT, HINT_TYPED);
+                }
+                pc.text(h.label[typed.len()..].to_string(), x + 4.0 + typed_w, ty, HINT_FONT, HINT_TEXT);
+            }
+        }
+
+        let material = cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]);
+        let bevel = cce_ui::layout::bevel_width().min(3.0);
+        if self.vi_mode == vi::Mode::Command {
+            let r = self.vi_line_rect((self.win.0 * 0.5).clamp(320.0, 720.0));
+            pc.plate(r, (8.0, 8.0, 8.0, 8.0), &material, bevel);
+            let sigil = self.vi_prompt.sigil().to_string();
+            let x = r.x + text_pad();
+            let ty = cce_ui::layout::align_text_y(r.y, r.height, URL_FONT, 0.0);
+            // What the field shows: an input method's composition at the
+            // caret, underlined (`FieldMarks`, as every chrome field).
+            let marks = FieldMarks::of(&mut self.font_system, &self.vi_cmd);
+            let tx = x + measure_text_width(&sigil, sans, URL_FONT) + 3.0;
+            let caret_rect = Rect { x: tx + marks.caret, y: r.y + 5.0, width: 1.0, height: r.height - 10.0 };
+            pc.clip(r, |pc| {
+                pc.text(sigil, x, ty, URL_FONT, [150, 190, 240]);
+                if let Some((x0, x1)) = marks.selection {
+                    pc.quad(Rect { x: tx + x0, y: r.y + 5.0, width: x1 - x0, height: r.height - 10.0 }, SEL_BG);
+                }
+                pc.text(marks.shown.clone(), tx, ty, URL_FONT, TEXT);
+                if let Some((x0, x1)) = marks.composition {
+                    pc.quad(Rect { x: tx + x0, y: r.y + r.height - 6.0, width: x1 - x0, height: 1.0 }, CARET);
+                }
+                pc.quad(caret_rect, [0.85, 0.87, 0.92, 1.0]);
+            });
+            report_caret(caret_rect);
+            return;
+        }
+
+        let (text, color) = if let Some((msg, _)) = &self.vi_msg {
+            (msg.clone(), TEXT)
+        } else {
+            let keys = self.vi_keys.shown();
+            match self.vi_mode.label() {
+                Some(label) => (label.to_string(), [150, 190, 240]),
+                None if !keys.is_empty() => (keys, TEXT),
+                None => return,
+            }
+        };
+        let avail = self.win.0 - 2.0 * bar_margin() - 2.0 * text_pad();
+        let text = Self::fit_text(&text, sans, VI_FONT, avail);
+        let r = self.vi_line_rect(measure_text_width(&text, sans, VI_FONT) + 2.0 * text_pad());
+        pc.plate(r, (8.0, 8.0, 8.0, 8.0), &material, bevel);
+        pc.text(
+            text,
+            r.x + text_pad(),
+            cce_ui::layout::align_text_y(r.y, r.height, VI_FONT, 0.0),
+            VI_FONT,
+            color,
+        );
     }
 }
 
@@ -3221,6 +3952,7 @@ impl Application for BrowserApp {
         host.set_force_dark(settings.color_scheme.forces_dark());
         #[cfg(feature = "wpe")]
         host.set_accounts_enabled(settings.accounts);
+        host.set_vi_enabled(settings.vi_mode);
         let accounts = accounts::Accounts::spawn(sender.clone());
         let raindrop_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(settings.raindrop));
         let raindrop_started = settings.raindrop;
@@ -3280,6 +4012,25 @@ impl Application for BrowserApp {
             #[cfg(feature = "wpe")]
             ac_menu: None,
             nav_url: None,
+            scroll_origin: None,
+            url_new_tab: false,
+            closed_tabs: Vec::new(),
+            vi_mode: vi::Mode::Normal,
+            vi_keys: vi::Keys::default(),
+            vi_hints: Vec::new(),
+            vi_hint_kind: vi::HintKind::Follow,
+            vi_hint_typed: String::new(),
+            vi_pending: None,
+            vi_tag: 0,
+            vi_cmd: cce_ui::widget::LineEdit::default(),
+            vi_prompt: vi::Prompt::Command,
+            vi_history: Vec::new(),
+            vi_history_at: None,
+            vi_msg: None,
+            vi_click: None,
+            vi_swallowed: Vec::new(),
+            vi_search: None,
+            vi_searching: false,
         }
     }
 
@@ -3385,6 +4136,12 @@ impl Application for BrowserApp {
                     if now != self.nav_url {
                         self.nav_url = now;
                         self.stop_scroll();
+                        // A load, not a pushState: a search field rewriting
+                        // the address on every keystroke must not lose the
+                        // keyboard to it.
+                        if self.host.loading() {
+                            self.vi_page_changed();
+                        }
                         #[cfg(feature = "wpe")]
                         {
                             self.ac_menu = None;
@@ -3396,6 +4153,9 @@ impl Application for BrowserApp {
                     // Navigation reaches the tab set through these signals,
                     // so this is where an address change gets persisted.
                     self.persist_session();
+                }
+                if self.vi_drain() {
+                    *needs_rebuild = true;
                 }
                 // Drained after the navigation check, so a field reported in
                 // the same pump that finished the load is not thrown away
@@ -3548,6 +4308,7 @@ impl Application for BrowserApp {
         // reach us; forget them rather than act on a stale Shift or drag.
         if !focused {
             self.shift_held = false;
+            self.vi_swallowed.clear();
             // A select's list is a transient of the page, and goes with focus
             // as a native one does.
             #[cfg(feature = "wpe")]
@@ -3578,6 +4339,9 @@ impl Application for BrowserApp {
         #[cfg(feature = "wpe")]
         if self.win != (width, height) {
             self.close_opt_menu();
+        }
+        if self.win != (width, height) && self.vi_mode == vi::Mode::Hint {
+            self.vi_set_mode(vi::Mode::Normal);
         }
         self.win = (width, height);
         self.scale = scale;
@@ -3721,6 +4485,14 @@ impl Application for BrowserApp {
         needs_rebuild: &mut bool,
     ) -> Option<Self::Message> {
         let pressed = state == ElementState::Pressed;
+
+        // A click ends hinting (the labels no longer match what is under
+        // them once anything moves) and the `:` line, as a click off any
+        // other field drops it.
+        if pressed && matches!(self.vi_mode, vi::Mode::Hint | vi::Mode::Command) {
+            self.vi_set_mode(vi::Mode::Normal);
+            *needs_rebuild = true;
+        }
 
         // Before any of the branches that swallow a click: a button the page
         // is holding gets its release no matter where it was let go, or the
@@ -3963,6 +4735,9 @@ impl Application for BrowserApp {
                     // caret, Shift extends to it, and a drag selects.
                     self.url_entry_press = !self.url_focused;
                     let extend = self.url_focused && self.shift_held;
+                    if !self.url_focused {
+                        self.url_new_tab = false;
+                    }
                     self.url_focused = true;
                     self.url.press(at, extend);
                 } else {
@@ -3985,10 +4760,25 @@ impl Application for BrowserApp {
             MouseButton::Forward if pressed => self.host.forward(),
             _ => self.page_press(button, pressed, pos),
         }
+        if button == MouseButton::Left && self.settings.vi_mode {
+            if pressed {
+                self.vi_click = Some(std::time::Instant::now());
+            } else if self.vi_mode == vi::Mode::Normal {
+                // Clicking a field that already had focus moves no focus,
+                // so the watcher has nothing to say; ask the page instead.
+                self.vi_ask(ViAsk::ClickCheck, &vi::active_editable_js());
+            }
+        }
         None
     }
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        self.scroll_origin = None;
+        // The labels would stay put while the page moved under them.
+        if self.vi_mode == vi::Mode::Hint {
+            self.vi_set_mode(vi::Mode::Normal);
+            *needs_rebuild = true;
+        }
         // A select's list takes the wheel: over it, it scrolls the list;
         // anywhere else it is swallowed, so the select stays under it.
         #[cfg(feature = "wpe")]
@@ -4243,6 +5033,13 @@ impl Application for BrowserApp {
             return None;
         }
 
+        // Vi mode, ahead of the chrome's chords: normal mode's Ctrl bindings
+        // (Ctrl+D/U/F/B scroll, Ctrl+V is passthrough) win over them, and
+        // passthrough hands the page even those.
+        if let Some(out) = self.vi_key(event, needs_rebuild) {
+            return out;
+        }
+
         // Tab shortcuts work regardless of URL-bar focus.
         if event.state == ElementState::Pressed && event.ctrl {
             let count = self.host.tab_count();
@@ -4341,6 +5138,7 @@ impl Application for BrowserApp {
                         }
                         "l" => {
                             self.open_chrome();
+                            self.url_new_tab = false;
                             self.url_focused = true;
                             self.select_all_url();
                             *needs_rebuild = true;
@@ -4572,14 +5370,21 @@ impl Application for BrowserApp {
             });
         }
 
-        // The corner control, over the bar: the DE's dot, emphasized while
-        // hovered or while the bar it opens is out.
-        // `plate_dock::draw_corner_dot`'s disc, at the browser's size.
+        // The corner control, over the bar: a circular plate of the bar's
+        // own material — the seed the bar unfolds from, so folded it reads
+        // as the bar in miniature, and open it is a plate on the bar's
+        // corner. Emphasized while hovered or while the bar is out.
         let (cx, cy) = self.dot_center();
         let r = if self.dot_hover || self.chrome_open { DOT_R * 1.15 } else { DOT_R };
-        let fill = cce_ui::color::plate_border_color().unwrap_or([0.55, 0.58, 0.66, 0.85]);
-        pc.circle(cx, cy, r, fill);
+        pc.plate_shaped(
+            Rect { x: cx - r, y: cy - r, width: 2.0 * r, height: 2.0 * r },
+            (r, r, r, r),
+            &cce_ui::scene::Material::from_fill(BAR_FILL),
+            cce_ui::layout::bevel_width().min(3.0),
+            Some(2.0),
+        );
 
+        self.paint_vi(&mut pc, &sans);
         self.paint_bm_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_ac_menu(&mut pc, &sans);

@@ -374,6 +374,9 @@ pub struct WebKitHost {
     held_buttons: Cell<WPEModifiers::Type>,
     /// A hang being watched to see whether it is a deadlock.
     deadlock_watch: Option<DeadlockWatch>,
+    /// The injected vi focus watcher; `None` while vi mode is off, which is
+    /// also when no page carries it.
+    vi_watcher: Option<*mut WebKitUserScript>,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -530,11 +533,13 @@ impl WebKitHost {
                 window_focused: false,
                 held_buttons: Cell::new(0),
                 deadlock_watch: None,
+                vi_watcher: None,
             };
             // The account watcher's channel, in its own script world. Both
             // halves are registered here, once, on the shared content
             // manager every tab is built against.
             host.register_account_channel();
+            host.register_vi_channel();
             host.open_tab(url);
             host
         }
@@ -678,6 +683,146 @@ impl WebKitHost {
         }
     }
 
+    // ---- vi mode ----
+
+    /// Listen for the vi focus watcher, in its own private world — the same
+    /// guarantee as the account channel: page script cannot post on it.
+    fn register_vi_channel(&self) {
+        unsafe {
+            let name = cstr(crate::vi::CHANNEL);
+            let world = cstr(crate::vi::WORLD);
+            if webkit_user_content_manager_register_script_message_handler(
+                self.ucm,
+                name.as_ptr(),
+                world.as_ptr(),
+            ) == 0
+            {
+                log::warn!("could not register the vi message channel");
+                return;
+            }
+            let signal = cstr(&format!("script-message-received::{}", crate::vi::CHANNEL));
+            g_signal_connect_data(
+                self.ucm as *mut _,
+                signal.as_ptr(),
+                Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(
+                    on_vi_message as *const () as usize,
+                )),
+                Rc::into_raw(self.prompts.clone()) as gpointer,
+                Some(drop_prompts_ref),
+                0,
+            );
+        }
+    }
+
+    /// Install or remove the vi focus watcher. Off, pages carry nothing.
+    pub fn set_vi_enabled(&mut self, on: bool) {
+        unsafe {
+            match (on, self.vi_watcher.take()) {
+                (true, None) => {
+                    let source = cstr(&crate::vi::focus_watch_js());
+                    let world = cstr(crate::vi::WORLD);
+                    // Every frame: the field being clicked into is often in one.
+                    let script = webkit_user_script_new_for_world(
+                        source.as_ptr(),
+                        WebKitUserContentInjectedFrames::WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+                        WebKitUserScriptInjectionTime::WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+                        world.as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    );
+                    webkit_user_content_manager_add_script(self.ucm, script);
+                    self.vi_watcher = Some(script);
+                }
+                (false, Some(script)) => {
+                    webkit_user_content_manager_remove_script(self.ucm, script);
+                    webkit_user_script_unref(script);
+                }
+                (true, Some(script)) => self.vi_watcher = Some(script),
+                (false, None) => {}
+            }
+        }
+        self.prompts.borrow_mut().vi_focus = None;
+    }
+
+    /// Whether the focused element takes text, if focus moved since last asked.
+    pub fn take_vi_focus(&self) -> Option<bool> {
+        self.prompts.borrow_mut().vi_focus.take()
+    }
+
+    /// Run `script` in the active tab's top frame, in the vi world, and queue
+    /// its result as a string under `tag` for [`Self::take_vi_result`]. A
+    /// failed script answers with an empty string, so a caller waiting on
+    /// it is never left waiting.
+    pub fn vi_eval(&self, script: &str, tag: u32) {
+        let Some(t) = self.tabs.get(self.active) else { return };
+        let ctx = Box::new((self.prompts.clone(), tag));
+        unsafe {
+            let (script, world) = (cstr(script), cstr(crate::vi::WORLD));
+            webkit_web_view_evaluate_javascript(
+                t.webview,
+                script.as_ptr(),
+                -1,
+                world.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                Some(on_vi_eval),
+                Box::into_raw(ctx) as gpointer,
+            );
+        }
+    }
+
+    pub fn take_vi_result(&self) -> Option<(u32, String)> {
+        self.prompts.borrow_mut().vi_results.pop_front()
+    }
+
+    fn find_controller(&self) -> Option<*mut WebKitFindController> {
+        let t = self.tabs.get(self.active)?;
+        Some(unsafe { webkit_web_view_get_find_controller(t.webview) })
+    }
+
+    /// Find `text` in the active page, highlighting every match and
+    /// scrolling to the first. Smart case, as qutebrowser does it: case
+    /// matters only when the text has a capital in it.
+    pub fn find(&self, text: &str, backwards: bool) {
+        let Some(fc) = self.find_controller() else { return };
+        use WebKitFindOptions::*;
+        let mut opts = WEBKIT_FIND_OPTIONS_WRAP_AROUND;
+        if !text.chars().any(char::is_uppercase) {
+            opts |= WEBKIT_FIND_OPTIONS_CASE_INSENSITIVE;
+        }
+        if backwards {
+            opts |= WEBKIT_FIND_OPTIONS_BACKWARDS;
+        }
+        let c = unsafe { cstr(text) };
+        unsafe { webkit_find_controller_search(fc, c.as_ptr(), opts, 1000) };
+    }
+
+    /// The next match, in the search's own direction.
+    pub fn find_next(&self) {
+        if let Some(fc) = self.find_controller() {
+            unsafe { webkit_find_controller_search_next(fc) }
+        }
+    }
+
+    pub fn find_prev(&self) {
+        if let Some(fc) = self.find_controller() {
+            unsafe { webkit_find_controller_search_previous(fc) }
+        }
+    }
+
+    /// Drop the search and its highlights.
+    pub fn find_finish(&self) {
+        if let Some(fc) = self.find_controller() {
+            unsafe { webkit_find_controller_search_finish(fc) }
+        }
+        self.prompts.borrow_mut().find_result = None;
+    }
+
+    /// How the last search went: the match count, 0 for none.
+    pub fn take_find_result(&self) -> Option<u32> {
+        self.prompts.borrow_mut().find_result.take()
+    }
+
     fn build_webview(&self, url: &Url, state: &Rc<TabState>) -> (*mut WebKitWebView, *mut WPEView) {
         unsafe {
             let (p_display, p_ucm, p_session) = (
@@ -750,6 +895,22 @@ impl WebKitHost {
                 on_decide_policy as *const () as usize,
                 &self.prompts,
             );
+            // Find-in-page answers on the controller, not the view.
+            let fc = webkit_web_view_get_find_controller(wv);
+            for (signal, cb) in [
+                ("found-text", on_found_text as *const () as usize),
+                ("failed-to-find-text", on_failed_to_find as *const () as usize),
+            ] {
+                let name = cstr(signal);
+                g_signal_connect_data(
+                    fc as *mut _,
+                    name.as_ptr(),
+                    Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(cb)),
+                    Rc::into_raw(self.prompts.clone()) as gpointer,
+                    Some(drop_prompts_ref),
+                    0,
+                );
+            }
             let (lw, lh) = self.logical_size();
             wpe_view_resized(view, lw, lh);
             wpe_view_set_visible(view, 1);
@@ -2022,6 +2183,13 @@ pub(super) struct Prompts {
     /// every one is answered exactly once: with a credential, or with
     /// nothing when it is displaced or dropped.
     fill_asks: std::collections::VecDeque<(String, *mut WebKitScriptMessageReply)>,
+    /// The vi focus watcher's latest word: whether the focused element takes
+    /// text. Only the newest matters, so a slot, not a queue.
+    vi_focus: Option<bool>,
+    /// Answers to [`WebKitHost::vi_eval`], by the caller's tag.
+    vi_results: std::collections::VecDeque<(u32, String)>,
+    /// The last find-in-page outcome: the match count, 0 for none.
+    find_result: Option<u32>,
 }
 
 /// What was under the pointer when the page asked for a context menu, read
@@ -2092,6 +2260,51 @@ unsafe fn connect_raw(
         Some(drop_prompts_ref),
         0,
     );
+}
+
+/// A report from the vi focus watcher. Anything else is dropped.
+unsafe extern "C" fn on_vi_message(
+    _ucm: *mut WebKitUserContentManager,
+    value: *mut JSCValue,
+    data: gpointer,
+) {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    let raw = jsc_value_to_string(value);
+    let Some(json) = from_cstr(raw) else { return };
+    g_free(raw as *mut _);
+    if let Some(editable) = crate::vi::parse_focus(&json) {
+        prompts.borrow_mut().vi_focus = Some(editable);
+    }
+}
+
+/// A [`WebKitHost::vi_eval`] script finished: queue what it returned.
+unsafe extern "C" fn on_vi_eval(source: *mut GObject, res: *mut GAsyncResult, data: gpointer) {
+    let ctx = Box::from_raw(data as *mut (Rc<RefCell<Prompts>>, u32));
+    let mut err: *mut GError = std::ptr::null_mut();
+    let v = webkit_web_view_evaluate_javascript_finish(source as *mut WebKitWebView, res, &mut err);
+    let mut text = String::new();
+    if !v.is_null() {
+        if jsc_value_is_string(v) != 0 {
+            let raw = jsc_value_to_string(v);
+            text = from_cstr(raw).unwrap_or_default();
+            g_free(raw as *mut _);
+        }
+        g_object_unref(v as *mut _);
+    }
+    if !err.is_null() {
+        g_error_free(err);
+    }
+    ctx.0.borrow_mut().vi_results.push_back((ctx.1, text));
+}
+
+unsafe extern "C" fn on_found_text(_fc: *mut WebKitFindController, count: guint, data: gpointer) {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    prompts.borrow_mut().find_result = Some(count);
+}
+
+unsafe extern "C" fn on_failed_to_find(_fc: *mut WebKitFindController, data: gpointer) {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    prompts.borrow_mut().find_result = Some(0);
 }
 
 /// A message from the account watcher. Anything that does not parse as one of

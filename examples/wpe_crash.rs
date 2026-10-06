@@ -34,6 +34,11 @@ mod pages;
 #[path = "../src/downloads.rs"]
 mod downloads;
 #[cfg(feature = "wpe")]
+// The host's vi channel and scripts.
+#[path = "../src/vi.rs"]
+#[allow(dead_code)]
+mod vi;
+
 #[path = "../src/wpe/mod.rs"]
 mod wpe;
 

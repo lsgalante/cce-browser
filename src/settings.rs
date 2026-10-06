@@ -96,6 +96,9 @@ pub struct Settings {
     /// (RAINDROP-SYNC.md). Off by default: it needs a token in the keyring,
     /// and it writes to an account elsewhere.
     pub raindrop: bool,
+    /// Vi-style modal keys, after qutebrowser (`src/vi.rs`). Off by default:
+    /// it changes what every letter typed at a page means.
+    pub vi_mode: bool,
     /// Window edge the utility bar floats against.
     pub bar_position: BarPosition,
     /// What pages are told to prefer.
@@ -114,6 +117,7 @@ impl Default for Settings {
             history: true,
             accounts: true,
             raindrop: false,
+            vi_mode: false,
             bar_position: BarPosition::Top,
             color_scheme: ColorScheme::Dark,
             external_browser: None,
@@ -158,6 +162,7 @@ pub fn load() -> Settings {
         history: b["history"].as_bool().unwrap_or(true),
         accounts: b["accounts"].as_bool().unwrap_or(true),
         raindrop: b["raindrop"].as_bool().unwrap_or(false),
+        vi_mode: b["vi-mode"].as_bool().unwrap_or(false),
         bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
         color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("dark")),
         external_browser: b["external-browser"]

@@ -806,6 +806,28 @@ impl ServoHost {
         self.mouse_button(b, pressed, x_px, y_px);
     }
 
+    // ---- vi mode ----
+    //
+    // The WPE host's surface, as no-ops: Servo has no script worlds to run
+    // the focus watcher or the hint script in, and no find controller. Keys
+    // still bind; hints, `gi`, half-page scrolls and search do nothing.
+
+    pub fn set_vi_enabled(&mut self, _on: bool) {}
+    pub fn take_vi_focus(&self) -> Option<bool> {
+        None
+    }
+    pub fn vi_eval(&self, _script: &str, _tag: u32) {}
+    pub fn take_vi_result(&self) -> Option<(u32, String)> {
+        None
+    }
+    pub fn find(&self, _text: &str, _backwards: bool) {}
+    pub fn find_next(&self) {}
+    pub fn find_prev(&self) {}
+    pub fn find_finish(&self) {}
+    pub fn take_find_result(&self) -> Option<u32> {
+        None
+    }
+
     /// A cce-ui key event, translated and forwarded. Same signature as the
     /// WPE backend's `key`.
     pub fn key_ui(&self, event: &cce_ui::widget::KeyEvent) {
