@@ -15,7 +15,7 @@ remote at all, so check `origin/master` after committing). Read the workspace-le
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
-Eighteen files, ~11.4k lines. The eleven that carry the design:
+Nineteen files, ~14.8k lines. The twelve that carry the design:
 
 | file | what it owns |
 | --- | --- |
@@ -27,6 +27,7 @@ Eighteen files, ~11.4k lines. The eleven that carry the design:
 | `src/downloads.rs` | the chrome-side download pipeline (Servo has none) |
 | `src/session.rs` | open-tab persistence: the tab set survives a restart |
 | `src/settings.rs` | the per-app KDL config |
+| `src/vi.rs` | vi mode, after qutebrowser: the modes, the bindings and their parser, hint labels, `:` commands, and the page scripts |
 | `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, which entries a host earns, saving a new login, and the never-save list |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
 | `src/raindrop/` | bookmark sync with Raindrop.io's Unsorted: the three-way merge (`mod.rs`), the REST client (`api.rs`), the worker and status line (`sync.rs`) — design in RAINDROP-SYNC.md |
@@ -540,6 +541,77 @@ notches in quick succession land exactly three notches on (190 → 760), so the
 distance a notch travels is unchanged — only its timing. (The 190 is WebKit's
 own multiplier on a precise delta; the direct path has always moved that far.)
 
+## Vi mode
+
+`browser.vi-mode` (default **off**; a toggle on cce-system-interface's Browser
+page) turns the keyboard modal, after qutebrowser. `src/vi.rs` is the
+engine-free half — modes, the `BINDINGS` table, the count/sequence parser
+(`Keys`), hint labels, `:` parsing, and the scripts; `vi_*` in `main.rs` does
+the commands; the WPE host runs the scripts (`vi_eval`, `set_vi_enabled`)
+and the find controller (`find*`). On Servo those host calls are no-ops.
+
+Modes: **normal** (keys are commands), **insert** (keys go to the page;
+Escape leaves), **passthrough** (`Ctrl+V`: *every* key goes to the page, the
+chrome's Ctrl chords included; Shift+Escape leaves), **hint** (`f`, `F`,
+`;b`, `;y`), **command** (`:`, `/`, `?`). The status line is a plate at the
+bottom-left (lifted over a bottom bar); normal mode with nothing pending
+shows nothing.
+
+The bindings are qutebrowser's where the browser has the feature: `j/k/h/l`,
+`Ctrl+D/U/F/B`, `gg`/`G` (with a count, a percent), `H`/`L`, `r`, `J`/`K`
+and `gt`/`gT`/`g0`/`g$`/`Alt+n` for tabs (`3gt` is tab 3), `d` / `u` close
+and reopen, `co` close others, `o`/`O`/`go`/`gO` the URL bar (O submits into
+a new tab — `url_new_tab`), `yy`/`yt`, `p`/`P`, `i`, `gi`, `n`/`N`, `M`
+bookmark, `Sb`/`Sh`, `gu`/`gU`. `:` knows `open [-t|-b]`, `tabopen`, `back`,
+`forward`, `reload`, `tab-close`, `tab-only`, `undo`, `buffer N`, `yank
+[title]`, `bookmarks`/`history`/`downloads`/`favorites`, and `q` (which
+quits like a window close — the tabs are kept). Points that are choices:
+
+- **The vi stage sits ahead of the chrome's Ctrl chords** in
+  `handle_key_input`, so normal mode's `Ctrl+D/U/F/B` scroll (qutebrowser)
+  instead of bookmarking or opening pages — `M` and `Sb` are the vi route
+  there. A chord vi does not bind still reaches the chrome (`Keys::takes`),
+  and Ctrl+Shift is spelled apart (`<C-S-d>`), so the favorites chord
+  survives. It stays out while the URL bar or the bookmarks search has the
+  keyboard.
+- **Unbound letters are swallowed, unbound named keys are not** (qutebrowser's
+  `forward_unbound_keys = auto`): arrows, Page Up/Down, Space, Enter and Tab
+  still reach the page. A swallowed press's release is swallowed too
+  (`vi_swallowed`, keyed case-folded so `G` released as `g` matches), even
+  across the mode change the press caused.
+- **Insert mode follows a click, not focus.** A page autofocusing its search
+  box leaves normal mode alone, so `j` still scrolls. Two signals: a focus
+  watcher in every frame (private world `cce-vi`, channel `cceVi`) reports
+  whether the focused element takes text, and a report of "yes" within
+  `VI_CLICK_WINDOW` of a page click enters insert; and after every normal-mode
+  click the chrome asks the top frame (`active_editable_js`), because clicking
+  a field that *already* had focus moves no focus and the watcher stays
+  silent. A "no" report while in insert leaves it. A *load* (not a pushState —
+  a search field rewriting the URL per keystroke must keep the keyboard), a
+  tab switch, and closing the tab all drop back to normal; a navigation also
+  forgets the click, so the next page's autofocus is not "clicked into".
+- **Hints are drawn by the chrome and followed by real clicks.** The script
+  (`hints_js`) returns visible rects in the top viewport's CSS pixels — the
+  chrome's logical pixels — descending into same-origin frames and skipping
+  anything covered at its middle; the labels are prefix-free and as short as
+  the count allows (`hint_labels`, qutebrowser's mixed-length scheme). Picking
+  one sends a pointer move, press and release at the rect's middle, so the
+  page sees a person's click: user activation, focus, even a cross-origin
+  frame under it. `F` is the same with button 2, which `decide-policy` already
+  turns into a background tab. Cross-origin frames' *contents* get no labels
+  (the script runs in the top frame). The wheel, a click, a resize or a
+  navigation takes the labels down — they would no longer match the page.
+- **Scrolling has two routes.** `j/k/h/l` go through the eased wheel model
+  (half a notch a line), aimed at the page's middle (`scroll_origin`) rather
+  than the resting pointer; `Ctrl+D/U/F/B` and `gg`/`G` are `scroll_js`,
+  exact fractions of the viewport — WebKit scales wheel deltas (the 190 for
+  76 above), so a half page by wheel would be a guess. The script scrolls
+  whatever scrolls under the view's middle, falling back to the document.
+- **Search is WebKit's find controller**: smart case, wrapping, the current
+  match from the last position; `n`/`N` step, Escape clears the highlights,
+  "Text not found" comes from `failed-to-find-text`. It is the only
+  find-in-page there is.
+
 ## Account autocomplete (cce-secrets)
 
 A login field on a page gets a list of the accounts the keyring holds for that
@@ -782,7 +854,7 @@ clipboard path as the rest of the DE.
 
 ## Not implemented yet
 
-Worth knowing before assuming a bug: no find-in-page, no zoom, no favicons, and no
+Worth knowing before assuming a bug: no find-in-page outside vi mode's `/`, no zoom, no favicons, and no
 history/URL autocomplete. (The context menu, JS dialogs and HTTP auth landed with the
 WPE backend and are Servo-only gaps now.) Account autocomplete saves new logins but
 never updates a changed password, and "never save" has no undo UI. Ctrl+Shift+O ("hand this page to
