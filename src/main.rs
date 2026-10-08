@@ -26,7 +26,6 @@ mod webview;
 mod wpe;
 
 use url::Url;
-use wayland_client::QueueHandle;
 
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
@@ -4014,7 +4013,9 @@ impl BrowserApp {
 impl Application for BrowserApp {
     type Message = Message;
 
-    fn new(_qh: &QueueHandle<EngineState<Self>>, sender: calloop::channel::Sender<Self::Message>) -> Self {
+    fn create(sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+        // The app keeps calloop's sender; `AppSender` converts into it.
+        let sender: calloop::channel::Sender<Self::Message> = sender.into();
         // Serve the instance socket claimed in main(), if this launch won it.
         instance::spawn_listener(sender.clone());
         let settings = settings::load();
