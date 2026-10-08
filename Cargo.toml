@@ -22,7 +22,7 @@ servo = ["dep:servo", "dep:dpi", "dep:euclid", "dep:rustls", "dep:http"]
 cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "4dcb970d84f0a6aeeef5311ac1d4cacb0c63a803" }
 # For `cce-browser-open`: the instance client, from the GUI-free half of the
 # toolkit, so the launcher links no Wayland, Vulkan or WebKit.
-cce-core = { git = "https://github.com/lsgalante/cce-core.git", rev = "39e989d6ebc7850a1e5aa96bf228fe8714e538e0" }
+cce-core = { git = "https://github.com/lsgalante/cce-core.git", rev = "de8a6ff818874b38f3958b0bd562377390e7af34" }
 calloop = "0.13.0"
 wayland-client = { version = "0.31", features = ["system"] }
 servo = { version = "0.4", optional = true }
