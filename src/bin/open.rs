@@ -6,34 +6,18 @@
 //! path. This bin exists to link nothing, forward in a few ms, and only
 //! `exec` the real browser when no instance answers.
 //!
-//! It therefore deliberately duplicates the client half of the socket
-//! protocol instead of importing it: `src/instance.rs` (same crate, on
-//! `cce_ui::ipc::instance`) is the server side and the fallback client,
-//! `cce_ui::ipc::socket_path` is the path convention. All three must agree on `/tmp/cce-browser-<display>.sock`
-//! and the `open <arg>` / `new-tab` lines. The protocol is small on purpose;
-//! change it in both files or not at all.
+//! It takes the client half of the socket protocol from `cce_core::ipc`
+//! (the GUI-free half of the toolkit, which has no native libraries): the
+//! path convention and the one-line forward with its ack wait. `src/instance.rs`
+//! (same crate, on `cce_ui::ipc::instance`, the same module) is the server side.
+//! Both must agree on the `open <arg>` / `new-tab` lines. Until 2026-10-07 this
+//! file copied both halves, to stay clear of cce-ui's native link flags.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 
-fn socket_path() -> String {
-    // Mirrors cce_ui::ipc::socket_path("cce-browser") — not imported, so this
-    // bin stays free of cce-ui's native link flags.
-    match std::env::var("WAYLAND_DISPLAY") {
-        Ok(d) if !d.is_empty() => format!("/tmp/cce-browser-{d}.sock"),
-        _ => "/tmp/cce-browser.sock".to_string(),
-    }
-}
-
-/// One forwarding attempt; false on any failure. Mirrors the client half of
-/// `cce_ui::ipc::instance::forward_or_claim`, ack wait included — exiting on
-/// write alone races the instance actually reading the line — and so is its
-/// bound on that wait: a stuck instance must not hang every click forever.
+/// One forwarding attempt; false on any failure. A stuck instance does not
+/// hang the click: `forward` bounds its wait for the ack.
 fn try_forward(arg: Option<&str>) -> bool {
-    let Ok(mut stream) = UnixStream::connect(socket_path()) else {
-        return false;
-    };
     let command = match arg {
         Some(a) => {
             // A relative file path is resolved against *this* process's cwd —
@@ -46,16 +30,11 @@ fn try_forward(arg: Option<&str>) -> bool {
             } else {
                 None
             };
-            format!("open {}\n", abs.as_deref().unwrap_or(a))
+            format!("open {}", abs.as_deref().unwrap_or(a))
         }
-        None => "new-tab\n".to_string(),
+        None => "new-tab".to_string(),
     };
-    if stream.write_all(command.as_bytes()).is_err() {
-        return false;
-    }
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply).is_ok()
+    cce_core::ipc::instance::forward("cce-browser", &command).is_some()
 }
 
 fn main() {
