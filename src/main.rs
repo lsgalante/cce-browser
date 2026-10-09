@@ -246,6 +246,34 @@ enum LineField {
     Dialog(usize),
 }
 
+/// The accessibility node the app numbers a line field by (`AppNodes::id`): the address
+/// bar 1, the bookmarks search 2, the vi command line 3, a dialog's fields from 16.
+fn a11y_node(field: LineField) -> u64 {
+    match field {
+        LineField::Url => 1,
+        LineField::BmSearch => 2,
+        LineField::ViCmd => 3,
+        #[cfg(feature = "wpe")]
+        LineField::Dialog(i) => 16 + i as u64,
+    }
+}
+
+/// The open dialog's own node, which holds its fields.
+#[cfg(feature = "wpe")]
+const A11Y_DIALOG: u64 = 8;
+
+/// The line field an accessibility node number names ([`a11y_node`]'s inverse).
+fn a11y_field(n: u64) -> Option<LineField> {
+    match n {
+        1 => Some(LineField::Url),
+        2 => Some(LineField::BmSearch),
+        3 => Some(LineField::ViCmd),
+        #[cfg(feature = "wpe")]
+        16.. => Some(LineField::Dialog((n - 16) as usize)),
+        _ => None,
+    }
+}
+
 /// What a line field draws, and where on it its caret, selection and an
 /// input method's composition fall — x offsets from the text's origin, read
 /// off the same shaped run the text is drawn as.
@@ -4412,6 +4440,109 @@ impl Application for BrowserApp {
         }
         *needs_rebuild |= done;
         done
+    }
+
+    /// The line fields, for a screen reader: the address bar, and while they are up the
+    /// bookmarks search, the vi command line and a dialog with its fields. Each is a text
+    /// field a reader reads by character and line and sets (`accessibility_action`).
+    fn accessibility(&mut self, nodes: &mut cce_ui::a11y::AppNodes) {
+        use cce_ui::a11y::AppNodes;
+        let has = self.keyboard_field();
+        let focus = |field| (has == Some(field)).then(|| a11y_node(field));
+        let mut focused = None;
+
+        let bar = self.chrome_open.then(|| url_rect(&self.bar(), self.settings.bar_position));
+        let mut t = self.url.a11y_text(has == Some(LineField::Url));
+        t.placeholder = Some("Search or enter address".into());
+        let url = nodes.text_field(a11y_node(LineField::Url), "Address", &t, bar);
+        nodes.push_top(AppNodes::id(a11y_node(LineField::Url)), url);
+        focused = focused.or(focus(LineField::Url));
+
+        if let Some(m) = self.bm_menu.as_ref() {
+            let mut t = m.query.a11y_text(has == Some(LineField::BmSearch));
+            t.placeholder = Some("Search bookmarks".into());
+            let rect = self.bm_layout().map(|l| l.search);
+            let search = nodes.text_field(a11y_node(LineField::BmSearch), "Search bookmarks", &t, rect);
+            nodes.push_top(AppNodes::id(a11y_node(LineField::BmSearch)), search);
+            focused = focused.or(focus(LineField::BmSearch));
+        }
+        if self.settings.vi_mode && self.vi_mode == vi::Mode::Command {
+            let label = if self.vi_prompt == vi::Prompt::Command { "Command" } else { "Find in page" };
+            let line = nodes.text_field(a11y_node(LineField::ViCmd), label, &self.vi_cmd.a11y_text(has == Some(LineField::ViCmd)), None);
+            nodes.push_top(AppNodes::id(a11y_node(LineField::ViCmd)), line);
+            focused = focused.or(focus(LineField::ViCmd));
+        }
+        #[cfg(feature = "wpe")]
+        if let Some(m) = self.modal.as_ref() {
+            // The dialog, modal, its fields inside it: a reader keeps to it, as the keyboard does.
+            let rect = m.rect(self.win);
+            let mut dialog = cce_ui::accesskit::Node::new(cce_ui::accesskit::Role::Dialog);
+            dialog.set_modal();
+            if !m.title.is_empty() {
+                dialog.set_label(m.title.as_str());
+            }
+            if !m.message.is_empty() {
+                dialog.set_description(m.message.as_str());
+            }
+            let mut children = Vec::new();
+            for (i, (label, edit)) in m.fields.iter().enumerate() {
+                let field = LineField::Dialog(i);
+                let mut t = edit.a11y_text(has == Some(field));
+                t.placeholder = Some((*label).to_string());
+                let node = nodes.text_field(a11y_node(field), label, &t, Some(m.field_rect(&rect, i)));
+                nodes.push(AppNodes::id(a11y_node(field)), node);
+                children.push(AppNodes::id(a11y_node(field)));
+                focused = focused.or(focus(field));
+            }
+            dialog.set_children(children);
+            nodes.push_top(AppNodes::id(A11Y_DIALOG), dialog);
+        }
+        if let Some(n) = focused {
+            nodes.set_focus(AppNodes::id(n));
+        }
+    }
+
+    /// A reader's request on a line field: its keyboard, or a new text — set as typing it
+    /// would be, the bookmarks list following its search. The address bar takes the
+    /// keyboard to be set (unfolding the bar), since out of it the bar shows the page's
+    /// address; Enter then goes where it says, as after typing.
+    fn accessibility_action(&mut self, n: u64, action: cce_ui::a11y::AppAction) -> bool {
+        use cce_ui::a11y::AppAction;
+        let Some(field) = a11y_field(n) else { return false };
+        let focus = |app: &mut Self| match field {
+            LineField::Url => {
+                if !app.url_focused {
+                    app.open_chrome();
+                    app.url_focused = true;
+                    app.url_new_tab = false;
+                    app.select_all_url();
+                }
+            }
+            #[cfg(feature = "wpe")]
+            LineField::Dialog(i) => {
+                if let Some(m) = app.modal.as_mut() {
+                    m.focused = i;
+                }
+            }
+            // The keyboard is already the open menu's or the command line's.
+            LineField::BmSearch | LineField::ViCmd => {}
+        };
+        match action {
+            AppAction::Focus => {
+                focus(self);
+                true
+            }
+            AppAction::SetText(text) => {
+                focus(self);
+                let Some(edit) = self.line_field(field) else { return false };
+                let changed = edit.a11y_set_text(&text);
+                if changed && field == LineField::BmSearch {
+                    self.bm_query_changed();
+                }
+                changed
+            }
+            _ => false,
+        }
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
