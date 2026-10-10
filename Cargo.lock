@@ -1034,7 +1034,7 @@ version = "0.1.0"
 dependencies = [
  "calloop",
  "cce-core",
- "cce-ui",
+ "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=84fc812ac5d548895fc8b5df8c24fd2ec8e033f5)",
  "cce-wpe",
  "dpi",
  "env_logger",
@@ -1069,10 +1069,55 @@ dependencies = [
 [[package]]
 name = "cce-ui"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=fe642dc875d68bcb140bad6e25d3e78a76cb111c#fe642dc875d68bcb140bad6e25d3e78a76cb111c"
+source = "git+https://github.com/lsgalante/cce-ui.git?rev=84fc812ac5d548895fc8b5df8c24fd2ec8e033f5#84fc812ac5d548895fc8b5df8c24fd2ec8e033f5"
 dependencies = [
  "accesskit 0.25.1",
  "accesskit_unix",
+ "ash",
+ "bitflags 2.13.1",
+ "bytemuck",
+ "calloop",
+ "calloop-wayland-source",
+ "cce-core",
+ "chrono",
+ "cosmic-text",
+ "cursor-icon",
+ "dispatch2",
+ "glam",
+ "gpu-allocator",
+ "js-sys",
+ "kdl",
+ "libc",
+ "log",
+ "naga",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-quartz-core",
+ "png 0.17.16",
+ "raw-window-handle",
+ "resvg 0.41.0",
+ "serde",
+ "serde_json",
+ "smithay-client-toolkit",
+ "unicode-bidi",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-scanner",
+ "web-sys",
+ "web-time",
+ "xkeysym",
+]
+
+[[package]]
+name = "cce-ui"
+version = "0.1.0"
+source = "git+https://github.com/lsgalante/cce-ui.git?rev=fe642dc875d68bcb140bad6e25d3e78a76cb111c#fe642dc875d68bcb140bad6e25d3e78a76cb111c"
+dependencies = [
+ "accesskit 0.25.1",
  "ash",
  "bitflags 2.13.1",
  "bytemuck",
@@ -1119,7 +1164,7 @@ version = "0.1.0"
 source = "git+https://github.com/lsgalante/cce-wpe.git?rev=93c6fdd322111895357558aaf1a9e3c9d2408b77#93c6fdd322111895357558aaf1a9e3c9d2408b77"
 dependencies = [
  "bindgen",
- "cce-ui",
+ "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=fe642dc875d68bcb140bad6e25d3e78a76cb111c)",
  "log",
  "pkg-config",
  "rustix 0.38.44",
