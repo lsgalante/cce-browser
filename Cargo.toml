@@ -19,7 +19,7 @@ wpe = ["dep:rustix"]
 servo = ["dep:servo", "dep:dpi", "dep:euclid", "dep:rustls", "dep:http"]
 
 [dependencies]
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "45c5ed027a64fa7072c82021168ed4383b03ba42", features = ["a11y"] }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "3c5b1fde4e8c4115b6f2666f8e661da9bc9a2850", features = ["a11y"] }
 # For `cce-browser-open`: the instance client, from the GUI-free half of the
 # toolkit, so the launcher links no Wayland, Vulkan or WebKit.
 cce-core = { git = "https://github.com/lsgalante/cce-core.git", rev = "27a2567b217312898a5de44ce430533d9870b4e4" }
