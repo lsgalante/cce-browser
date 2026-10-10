@@ -96,21 +96,7 @@ fn download_dir() -> PathBuf {
 /// falls back untouched.
 #[cfg_attr(not(feature = "servo"), allow(dead_code))]
 fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+    String::from_utf8(cce_ui::fmt::percent_decode_bytes(s)).unwrap_or_else(|_| s.to_string())
 }
 
 #[cfg_attr(not(feature = "servo"), allow(dead_code))]
