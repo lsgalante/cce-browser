@@ -54,6 +54,18 @@ pub enum EditingCommand {
     Paste,
 }
 
+/// Spawn `cmd` and reap it on a background thread, so the child never lingers
+/// as a zombie once it exits. The same helper cce-mail, cce-files, cce-terminal
+/// and cce-system-interface each keep; cce-ui's shared `process::spawn_detached`
+/// went away in cce-ui 4e94236.
+fn spawn_detached(mut cmd: std::process::Command) -> std::io::Result<()> {
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 // Spacing is the DE's ladder (cce-ui `layout.rs`), never a number of this
 // app's own. Five readings of it cover the whole chrome:
 
@@ -2657,7 +2669,9 @@ impl BrowserApp {
             let mut parts = command.split_whitespace();
             let Some(program) = parts.next() else { return };
             let args: Vec<&str> = parts.collect();
-            match std::process::Command::new(program).args(args).arg(&url).spawn() {
+            let mut cmd = std::process::Command::new(program);
+            cmd.args(args).arg(&url);
+            match spawn_detached(cmd) {
                 Ok(_) => log::info!("handed {url} to {program}"),
                 Err(e) => log::warn!("could not run {program}: {e}"),
             }
