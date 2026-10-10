@@ -51,7 +51,7 @@ zbus = "5"
 rustix = { version = "0.38", features = ["event"], optional = true }
 # The WPE embedding shared with cce-mail (bindings, subclasses, GLib
 # source, input, damage, IME context); only with the `wpe` feature.
-cce-wpe = { git = "https://github.com/lsgalante/cce-wpe.git", rev = "c608017576a03a0077c4dc6dd31f3a0b355e3644", optional = true }
+cce-wpe = { git = "https://github.com/lsgalante/cce-wpe.git", rev = "ab6154adf9d0a60e6ac43f96eb2f940c2fa4eed4", optional = true }
 
 # The desktop entry's Exec target: a forwarder that links (almost) nothing,
 # so the click-to-tab path skips the ~20ms of library loading the full
