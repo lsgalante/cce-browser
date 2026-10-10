@@ -21,14 +21,8 @@ use std::ffi::{c_char, c_void, CString};
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-mod ffi {
-    #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
-    // bindgen's output, regenerated every build: its bitfield accessors trip
-    // these, and there is no source to fix them in.
-    #![allow(clippy::useless_transmute, clippy::ptr_offset_with_cast)]
-    include!(concat!(env!("OUT_DIR"), "/wpe_bindings.rs"));
-}
-use ffi::*;
+// The bindings are cce-wpe's (bindgen runs in its build script).
+use cce_wpe::ffi::*;
 
 static FRAMES: AtomicU32 = AtomicU32::new(0);
 static mut LOOP_PTR: *mut GMainLoop = std::ptr::null_mut();

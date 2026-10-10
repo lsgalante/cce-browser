@@ -2,9 +2,6 @@
 name = "cce-browser"
 version = "0.1.0"
 edition = "2021"
-# Only runs bindgen when the `wpe` feature is on, so a default build needs
-# no WPE headers and stays exactly as it was.
-build = "build.rs"
 
 [features]
 # WPE WebKit is the engine as of 2026-08-30 (see WPE-PORT.md). Default, so a
@@ -13,7 +10,7 @@ build = "build.rs"
 # exactly what happened two days after the port landed. Needs
 # `pacman -S wpewebkit`.
 default = ["wpe"]
-wpe = ["dep:rustix"]
+wpe = ["dep:rustix", "dep:cce-wpe"]
 # The retired Servo backend, kept buildable for comparison:
 #   cargo build --release -p cce-browser --no-default-features --features servo
 servo = ["dep:servo", "dep:dpi", "dep:euclid", "dep:rustls", "dep:http"]
@@ -52,10 +49,9 @@ zbus = "5"
 # Only used by the `wpe` backend, to hold GLib's changing pollfd set in one
 # epoll fd that calloop can watch. Optional so a default build skips it.
 rustix = { version = "0.38", features = ["event"], optional = true }
-
-[build-dependencies]
-bindgen = "0.72"
-pkg-config = "0.3"
+# The WPE embedding shared with cce-mail (bindings, subclasses, GLib
+# source, input, damage, IME context); only with the `wpe` feature.
+cce-wpe = { git = "https://github.com/lsgalante/cce-wpe.git", rev = "c608017576a03a0077c4dc6dd31f3a0b355e3644", optional = true }
 
 # The desktop entry's Exec target: a forwarder that links (almost) nothing,
 # so the click-to-tab path skips the ~20ms of library loading the full
