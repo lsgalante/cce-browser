@@ -1,12 +1,13 @@
-//! cce-browser — a web browser on the embedded Servo engine.
+//! cce-browser — a web browser on an embedded engine: WPE WebKit by default
+//! (`wpe/`, the `wpe` feature, since 2026-08-30), Servo behind the `servo`
+//! feature (`webview.rs`).
 //!
-//! Servo renders pages into a CPU (software) rendering context; each
-//! finished frame is read back and uploaded to cce-ui's image registry,
-//! then drawn as a single quad under the chrome: the DE's circular corner
-//! control (`cce_ui::widget::plate_dock`), which here toggles the utility
-//! bar (tabs, the favorites strip, back / forward / reload, URL field) that
-//! unfolds from under it. Input over the page area is translated into Servo input events; the
-//! URL bar is a small hand-rolled line editor.
+//! The engine renders each page into an image that is uploaded to cce-ui's
+//! image registry and drawn as a single quad under the chrome: the DE's
+//! circular corner control (`cce_ui::widget::plate_dock`), which here toggles
+//! the utility bar (tabs, the favorites strip, back / forward / reload, URL
+//! field) that unfolds from under it. Input over the page area is translated
+//! into the engine's input events; the URL bar is a `cce_ui::widget::LineEdit`.
 
 mod accounts;
 mod downloads;
