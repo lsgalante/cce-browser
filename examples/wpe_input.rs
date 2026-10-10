@@ -6,6 +6,9 @@
 //!
 //! `cargo run --release -p cce-browser --features wpe --example wpe_input -- <url>`
 
+// Builds the app's own modules by path and uses only part of each.
+#![allow(dead_code, unused_imports)]
+
 #[cfg(not(feature = "wpe"))]
 fn main() {
     eprintln!("build with --features wpe");

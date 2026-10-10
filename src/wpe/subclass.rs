@@ -37,7 +37,9 @@ pub(super) unsafe fn register_subclass(
         parent,
         cname.as_ptr(),
         q.class_size,
-        std::mem::transmute::<_, GClassInitFunc>(class_init),
+        std::mem::transmute::<unsafe extern "C" fn(*mut c_void, *mut c_void), GClassInitFunc>(
+            class_init,
+        ),
         q.instance_size,
         None,
         0,

@@ -276,10 +276,6 @@ impl Accounts {
         });
         hits
     }
-
-    pub fn is_loading(&self) -> bool {
-        self.loading
-    }
 }
 
 /// The worker thread: one Secret Service connection, held for the life of the
@@ -440,7 +436,7 @@ impl NeverSave {
         let hosts = std::fs::read_to_string(&path)
             .map(|s| {
                 s.lines()
-                    .map(|l| normalize_host(l))
+                    .map(normalize_host)
                     .filter(|l| !l.is_empty())
                     .collect()
             })

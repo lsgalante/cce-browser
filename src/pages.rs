@@ -135,7 +135,9 @@ impl History {
     }
 
     /// Record a completed page load. Internal pages and immediate
-    /// duplicates (reload spam) are skipped.
+    /// duplicates (reload spam) are skipped. Only the Servo backend records
+    /// history so far.
+    #[cfg_attr(not(feature = "servo"), allow(dead_code))]
     pub fn record(&self, url: &str, title: &str) {
         if url.starts_with("cce:") || url == "about:blank" {
             return;

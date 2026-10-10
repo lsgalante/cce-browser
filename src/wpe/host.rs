@@ -347,15 +347,12 @@ pub struct WebKitHost {
     /// Shared with the `cce:` pages, exactly as `ServoHost` holds them —
     /// bookmarks and history are app state, not engine state, so they cross
     /// the backend swap unchanged.
+    #[allow(dead_code)] // nothing records history on this backend yet
     history: std::sync::Arc<crate::pages::History>,
     bookmarks: std::sync::Arc<crate::pages::Bookmarks>,
     favorites: std::sync::Arc<crate::pages::Favorites>,
     history_enabled: bool,
     force_dark: bool,
-    /// Serves the `cce:` pages. Boxed and leaked into the scheme callback,
-    /// so it must outlive every webview.
-    protocol: Rc<crate::pages::CceProtocol>,
-    downloads: std::sync::Arc<crate::downloads::Downloads>,
     clear_cookies: std::sync::Arc<std::sync::atomic::AtomicBool>,
     session: *mut WebKitNetworkSession,
     download_started: Rc<Cell<bool>>,
@@ -491,7 +488,10 @@ impl WebKitHost {
             g_signal_connect_data(
                 session as *mut _,
                 sig.as_ptr(),
-                Some(std::mem::transmute::<_, unsafe extern "C" fn()>(
+                Some(std::mem::transmute::<
+                    unsafe extern "C" fn(*mut GObject, *mut WebKitDownload, gpointer),
+                    unsafe extern "C" fn(),
+                >(
                     on_download_started
                         as unsafe extern "C" fn(*mut GObject, *mut WebKitDownload, gpointer),
                 )),
@@ -552,8 +552,6 @@ impl WebKitHost {
                 favorites,
                 history_enabled: true,
                 force_dark: false,
-                protocol,
-                downloads,
                 clear_cookies,
                 session,
                 download_started,
@@ -1142,6 +1140,7 @@ impl WebKitHost {
     /// The epoll fd carrying GLib's pollfd set, for `register_sources`.
     /// `None` if the bridge could not be created, in which case the app must
     /// fall back to calling [`Self::pump`] on a timer.
+    #[allow(dead_code)] // the wpe_loop example's; the app uses `poll_fd_owned`
     pub fn poll_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
         self.poll.as_ref().map(|p| p.fd())
     }
@@ -1451,6 +1450,7 @@ impl WebKitHost {
 
     /// Top-left pixel of the last frame, for tests that need to assert on
     /// what was actually rendered rather than on what was configured.
+    #[allow(dead_code)] // used by the wpe_dark example
     pub fn sample_pixel(&self) -> Option<(u8, u8, u8)> {
         self.last_pixel
     }
@@ -1741,6 +1741,7 @@ impl WebKitHost {
     /// Push the system selection into WPE. Separated so it can be done
     /// ahead of a paste rather than in the same breath — the web process is
     /// a different process, and the content has to reach it.
+    #[allow(dead_code)] // used by the wpe_paste example
     pub fn sync_clipboard(&self) {
         unsafe { super::subclass::sync_system_clipboard(self.display) }
     }
@@ -2222,8 +2223,10 @@ unsafe fn check_regions(
     }
     let truth = shm.copy_all();
     let wrong = mirror
-        .chunks_exact(4)
-        .zip(truth.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(truth.as_chunks::<4>().0)
         .filter(|(a, b)| a != b)
         .count();
     if wrong > 0 {

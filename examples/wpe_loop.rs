@@ -10,6 +10,9 @@
 //! Run with `--features wpe`; pass `poll` as argv[1] to compare against the
 //! old fixed-interval polling.
 
+// Builds the app's own modules by path and uses only part of each.
+#![allow(dead_code, unused_imports)]
+
 #[cfg(not(feature = "wpe"))]
 fn main() {
     eprintln!("build with --features wpe");

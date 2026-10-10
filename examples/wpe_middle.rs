@@ -11,6 +11,9 @@
 //!
 //! `cce-shadow --instance <n> run ./target/release/examples/wpe_middle`
 
+// Builds the app's own modules by path and uses only part of each.
+#![allow(dead_code, unused_imports)]
+
 #[cfg(not(feature = "wpe"))]
 fn main() {
     eprintln!("build with --features wpe");

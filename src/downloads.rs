@@ -5,8 +5,12 @@
 //! meta-refresh while anything is active, so progress needs no chrome
 //! plumbing at all.
 
+// The fetch workers below serve only the Servo backend (WPE downloads
+// natively), so in the default build they and these imports go unused.
+#[cfg_attr(not(feature = "servo"), allow(unused_imports))]
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg_attr(not(feature = "servo"), allow(unused_imports))]
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,11 +20,13 @@ use crate::pages::{html_escape, page};
 
 /// Extensions that download instead of navigating. Servo renders none of
 /// these; the common "click a release artifact" cases.
+#[cfg_attr(not(feature = "servo"), allow(dead_code))]
 const DOWNLOAD_EXTENSIONS: &[&str] = &[
     "zip", "tar", "gz", "tgz", "xz", "bz2", "7z", "rar", "pdf", "iso", "img", "deb", "rpm",
     "exe", "msi", "dmg", "appimage", "bin", "apk", "jar", "flatpak",
 ];
 
+#[cfg_attr(not(feature = "servo"), allow(dead_code))]
 pub fn is_download_url(url: &Url) -> bool {
     if !matches!(url.scheme(), "http" | "https") {
         return false;
@@ -88,6 +94,7 @@ fn download_dir() -> PathBuf {
 
 /// Minimal percent-decode for display filenames; anything path-hostile
 /// falls back untouched.
+#[cfg_attr(not(feature = "servo"), allow(dead_code))]
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -106,6 +113,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
+#[cfg_attr(not(feature = "servo"), allow(dead_code))]
 fn filename_for(url: &Url) -> String {
     let name = url
         .path_segments()
@@ -117,7 +125,7 @@ fn filename_for(url: &Url) -> String {
 }
 
 /// `name.ext` → `name.1.ext` … until the path is free.
-fn unique_path(dir: &PathBuf, filename: &str) -> PathBuf {
+fn unique_path(dir: &Path, filename: &str) -> PathBuf {
     let candidate = dir.join(filename);
     if !candidate.exists() {
         return candidate;

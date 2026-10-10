@@ -6,6 +6,9 @@
 
 pub mod ffi {
     #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+    // bindgen's output, regenerated every build: its bitfield accessors trip
+    // these, and there is no source to fix them in.
+    #![allow(clippy::useless_transmute, clippy::ptr_offset_with_cast)]
     include!(concat!(env!("OUT_DIR"), "/wpe_bindings.rs"));
 }
 
@@ -24,6 +27,4 @@ pub mod formwatch;
 // Not consumed yet — main.rs still drives ServoHost.
 #[allow(unused_imports)]
 pub use formwatch::FormEvent;
-pub use host::{
-    ContextMenuInfo, OptionItem, OptionMenuInfo, PendingAuth, PendingDialog, Tab, WebKitHost,
-};
+pub use host::{ContextMenuInfo, OptionItem, OptionMenuInfo, WebKitHost};

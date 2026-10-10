@@ -23,6 +23,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 mod ffi {
     #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code)]
+    // bindgen's output, regenerated every build: its bitfield accessors trip
+    // these, and there is no source to fix them in.
+    #![allow(clippy::useless_transmute, clippy::ptr_offset_with_cast)]
     include!(concat!(env!("OUT_DIR"), "/wpe_bindings.rs"));
 }
 use ffi::*;
@@ -45,7 +48,9 @@ unsafe fn register_subclass(
         parent,
         cname.as_ptr(),
         q.class_size,
-        std::mem::transmute::<_, GClassInitFunc>(class_init),
+        std::mem::transmute::<unsafe extern "C" fn(*mut c_void, *mut c_void), GClassInitFunc>(
+            class_init,
+        ),
         q.instance_size,
         None,
         0,
@@ -192,7 +197,13 @@ fn main() {
 
         webkit_web_view_load_uri(wv, curl.as_ptr());
         LOOP_PTR = g_main_loop_new(std::ptr::null_mut(), 0);
-        g_timeout_add_seconds(30, Some(std::mem::transmute(g_main_loop_quit as *const ())), LOOP_PTR as *mut c_void);
+        g_timeout_add_seconds(
+            30,
+            Some(std::mem::transmute::<*const (), unsafe extern "C" fn(gpointer) -> gboolean>(
+                g_main_loop_quit as *const (),
+            )),
+            LOOP_PTR as *mut c_void,
+        );
         g_main_loop_run(LOOP_PTR);
     }
     println!("done, {} frames", FRAMES.load(Ordering::SeqCst));

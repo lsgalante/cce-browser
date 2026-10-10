@@ -312,6 +312,7 @@ pub fn fill_reply(username: &str, password: &str) -> String {
 pub struct Password(String);
 
 impl Password {
+    #[allow(dead_code)] // the wpe_autofill example's and the tests'
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -363,6 +364,7 @@ pub enum FormEvent {
     Submit {
         /// The frame's origin — the site these credentials belong to.
         origin: String,
+        #[allow(dead_code)] // the page reports it; nothing reads it yet
         frame: String,
         top: bool,
         username: String,

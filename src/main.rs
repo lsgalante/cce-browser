@@ -1180,7 +1180,7 @@ fn tab_rect(bar: &Rect, position: settings::BarPosition, count: usize, i: usize)
 
 /// The close hit region on a tab pill, when the pill is wide enough.
 fn tab_close_rect(pill: &Rect) -> Option<Rect> {
-    (pill.width >= TAB_CLOSE_MIN_W).then(|| Rect {
+    (pill.width >= TAB_CLOSE_MIN_W).then_some(Rect {
         x: pill.x + pill.width - TAB_CLOSE_W,
         y: pill.y,
         width: TAB_CLOSE_W,
@@ -5180,7 +5180,7 @@ impl Application for BrowserApp {
             let typing = self.opt_menu.as_ref().is_some_and(|m| {
                 !m.typed.is_empty() && m.typed_at.elapsed() <= OPT_TYPE_RESET
             });
-            let Some(m) = self.opt_menu.as_mut() else { return None };
+            let m = self.opt_menu.as_mut()?;
             match &event.logical_key {
                 Key::Named(NamedKey::ArrowDown) => m.step(1),
                 Key::Named(NamedKey::ArrowUp) => m.step(-1),

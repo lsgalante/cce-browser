@@ -167,6 +167,9 @@ pub fn pair_key(url: &str) -> Option<String> {
 }
 
 /// Work out one pass. `Err` when the pass trips the deletion guard.
+// The `Err` is the `Ok`'s own `Plan` plus a reason, so boxing it would save
+// only the reason's 24 bytes, once per sync pass.
+#[allow(clippy::result_large_err)]
 pub fn plan(local: &[Local], remote: &[Remote], base: &[Synced]) -> Result<Plan, Refusal> {
     let mut plan = Plan::default();
     let local_by_url: HashMap<&str, &Local> = local.iter().map(|l| (l.url.as_str(), l)).collect();
