@@ -194,7 +194,30 @@ impl LabelFont {
     fn draw_family(&self) -> Option<String> {
         self.named.then(|| self.family.clone())
     }
+
+    /// The URL field's face: the same condensed cut, a size up from the
+    /// labels; without one, the field is as every other chrome field.
+    fn url_field(&self) -> FieldFont {
+        if self.named {
+            FieldFont { family: Some(self.family.clone()), size: URL_FONT_CONDENSED }
+        } else {
+            FIELD_FONT
+        }
+    }
 }
+
+/// The face a line field is drawn, measured and hit-tested in. `family`
+/// `None` is the chrome's default face.
+#[derive(Clone, Debug, PartialEq)]
+struct FieldFont {
+    family: Option<String>,
+    size: f32,
+}
+
+/// Every line field but the URL bar: dialogs, the bookmarks search, the vi
+/// command line.
+const FIELD_FONT: FieldFont = FieldFont { family: None, size: URL_FONT };
+const URL_FONT_CONDENSED: f32 = 15.0;
 
 /// Condensed sans families tried, in order, after the preferred sans's own
 /// condensed sibling. Only a family the *renderer's* font set holds is
@@ -351,9 +374,9 @@ struct FieldMarks {
 impl FieldMarks {
     /// Measure `edit` as it will be drawn. Every offset the field holds is
     /// into its text, so each goes through `display_index` onto `shown`.
-    fn of(fs: &mut cce_ui::cosmic_text::FontSystem, edit: &cce_ui::widget::LineEdit) -> Self {
+    fn of(fs: &mut cce_ui::cosmic_text::FontSystem, edit: &cce_ui::widget::LineEdit, font: &FieldFont) -> Self {
         let shown = edit.display();
-        let mut x = |byte: usize| x_of_boundary_in(fs, &shown, byte);
+        let mut x = |byte: usize| x_of_boundary_in(fs, &shown, byte, font);
         let caret = x(edit.display_index(edit.cursor));
         let selection = edit
             .selection
@@ -371,8 +394,16 @@ impl FieldMarks {
 ///
 /// style: deliberate — caret and selection stand 4px inside the rim: the
 /// glyph box's inset, not a gap.
-fn paint_field(pc: &mut PaintCtx, f: Rect, marks: &FieldMarks, placeholder: &str, caret: bool) -> Rect {
-    let ty = cce_ui::layout::align_text_y(f.y, f.height, URL_FONT, 0.0);
+fn paint_field(
+    pc: &mut PaintCtx,
+    f: Rect,
+    marks: &FieldMarks,
+    placeholder: &str,
+    caret: bool,
+    font: &FieldFont,
+) -> Rect {
+    let size = font.size;
+    let ty = cce_ui::layout::align_text_y(f.y, f.height, size, 0.0);
     let x0 = f.x + text_pad();
     let caret_rect = Rect { x: x0 + marks.caret, y: f.y + 4.0, width: 1.0, height: f.height - 8.0 };
     pc.clip(f, |pc| {
@@ -380,9 +411,9 @@ fn paint_field(pc: &mut PaintCtx, f: Rect, marks: &FieldMarks, placeholder: &str
             pc.quad(Rect { x: x0 + a, y: f.y + 4.0, width: b - a, height: f.height - 8.0 }, SEL_BG);
         }
         if marks.shown.is_empty() && !placeholder.is_empty() {
-            pc.text(placeholder.to_string(), x0, ty, URL_FONT, TEXT_DIM);
+            pc.text_with(placeholder.to_string(), x0, ty, size, TEXT_DIM, font.family.clone(), None);
         } else {
-            pc.text(marks.shown.clone(), x0, ty, URL_FONT, TEXT);
+            pc.text_with(marks.shown.clone(), x0, ty, size, TEXT, font.family.clone(), None);
         }
         if let Some((a, b)) = marks.composition {
             pc.quad(Rect { x: x0 + a, y: f.y + f.height - 5.0, width: b - a, height: 1.0 }, CARET);
@@ -402,9 +433,9 @@ fn report_caret(r: Rect) {
 }
 
 /// X offset (text-origin relative) of byte `byte` of `text`, on the shaped
-/// run a field draws (`URL_FONT`, font=None, matching `pc.text`).
-fn x_of_boundary_in(fs: &mut cce_ui::cosmic_text::FontSystem, text: &str, byte: usize) -> f32 {
-    cce_ui::engine::shaped_cluster_offsets(fs, text, URL_FONT, None)
+/// run a field draws in `font` (matching `paint_field`).
+fn x_of_boundary_in(fs: &mut cce_ui::cosmic_text::FontSystem, text: &str, byte: usize, font: &FieldFont) -> f32 {
+    cce_ui::engine::shaped_cluster_offsets(fs, text, font.size, font.family.as_deref())
         .iter()
         .rev()
         .find(|&&(b, _)| b <= byte)
@@ -1958,7 +1989,7 @@ impl BrowserApp {
     fn bm_query_index_at(&mut self, x: f32) -> Option<usize> {
         let field = self.bm_layout()?.search;
         let shown = self.bm_menu.as_ref()?.query.display();
-        let at = self.boundary_at_x(&shown, x - field.x - text_pad());
+        let at = self.boundary_at_x(&shown, x - field.x - text_pad(), &FIELD_FONT);
         Some(self.bm_menu.as_ref()?.query.text_index(at))
     }
 
@@ -2918,7 +2949,7 @@ impl BrowserApp {
             .iter()
             .enumerate()
             .map(|(i, (_, edit))| {
-                let mut marks = FieldMarks::of(&mut self.font_system, edit);
+                let mut marks = FieldMarks::of(&mut self.font_system, edit, &FIELD_FONT);
                 if i != m.focused {
                     marks.selection = None;
                 }
@@ -2939,7 +2970,7 @@ impl BrowserApp {
             // `display()` masks a password field; the text itself never
             // reaches the paint list. The dialog blocks everything else, so
             // its focused field is the one with the keyboard.
-            let caret = paint_field(pc, f, marks, label, focused);
+            let caret = paint_field(pc, f, marks, label, focused, &FIELD_FONT);
             if focused {
                 report_caret(caret);
             }
@@ -3109,7 +3140,7 @@ impl BrowserApp {
                 m.hover,
                 m.scroll,
                 !m.query.text.is_empty(),
-                FieldMarks::of(&mut self.font_system, &m.query),
+                FieldMarks::of(&mut self.font_system, &m.query, &FIELD_FONT),
                 m.selected,
             ),
             None => return,
@@ -3132,7 +3163,7 @@ impl BrowserApp {
             RIM_FOCUS,
         );
         pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
-        let caret = paint_field(pc, f, &marks, "Search bookmarks", true);
+        let caret = paint_field(pc, f, &marks, "Search bookmarks", true, &FIELD_FONT);
         if has_keyboard {
             report_caret(caret);
         }
@@ -3345,17 +3376,22 @@ impl BrowserApp {
     /// lands in that and `text_index` carries it back to the text.
     fn cursor_from_click(&mut self, click_x: f32, field: &Rect) -> usize {
         let shown = self.url.display();
-        let at = self.boundary_at_x(&shown, click_x - field.x - text_pad());
+        let font = self.label_font.url_field();
+        let at = self.boundary_at_x(&shown, click_x - field.x - text_pad(), &font);
         self.url.text_index(at)
     }
 
     /// The char boundary of `text` nearest `rel_x` (text-origin relative),
-    /// off the same shaped run a field draws (`URL_FONT`, font=None,
-    /// matching `pc.text`). The URL bar and the dialog fields both read it,
-    /// so a click lands where the glyphs are.
-    fn boundary_at_x(&mut self, text: &str, rel_x: f32) -> usize {
-        let offsets =
-            cce_ui::engine::shaped_cluster_offsets(&mut self.font_system, text, URL_FONT, None);
+    /// off the same shaped run a field draws in `font` (matching
+    /// `paint_field`). The URL bar and the dialog fields both read it, so a
+    /// click lands where the glyphs are.
+    fn boundary_at_x(&mut self, text: &str, rel_x: f32, font: &FieldFont) -> usize {
+        let offsets = cce_ui::engine::shaped_cluster_offsets(
+            &mut self.font_system,
+            text,
+            font.size,
+            font.family.as_deref(),
+        );
         offsets
             .iter()
             .min_by(|a, b| (a.1 - rel_x).abs().total_cmp(&(b.1 - rel_x).abs()))
@@ -3371,7 +3407,7 @@ impl BrowserApp {
         let m = self.modal.as_ref()?;
         let f = m.field_rect(&m.rect(self.win), i);
         let shown = m.fields.get(i)?.1.display();
-        let at = self.boundary_at_x(&shown, x - f.x - text_pad());
+        let at = self.boundary_at_x(&shown, x - f.x - text_pad(), &FIELD_FONT);
         Some(self.modal.as_ref()?.fields[i].1.text_index(at))
     }
 
@@ -4049,7 +4085,7 @@ impl BrowserApp {
             let ty = cce_ui::layout::align_text_y(r.y, r.height, URL_FONT, 0.0);
             // What the field shows: an input method's composition at the
             // caret, underlined (`FieldMarks`, as every chrome field).
-            let marks = FieldMarks::of(&mut self.font_system, &self.vi_cmd);
+            let marks = FieldMarks::of(&mut self.font_system, &self.vi_cmd, &FIELD_FONT);
             let tx = x + measure_text_width(&sigil, sans, URL_FONT) + 3.0;
             let caret_rect = Rect { x: tx + marks.caret, y: r.y + 5.0, width: 1.0, height: r.height - 10.0 };
             pc.clip(r, |pc| {
@@ -5699,8 +5735,9 @@ impl Application for BrowserApp {
                 rim,
             );
             pc.rounded_rect(f, 6.0, (true, true, true, true), FIELD_BG);
-            let marks = FieldMarks::of(&mut self.font_system, &self.url);
-            let caret = paint_field(pc, f, &marks, "", self.url_focused);
+            let font = self.label_font.url_field();
+            let marks = FieldMarks::of(&mut self.font_system, &self.url, &font);
+            let caret = paint_field(pc, f, &marks, "", self.url_focused, &font);
             // Drawn here only while the bar is out, so a folded bar asks
             // for no text.
             if self.keyboard_field() == Some(LineField::Url) {
@@ -5832,20 +5869,20 @@ mod tests {
         use cce_ui::ime::{set_preedit, Preedit};
         use cce_ui::widget::LineEdit;
         let mut fs = cce_ui::create_font_system_with_system_fonts();
-        let mut x = |s: &str, b: usize| x_of_boundary_in(&mut fs, s, b);
+        let mut x = |s: &str, b: usize| x_of_boundary_in(&mut fs, s, b, &FIELD_FONT);
         let (ax, axyzb_1, axyzb_2, axyzb_4) = (x("ab", 1), x("axyzb", 1), x("axyzb", 2), x("axyzb", 4));
         assert!(ax > 0.0 && axyzb_2 > axyzb_1 && axyzb_4 > axyzb_2, "the run has widths to measure");
 
         let mut fs = cce_ui::create_font_system_with_system_fonts();
         let mut url = LineEdit::with_text("ab");
         url.cursor = 1;
-        let before = FieldMarks::of(&mut fs, &url);
+        let before = FieldMarks::of(&mut fs, &url, &FIELD_FONT);
         assert_eq!((before.shown.as_str(), before.caret, before.composition), ("ab", ax, None));
 
         // "xyz" composing between a and b, the input method's cursor after x.
         set_preedit(Some(Preedit::new("xyz", Some((1, 1)))));
         assert!(url.sync_ime());
-        let marks = FieldMarks::of(&mut fs, &url);
+        let marks = FieldMarks::of(&mut fs, &url, &FIELD_FONT);
         assert_eq!(marks.shown, "axyzb", "drawn at the caret");
         assert_eq!(url.text, "ab", "never in what the bar holds");
         assert_eq!(marks.composition, Some((axyzb_1, axyzb_4)), "underlined where it is drawn");
@@ -5856,13 +5893,13 @@ mod tests {
         url.press(at, false);
         url.release();
         assert!(!url.composing() && cce_ui::ime::preedit().is_none());
-        assert_eq!(FieldMarks::of(&mut fs, &url).shown, "ab");
+        assert_eq!(FieldMarks::of(&mut fs, &url, &FIELD_FONT).shown, "ab");
 
         // A password field's composition is bullets too.
         let mut password = LineEdit::masked();
         set_preedit(Some(Preedit::new("pw", None)));
         password.sync_ime();
-        let marks = FieldMarks::of(&mut fs, &password);
+        let marks = FieldMarks::of(&mut fs, &password, &FIELD_FONT);
         assert_eq!(marks.shown, "\u{2022}\u{2022}");
         assert!(password.text.is_empty());
         set_preedit(None);

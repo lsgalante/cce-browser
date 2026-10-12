@@ -349,7 +349,11 @@ chrome's default face. That set is `~/Dropbox/Fonts` plus CJK/emoji, not the sys
 fonts, so a condensed family only takes effect once it is there. The fallback is drawn
 with **no family name** on purpose: the preferred sans ("Noto Sans") is not in that
 set, and naming it rendered the labels in a serif. A label that is not in front is
-`TEXT_LABEL`, never `TEXT_DIM` — dim means unavailable.
+`TEXT_LABEL`, never `TEXT_DIM` — dim means unavailable. The **URL field** takes the
+same condensed cut at 15px (`LabelFont::url_field`); every other line field (dialogs,
+bookmarks search, vi line) stays on `FIELD_FONT`. A field's face is passed to
+`paint_field`, `FieldMarks::of` and `boundary_at_x` alike — draw, marks and click
+hit-test must shape the same run, or the caret drifts off the glyphs.
 
 ### Favorites are not bookmarks
 
