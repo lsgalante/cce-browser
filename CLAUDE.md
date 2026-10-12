@@ -32,7 +32,7 @@ Nineteen files under `src/`, ~16.8k lines. The ones that carry the design:
 | `src/wpe/ime.rs` | which page text field is open, as WebKit reports it to the input-method context our display hands out — what `display_list` claims for the on-screen keyboard |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
 | `src/wpe/damage.rs` | what a frame changed: damage accumulated per view across skipped frames, turned into the regions `pump` reads back |
-| `src/agent.rs` | agent control over MCP (`127.0.0.1:3004`): the tools, a thread per call running its steps, the steps done on the loop |
+| `src/agent.rs` | agent control over MCP (`127.0.0.1:3005`): the tools, a thread per call running its steps, the steps done on the loop |
 | `src/agent/page.js` | the page half of the agent tools: the accessibility-style tree and its `ref_N` handles, find, text, form input — in a private script world |
 | `src/wpe/host/agent.rs` | the engine half: script that answers, snapshots, and input aimed at any tab by id, the background ones included |
 | `src/raindrop/` | bookmark sync with Raindrop.io's Unsorted: the three-way merge (`mod.rs`), the REST client (`api.rs`), the worker and status line (`sync.rs`) — design in RAINDROP-SYNC.md |
@@ -766,7 +766,7 @@ The browser is an MCP server, so an agent drives it the way Claude in Chrome
 drives Chrome:
 
 ```sh
-claude mcp add --transport http cce-browser http://127.0.0.1:3004/mcp
+claude mcp add --transport http cce-browser http://127.0.0.1:3005/mcp
 ```
 
 `cce_ui::mcp` serves it (loopback, Origin/Host-checked, as cce-notes and

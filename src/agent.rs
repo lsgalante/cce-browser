@@ -4,7 +4,7 @@
 //! click, type, scroll, fill forms, run script, and see screenshots.
 //!
 //! ```sh
-//! claude mcp add --transport http cce-browser http://127.0.0.1:3004/mcp
+//! claude mcp add --transport http cce-browser http://127.0.0.1:3005/mcp
 //! ```
 //!
 //! cce-ui's tools-only server (`cce_ui::mcp`, as cce-notes and cce-designer
@@ -40,7 +40,8 @@ use crate::{BrowserApp, Message};
 /// The private script world the page half runs in.
 pub const WORLD: &str = "cce-agent";
 const PAGE_JS: &str = include_str!("agent/page.js");
-const DEFAULT_PORT: u16 = 3004;
+/// 3001 designer, 3002 notes, 3003 sheets, 3004 calendar.
+const DEFAULT_PORT: u16 = 3005;
 
 /// How long one step may wait on the loop. Under cce-ui's 30s call limit,
 /// so a stuck step fails the call with its own reason, not a timeout.
