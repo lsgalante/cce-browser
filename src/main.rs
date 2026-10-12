@@ -170,7 +170,62 @@ const TAB_CLOSE_W: f32 = 18.0;
 /// label's width up to `FAV_MAX_W`, and the strip simply stops at the bar's
 /// edge — favorites are a handful by design, not a scrolling list.
 const FAV_MAX_W: f32 = 150.0;
-const FAV_FONT: f32 = 12.0;
+
+/// The face the bar's labels — tab titles and favorites — are set in.
+///
+/// A label is a page title squeezed into a pill, so it is set in a
+/// condensed sans when the font set has one: the narrower cut is what lets
+/// the text be bigger and still show as much of the title as the old
+/// 12px normal-width run did. Without one the preferred sans is used, a
+/// size smaller, so a title cuts no earlier than it used to.
+#[derive(Clone, Debug, PartialEq)]
+struct LabelFont {
+    /// What labels are measured in.
+    family: String,
+    /// Whether `family` is named when drawing. The fallback is drawn in the
+    /// chrome's default face, as every other label is: the preferred sans
+    /// need not be in the renderer's font set, and a name it lacks comes
+    /// out in whatever face it falls back to — a serif, here.
+    named: bool,
+    size: f32,
+}
+
+impl LabelFont {
+    fn draw_family(&self) -> Option<String> {
+        self.named.then(|| self.family.clone())
+    }
+}
+
+/// Condensed sans families tried, in order, after the preferred sans's own
+/// condensed sibling. Only a family the *renderer's* font set holds is
+/// taken (`label_font`): naming one it lacks would draw the fallback sans
+/// while the label was measured in the condensed face.
+const CONDENSED_SANS: &[&str] = &[
+    "Roboto Condensed",
+    "Noto Sans Condensed",
+    "IBM Plex Sans Condensed",
+    "Fira Sans Condensed",
+    "Barlow Semi Condensed",
+    "Archivo Narrow",
+    "Liberation Sans Narrow",
+];
+const LABEL_FONT_CONDENSED: f32 = 14.0;
+const LABEL_FONT_PLAIN: f32 = 13.0;
+
+/// Pick the bar's label face from `db` (the font set the chrome is drawn
+/// with) for the preferred sans `sans`.
+fn label_font(db: &cce_ui::cosmic_text::fontdb::Database, sans: &str) -> LabelFont {
+    let has = |fam: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n == fam));
+    let own = ["Condensed", "SemiCondensed", "Semi Condensed", "Narrow"].map(|w| format!("{sans} {w}"));
+    own.iter()
+        .map(String::as_str)
+        .chain(CONDENSED_SANS.iter().copied())
+        .find(|fam| has(fam))
+        .map_or_else(
+            || LabelFont { family: sans.to_string(), named: false, size: LABEL_FONT_PLAIN },
+            |fam| LabelFont { family: fam.to_string(), named: true, size: LABEL_FONT_CONDENSED },
+        )
+}
 /// The bookmarks menu: a plate of rows dropped from the controls row's
 /// bookmarks button — the bar's own way to visit and manage what the star saves.
 const BM_W: f32 = 320.0;
@@ -191,8 +246,9 @@ const AC_FONT: f32 = 13.0;
 const AC_SUB_FONT: f32 = 11.0;
 /// Utility-bar fill; the negative alpha marks the plate as blur-behind.
 /// The blurred page is the base and this color tints it at |alpha|
-/// opacity — keep |alpha| low so the frosted content shows through.
-const BAR_FILL: [f32; 4] = [0.11, 0.12, 0.13, -0.28];
+/// opacity. At 0.28 a busy page's text read straight through the tab
+/// titles; this keeps the frost but puts the labels on a dark enough base.
+const BAR_FILL: [f32; 4] = [0.11, 0.12, 0.13, -0.55];
 const URL_FONT: f32 = 14.0;
 /// Pixels per wheel notch when the DE reports discrete line deltas.
 const LINE_PX: f64 = 76.0;
@@ -221,8 +277,8 @@ const HINT_TYPED: [u8; 3] = [140, 112, 30];
 const PAGE_BG: [f32; 4] = [0.10, 0.10, 0.11, 1.0];
 const FIELD_BG: [f32; 4] = [0.09, 0.09, 0.10, 0.40];
 const BTN_BG: [f32; 4] = [0.20, 0.21, 0.23, 0.40];
-const TAB_BG: [f32; 4] = [0.15, 0.16, 0.18, 0.30];
-const TAB_ACTIVE_BG: [f32; 4] = [0.32, 0.34, 0.38, 0.55];
+const TAB_BG: [f32; 4] = [0.15, 0.16, 0.18, 0.72];
+const TAB_ACTIVE_BG: [f32; 4] = [0.32, 0.34, 0.38, 0.80];
 const RIM: [f32; 4] = [0.22, 0.23, 0.25, 1.0];
 const RIM_FOCUS: [f32; 4] = [0.33, 0.48, 0.72, 1.0];
 /// URL-bar selection highlight; the text is drawn over it.
@@ -230,6 +286,10 @@ const SEL_BG: [f32; 4] = [0.24, 0.38, 0.60, 0.95];
 const ACCENT: [f32; 4] = [0.35, 0.55, 0.85, 1.0];
 const TEXT: [u8; 3] = [220, 220, 225];
 const TEXT_DIM: [u8; 3] = [120, 122, 128];
+/// A tab or favorite label that is not the one in front. Quieter than
+/// `TEXT`, but far from `TEXT_DIM`: dim means *unavailable* in this chrome,
+/// and a background tab's title is something to read.
+const TEXT_LABEL: [u8; 3] = [182, 185, 192];
 /// A line field's caret, and the underline under an input method's
 /// composition.
 const CARET: [f32; 4] = [0.85, 0.87, 0.92, 1.0];
@@ -984,6 +1044,9 @@ struct BrowserApp {
     /// with) for URL-bar caret/click metrics via `shaped_cluster_offsets` —
     /// `measure_text_width`'s inked-extent numbers drift off the drawn glyphs.
     font_system: cce_ui::cosmic_text::FontSystem,
+    /// The face tab titles and favorites are set in (`label_font`), picked
+    /// from `font_system`'s set — the one the chrome is drawn with.
+    label_font: LabelFont,
     /// The line field that had the keyboard when the last frame was built,
     /// so the frame it loses it can drop a composition it was showing.
     ime_field: Option<LineField>,
@@ -1126,12 +1189,12 @@ fn controls_y(bar: &Rect) -> f32 {
 /// order (index into the strip = index into the result). Widths follow the
 /// labels, which is why this takes the font: draw and hit-test both read it
 /// with the same font and get the same rects.
-fn fav_rects(bar: &Rect, favs: &[pages::Link], sans: &str) -> Vec<Rect> {
+fn fav_rects(bar: &Rect, favs: &[pages::Link], font: &LabelFont) -> Vec<Rect> {
     let mut rects = Vec::with_capacity(favs.len());
     let right = bar.x + bar.width - plate_pad();
     let mut x = bar.x + plate_pad();
     for f in favs {
-        let w = (measure_text_width(&f.label, sans, FAV_FONT) + 2.0 * text_pad())
+        let w = (measure_text_width(&f.label, &font.family, font.size) + 2.0 * text_pad())
             .min(FAV_MAX_W)
             .max(btn_h());
         if x + w > right {
@@ -1295,8 +1358,13 @@ impl BrowserApp {
 
     /// The favorites strip's pills for the current bar.
     fn fav_rects(&self, bar: &Rect) -> Vec<Rect> {
+        fav_rects(bar, &self.favs, &self.label_font)
+    }
+
+    /// Re-pick the bar's label face: the preferred sans may have changed.
+    fn refresh_label_font(&mut self) {
         let (sans, ..) = cce_ui::layout::read_preferred_fonts();
-        fav_rects(bar, &self.favs, &sans)
+        self.label_font = label_font(self.font_system.db(), &sans);
     }
 
     /// Re-read the strip from the store. Called with the rest of the page
@@ -4114,6 +4182,8 @@ impl Application for BrowserApp {
         let favorites = host.favorites();
         let favs = favorites.snapshot();
         let bookmarks = host.bookmarks();
+        let font_system = cce_ui::create_font_system();
+        let label_font = label_font(font_system.db(), &cce_ui::layout::read_preferred_fonts().0);
         Self {
             host,
             seen_renderer: false,
@@ -4143,7 +4213,8 @@ impl Application for BrowserApp {
             opt_menu: None,
             #[cfg(feature = "wpe")]
             sender,
-            font_system: cce_ui::create_font_system(),
+            font_system,
+            label_font,
             ime_field: None,
             session,
             favorites,
@@ -4609,6 +4680,13 @@ impl Application for BrowserApp {
         // that changed anything has to redraw the chrome.
         if focused && self.reload_settings() {
             *needs_rebuild = true;
+        }
+        if focused {
+            let was = self.label_font.clone();
+            self.refresh_label_font();
+            if self.label_font != was {
+                *needs_rebuild = true;
+            }
         }
     }
 
@@ -5535,14 +5613,17 @@ impl Application for BrowserApp {
                     .unwrap_or_else(|| "New Tab".to_string());
                 let close = tab_close_rect(&pill);
                 let text_avail = pill.width - 2.0 * text_pad() - close.map_or(0.0, |_| TAB_CLOSE_W - 4.0);
-                let label = Self::fit_text(&title, &sans, 12.0, text_avail);
-                let color = if is_active { TEXT } else { TEXT_DIM };
-                pc.text(
+                let lf = &self.label_font;
+                let label = Self::fit_text(&title, &lf.family, lf.size, text_avail);
+                let color = if is_active { TEXT } else { TEXT_LABEL };
+                pc.text_with(
                     label,
                     pill.x + text_pad(),
-                    cce_ui::layout::align_text_y(pill.y, pill.height, 12.0, 0.0),
-                    12.0,
+                    cce_ui::layout::align_text_y(pill.y, pill.height, lf.size, 0.0),
+                    lf.size,
                     color,
+                    lf.draw_family(),
+                    None,
                 );
                 if tab.is_some_and(|t| t.loading) {
                     pc.quad(
@@ -5570,14 +5651,17 @@ impl Application for BrowserApp {
                     (true, true, true, true),
                     if hovered { TAB_ACTIVE_BG } else { TAB_BG },
                 );
+                let lf = &self.label_font;
                 let label =
-                    Self::fit_text(&self.favs[i].label, &sans, FAV_FONT, r.width - 2.0 * text_pad());
-                pc.text(
+                    Self::fit_text(&self.favs[i].label, &lf.family, lf.size, r.width - 2.0 * text_pad());
+                pc.text_with(
                     label,
                     r.x + text_pad(),
-                    cce_ui::layout::align_text_y(r.y, r.height, FAV_FONT, 0.0),
-                    FAV_FONT,
-                    if hovered { TEXT } else { TEXT_DIM },
+                    cce_ui::layout::align_text_y(r.y, r.height, lf.size, 0.0),
+                    lf.size,
+                    if hovered { TEXT } else { TEXT_LABEL },
+                    lf.draw_family(),
+                    None,
                 );
             }
 
@@ -5723,6 +5807,25 @@ mod tests {
     use super::*;
 
     const SEARCH: &str = "https://duckduckgo.com/?q=";
+
+    #[test]
+    fn labels_are_condensed_only_in_a_face_the_renderer_has() {
+        use cce_ui::cosmic_text::fontdb::Database;
+        // Nothing condensed: the preferred sans's metrics, drawn in the
+        // chrome's default face rather than by a name the set may lack.
+        let plain = label_font(&Database::new(), "Noto Sans");
+        assert_eq!(plain, LabelFont { family: "Noto Sans".into(), named: false, size: LABEL_FONT_PLAIN });
+        assert_eq!(plain.draw_family(), None);
+
+        let path = "/usr/share/fonts/TTF/RobotoCondensed-Regular.ttf";
+        if std::path::Path::new(path).exists() {
+            let mut db = Database::new();
+            db.load_font_file(path).unwrap();
+            let cond = label_font(&db, "Noto Sans");
+            assert_eq!(cond.draw_family().as_deref(), Some("Roboto Condensed"));
+            assert_eq!(cond.size, LABEL_FONT_CONDENSED);
+        }
+    }
 
     #[test]
     fn a_composition_is_drawn_at_the_caret_and_never_held() {

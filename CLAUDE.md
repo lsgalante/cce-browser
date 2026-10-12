@@ -342,6 +342,15 @@ readings of one geometry** — change a rect helper, not one call site.
 `check`. Never a character standing in for one (the bar was `<` `>` `R` `*` `B`); the
 fallback, drawn only with the icon set missing, is a plain word.
 
+**Tab titles and favorites are set in a condensed face** (`LabelFont`, picked by
+`label_font`): 14px in the first condensed sans the *renderer's* font set holds
+(`CONDENSED_SANS`, after the preferred sans's own `… Condensed`), else 13px in the
+chrome's default face. That set is `~/Dropbox/Fonts` plus CJK/emoji, not the system
+fonts, so a condensed family only takes effect once it is there. The fallback is drawn
+with **no family name** on purpose: the preferred sans ("Noto Sans") is not in that
+set, and naming it rendered the labels in a serif. A label that is not in front is
+`TEXT_LABEL`, never `TEXT_DIM` — dim means unavailable.
+
 ### Favorites are not bookmarks
 
 Two stores, two meanings. The **star** (`Ctrl+D`, `cce://bookmarks`) is the
