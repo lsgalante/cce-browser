@@ -10,6 +10,8 @@
 //! into the engine's input events; the URL bar is a `cce_ui::widget::LineEdit`.
 
 mod accounts;
+#[cfg(feature = "wpe")]
+mod agent;
 mod downloads;
 mod instance;
 mod pages;
@@ -991,6 +993,12 @@ pub enum Message {
     /// `Some` is a URL or file path to open in a new tab, `None` a bare
     /// launch that becomes a blank tab.
     OpenExternal(Option<String>),
+    /// An agent tool call (`agent.rs`), run on a thread of its own.
+    #[cfg(feature = "wpe")]
+    Mcp(cce_ui::mcp::McpToolCall),
+    /// One step of an agent tool call, done on this loop.
+    #[cfg(feature = "wpe")]
+    AgentOp(agent::Op, agent::Reply),
 }
 
 struct BrowserApp {
@@ -1177,6 +1185,15 @@ struct BrowserApp {
     /// highlights are up.
     vi_search: Option<String>,
     vi_searching: bool,
+    /// The last press the page got was an agent's (`agent.rs`), not the
+    /// person's: a select list or context menu it opens is the agent's, and
+    /// must not pop up over what the person is doing.
+    #[cfg(feature = "wpe")]
+    agent_pressed: bool,
+    /// What happened because of an agent's input that it should be told
+    /// (a list it opened, a menu it asked for), until its next look.
+    #[cfg(feature = "wpe")]
+    agent_notes: Vec<String>,
 }
 
 
@@ -2600,6 +2617,10 @@ impl BrowserApp {
     fn page_press(&mut self, button: MouseButton, pressed: bool, pos: LogicalPosition) {
         if !pressed {
             return;
+        }
+        #[cfg(feature = "wpe")]
+        {
+            self.agent_pressed = false;
         }
         if !self.page_buttons.contains(&button) {
             self.page_buttons.push(button);
@@ -4155,6 +4176,10 @@ impl Application for BrowserApp {
         // Serve the instance socket claimed in main(), if this launch won it.
         instance::spawn_listener(sender.clone());
         let settings = settings::load();
+        #[cfg(feature = "wpe")]
+        if settings.agent {
+            agent::start(sender.clone());
+        }
         downloads::set_download_dir(settings.download_dir.clone());
         // Optional CLI arg: the start URL (same parsing as the URL bar).
         let arg = std::env::args()
@@ -4209,6 +4234,10 @@ impl Application for BrowserApp {
         #[cfg(feature = "wpe")]
         host.set_accounts_enabled(settings.accounts);
         host.set_vi_enabled(settings.vi_mode);
+        #[cfg(feature = "wpe")]
+        if settings.agent {
+            host.agent_keep_world(agent::WORLD);
+        }
         let accounts = accounts::Accounts::spawn(sender.clone());
         let raindrop_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(settings.raindrop));
         let raindrop_started = settings.raindrop;
@@ -4293,6 +4322,10 @@ impl Application for BrowserApp {
             vi_search: None,
             vi_searching: false,
             #[cfg(feature = "wpe")]
+            agent_pressed: false,
+            #[cfg(feature = "wpe")]
+            agent_notes: Vec::new(),
+            #[cfg(feature = "wpe")]
             glib_fd_watched: false,
             #[cfg(feature = "wpe")]
             last_pump: std::time::Instant::now(),
@@ -4345,6 +4378,13 @@ impl Application for BrowserApp {
 
     fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
         match msg {
+            #[cfg(feature = "wpe")]
+            Message::Mcp(call) => agent::serve(call, self.sender.clone()),
+            #[cfg(feature = "wpe")]
+            Message::AgentOp(op, reply) => {
+                self.agent_op(op, reply);
+                *needs_rebuild = true;
+            }
             Message::Spin => {
                 #[cfg(feature = "wpe")]
                 {
@@ -4368,13 +4408,27 @@ impl Application for BrowserApp {
                 }
                 #[cfg(feature = "wpe")]
                 if let Some(info) = self.host.take_context_menu() {
-                    self.open_ctx_menu(info);
-                    *needs_rebuild = true;
+                    if self.agent_pressed {
+                        self.agent_notes.push("The page asked for the browser's context menu, which only a person's right-click shows.".into());
+                    } else {
+                        self.open_ctx_menu(info);
+                        *needs_rebuild = true;
+                    }
                 }
                 #[cfg(feature = "wpe")]
                 if let Some(info) = self.host.take_option_menu() {
-                    self.open_opt_menu(info);
-                    *needs_rebuild = true;
+                    if self.agent_pressed {
+                        self.host.close_option_menu();
+                        let options: Vec<&str> =
+                            info.items.iter().filter(|i| !i.group_label).map(|i| i.label.as_str()).collect();
+                        self.agent_notes.push(format!(
+                            "That opened a select's list ({}); choose with form_input on the select's ref.",
+                            options.join(", ")
+                        ));
+                    } else {
+                        self.open_opt_menu(info);
+                        *needs_rebuild = true;
+                    }
                 }
                 // The page closed the list itself: the select went away, or
                 // the page navigated.

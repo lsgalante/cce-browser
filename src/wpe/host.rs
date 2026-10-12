@@ -27,6 +27,10 @@ use super::glib_source::GlibPoll;
 use super::input;
 use super::subclass::{types, FRAME_SINK};
 
+/// What the agent tools drive the engine with (`crate::agent`).
+mod agent;
+pub use agent::{AgentImage, PointerKind};
+
 /// Page state a tab's WebKit signals write into.
 ///
 /// Held behind an `Rc` because each connected signal owns a reference: the
@@ -138,6 +142,9 @@ const PING_WORLD: &str = "cce-ping";
 /// uploaded to the image registry (id, w px, h px). Same shape as
 /// `webview::Tab` so the chrome reads it identically.
 pub struct Tab {
+    /// Stable for the tab's life, unlike its index, which shifts as tabs
+    /// before it close. What the agent tools name a tab by.
+    pub id: u64,
     webview: *mut WebKitWebView,
     view: *mut WPEView,
     state: Rc<TabState>,
@@ -400,6 +407,8 @@ pub struct WebKitHost {
     /// The injected vi focus watcher; `None` while vi mode is off, which is
     /// also when no page carries it.
     vi_watcher: Option<*mut WebKitUserScript>,
+    /// The id the next tab gets (`Tab::id`).
+    next_tab_id: u64,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -565,6 +574,7 @@ impl WebKitHost {
                 held_buttons: Cell::new(0),
                 deadlock_watch: None,
                 vi_watcher: None,
+                next_tab_id: 1,
             };
             // The account watcher's channel, in its own script world. Both
             // halves are registered here, once, on the shared content
@@ -1030,7 +1040,10 @@ impl WebKitHost {
         };
         state.loading.set(true);
         *state.url.borrow_mut() = Some(url.clone());
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
         self.tabs.push(Tab {
+            id,
             webview,
             view,
             state,

@@ -99,6 +99,9 @@ pub struct Settings {
     /// Vi-style modal keys, after qutebrowser (`src/vi.rs`). Off by default:
     /// it changes what every letter typed at a page means.
     pub vi_mode: bool,
+    /// Serve the agent tools (`src/agent.rs`) over MCP on loopback, so an
+    /// agent can drive the browser. Read at startup only.
+    pub agent: bool,
     /// Window edge the utility bar floats against.
     pub bar_position: BarPosition,
     /// What pages are told to prefer.
@@ -118,6 +121,7 @@ impl Default for Settings {
             accounts: true,
             raindrop: false,
             vi_mode: false,
+            agent: true,
             bar_position: BarPosition::Top,
             color_scheme: ColorScheme::Dark,
             external_browser: None,
@@ -163,6 +167,7 @@ pub fn load() -> Settings {
         accounts: b["accounts"].as_bool().unwrap_or(true),
         raindrop: b["raindrop"].as_bool().unwrap_or(false),
         vi_mode: b["vi-mode"].as_bool().unwrap_or(false),
+        agent: b["agent"].as_bool().unwrap_or(true),
         bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
         color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("dark")),
         external_browser: b["external-browser"]

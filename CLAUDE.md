@@ -15,7 +15,7 @@ remote at all, so check `origin/master` after committing). Read the workspace-le
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
-Nineteen files, ~14.8k lines. The twelve that carry the design:
+Nineteen files under `src/`, ~16.8k lines. The ones that carry the design:
 
 | file | what it owns |
 | --- | --- |
@@ -32,6 +32,9 @@ Nineteen files, ~14.8k lines. The twelve that carry the design:
 | `src/wpe/ime.rs` | which page text field is open, as WebKit reports it to the input-method context our display hands out — what `display_list` claims for the on-screen keyboard |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
 | `src/wpe/damage.rs` | what a frame changed: damage accumulated per view across skipped frames, turned into the regions `pump` reads back |
+| `src/agent.rs` | agent control over MCP (`127.0.0.1:3004`): the tools, a thread per call running its steps, the steps done on the loop |
+| `src/agent/page.js` | the page half of the agent tools: the accessibility-style tree and its `ref_N` handles, find, text, form input — in a private script world |
+| `src/wpe/host/agent.rs` | the engine half: script that answers, snapshots, and input aimed at any tab by id, the background ones included |
 | `src/raindrop/` | bookmark sync with Raindrop.io's Unsorted: the three-way merge (`mod.rs`), the REST client (`api.rs`), the worker and status line (`sync.rs`) — design in RAINDROP-SYNC.md |
 
 ## Build
@@ -756,6 +759,68 @@ quits like a window close — the tabs are kept). Points that are choices:
   match from the last position; `n`/`N` step, Escape clears the highlights,
   "Text not found" comes from `failed-to-find-text`. It is the only
   find-in-page there is.
+
+## Agent control (MCP)
+
+The browser is an MCP server, so an agent drives it the way Claude in Chrome
+drives Chrome:
+
+```sh
+claude mcp add --transport http cce-browser http://127.0.0.1:3004/mcp
+```
+
+`cce_ui::mcp` serves it (loopback, Origin/Host-checked, as cce-notes and
+cce-designer), only from the single instance; `browser.agent false` turns it
+off (read at startup; no settings-page toggle yet) and `CCE_BROWSER_MCP_PORT`
+moves it. WPE only. The tools, deliberately named and shaped like Claude in
+Chrome's so an agent that knows one knows the other: `tabs_context`,
+`tabs_create` (background unless `foreground`), `tabs_close`, `tabs_select`,
+`navigate` (URL-bar parsing, or back/forward/reload; waits for the load),
+`read_page`, `find`, `get_page_text`, `form_input`, `computer` (screenshot,
+zoom, clicks, hover, drag, type, key, scroll, scroll_to, wait),
+`javascript_tool`, `handle_dialog`. Every one takes an optional `tabId`; the
+default is the shown tab. Tabs have a stable `Tab::id` for this, since an
+index shifts as tabs close.
+
+Points that are choices:
+
+- **A call is a thread, its steps are messages.** `agent::serve` runs each
+  call on its own thread as a plain sequence ("where is ref_7 — press there —
+  wait for the load it started"); each step is an `agent::Op` the loop does
+  in `agent_op` and answers on a channel, at once for chrome state or from
+  inside `pump` for what WebKit answers later (script, snapshots). Nothing
+  ever blocks the loop on the page.
+- **The page half runs in a private world** (`agent::WORLD`), so the page can
+  neither see nor replace it. WebKit drops a named world nothing holds once
+  its script returns, taking the globals with it — refs restarted at `ref_1`
+  on every call until `agent_keep_world` registered a channel in it.
+- **Input is real WPE events, to any tab.** The page sees a person's clicks
+  (`isTrusted`, user activation, `detail` counting double clicks) and keys;
+  a background tab takes them as well as the shown one, and its snapshot is
+  painted fresh by WebKit (`webkit_web_view_get_snapshot`), not read from
+  the chrome's frames. A background tab has no caret drawn and reports
+  `visibilityState` hidden, which is the truth.
+- **Coordinates are in the last screenshot's pixels**, per tab
+  (`SHOT_SCALE`), and CSS pixels before any — the screenshot is sized from
+  the CSS viewport down to the vision budget (`SHOT_EDGE`/`SHOT_AREA`), so
+  at output scale 2 a 1200x800 viewport is a 1200x800 screenshot, and
+  `zoom` is the way to device resolution.
+- **What an agent's press opens is not shown to the person.** A select's
+  list or a context menu raised by the agent's click (`agent_pressed`,
+  cleared by any press of the person's) is closed and reported back as a
+  note — "choose with form_input" — rather than popping up over whatever the
+  person is doing. JS dialogs *are* shown (they block the page either way),
+  and the agent answers them with `handle_dialog`; while one is open, tools
+  that would run page script refuse instead of timing out.
+- **The wheel step is divided by WebKit's own gain** (`WHEEL_GAIN`, 2.5,
+  measured): a `scroll` step is 100 CSS px.
+- `javascript_tool` reads like a console: an expression (awaited), else the
+  script's completion value, else an async function body with `return`.
+  Script run this way is not subject to the page's CSP (checked on GitHub).
+
+Not there yet: console and network reading (Claude in Chrome's
+`read_console_messages` / `read_network_requests`), file upload, and any
+on-screen sign that an agent is driving.
 
 ## Account autocomplete (cce-secrets)
 

@@ -18,4 +18,4 @@ pub mod formwatch;
 // Not consumed yet — main.rs still drives ServoHost.
 #[allow(unused_imports)]
 pub use formwatch::FormEvent;
-pub use host::{ContextMenuInfo, OptionItem, OptionMenuInfo, WebKitHost};
+pub use host::{AgentImage, ContextMenuInfo, OptionItem, OptionMenuInfo, PointerKind, WebKitHost};

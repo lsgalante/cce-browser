@@ -10,13 +10,13 @@ edition = "2021"
 # exactly what happened two days after the port landed. Needs
 # `pacman -S wpewebkit`.
 default = ["wpe"]
-wpe = ["dep:rustix", "dep:cce-wpe"]
+wpe = ["dep:rustix", "dep:cce-wpe", "dep:png", "dep:base64"]
 # The retired Servo backend, kept buildable for comparison:
 #   cargo build --release -p cce-browser --no-default-features --features servo
 servo = ["dep:servo", "dep:dpi", "dep:euclid", "dep:rustls", "dep:http"]
 
 [dependencies]
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "cb7cb6684a76b54a6bc8f1054d11092c73d83c28", features = ["a11y"] }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "4f8e42b139faf7a29906b538944a3463a1480527", features = ["a11y"] }
 # For `cce-browser-open`: the instance client, from the GUI-free half of the
 # toolkit, so the launcher links no Wayland, Vulkan or WebKit.
 cce-core = { git = "https://github.com/lsgalante/cce-core.git", rev = "5b8dcb30f1b0d7d607ab49d637069560eca0cb14" }
@@ -49,6 +49,10 @@ zbus = "5"
 # Only used by the `wpe` backend, to hold GLib's changing pollfd set in one
 # epoll fd that calloop can watch. Optional so a default build skips it.
 rustix = { version = "0.38", features = ["event"], optional = true }
+# The agent tools' screenshots (src/agent.rs): PNG, base64 for MCP. Both
+# already in the tree (cce-ui encodes PNG; base64 through reqwest).
+png = { version = "0.17", optional = true }
+base64 = { version = "0.22", optional = true }
 # The WPE embedding shared with cce-mail (bindings, subclasses, GLib
 # source, input, damage, IME context); only with the `wpe` feature.
 cce-wpe = { git = "https://github.com/lsgalante/cce-wpe.git", rev = "ec323a125f9d2c8f70c868f80d8ef7cdfb588f9d", optional = true }
