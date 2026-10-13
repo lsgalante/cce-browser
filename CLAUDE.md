@@ -500,6 +500,49 @@ Menu semantics, all in `handle_mouse_input` / `handle_key_input`:
   keeps eating keystrokes. Wheel and pointer moves over the chrome stay off the
   page, gated by `chrome_hit`, not `bar_rect`.
 
+### The tab line
+
+Folded, the bar shows no tabs at all, so a tab switched by key (`J`/`K`,
+`gt`, Ctrl+Tab), closed, or opened in front used to change the page with
+nothing to say where in the set it landed. The **tab line** is qutebrowser's
+tab bar for that state: a plate of the bar's material in the dot's own row
+and height (`tab_line_rect`: from the bar's far end to an `item_gap` short
+of the dot, `2 * DOT_R` tall), holding one `n: title` pill per tab in the
+bar's tab colors (the front one lifted, a loading one underlined).
+`browser.tab-line` takes qutebrowser's `tabs.show` values: **`switching`**
+(the default: up for `TAB_LINE_FLASH`, qutebrowser's 800 ms, after the tab
+in front changes), `multiple`, `always`, `never`. cce-system-interface's
+Browser page has it as "Tab Line". Points that are choices:
+
+- **Never while the bar is out** (`tab_line_shown`): the open bar's tab row
+  says the same, and two tab strips is noise. Opening the bar also cancels
+  a flash, so it does not come back when the bar folds.
+- **A switch is noticed in one place**: `sync_page_state`, which every
+  change of the tab set passes through (a page opening a tab in front
+  included, through the dirty path), compares `front_tab` — the WPE `Tab::id`,
+  since an index shifts when an earlier tab closes — with the last one seen.
+  A switch made with the bar out (picking a tab, Ctrl+T, submitting `O`) was
+  watched, and flashes nothing: `navigate` notes the new tab before the bar
+  folds, because the load's own sync arrives after the fold.
+- **A flash is a display; a line up for good is a tab bar.** Under
+  `multiple`/`always` (`tab_line_at`) a click shows that tab, a middle-click
+  closes it, the wheel steps through the tabs and stops at the ends
+  (qutebrowser's `tabs.mousewheel_switching`), and nothing on the line
+  reaches the page. A `switching` flash takes nothing: it appears on its own
+  for less than a second, and a click aimed at the page must not land on it.
+- **Overlay, not layout.** qutebrowser takes the band away from the page;
+  here the page stays full-bleed under all the chrome, so `always` covers a
+  28px band of the page's top (or bottom). Reserving space would mean
+  offsetting every page coordinate the chrome uses (hints, field rects,
+  select anchors, input).
+- **Too many tabs for `TAB_LINE_MIN_W` each** and the line shows a run of
+  them around the front tab (`tab_line_pills`, which draw and hit-test both
+  read), not every tab cut down to its number.
+- A bottom line lifts the vi status line over it, as a bottom bar does.
+
+`the_tab_line_shares_out_its_width_and_keeps_the_front_tab_in_view` is the
+test.
+
 ### The right-click menu
 
 A right-click in the page (WebKit's `context-menu` signal, `take_context_menu`)

@@ -27,6 +27,32 @@ impl BarPosition {
     }
 }
 
+/// When the tab line is up: qutebrowser's tab bar, here a strip beside the
+/// corner control while the bar is folded (the open bar has its own tab
+/// row). The values and their meanings are qutebrowser's `tabs.show`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabLine {
+    Never,
+    /// For a moment after the tab in front changes.
+    #[default]
+    Switching,
+    /// Whenever more than one tab is open.
+    Multiple,
+    Always,
+}
+
+impl TabLine {
+    /// Config keys as written by the system-interface Browser page.
+    fn from_key(key: &str) -> Self {
+        match key {
+            "never" => Self::Never,
+            "multiple" => Self::Multiple,
+            "always" => Self::Always,
+            _ => Self::Switching,
+        }
+    }
+}
+
 /// The color scheme reported to pages as `prefers-color-scheme`. Sites that
 /// ship a dark stylesheet honor it; sites that don't are unaffected — this is
 /// a signal, not a filter over their colors.
@@ -104,6 +130,8 @@ pub struct Settings {
     pub agent: bool,
     /// Window edge the utility bar floats against.
     pub bar_position: BarPosition,
+    /// When the folded bar shows the tabs anyway (`main.rs`, "the tab line").
+    pub tab_line: TabLine,
     /// What pages are told to prefer.
     pub color_scheme: ColorScheme,
     /// Command used to hand the current page to another browser. Empty means
@@ -123,6 +151,7 @@ impl Default for Settings {
             vi_mode: false,
             agent: true,
             bar_position: BarPosition::Top,
+            tab_line: TabLine::Switching,
             color_scheme: ColorScheme::Dark,
             external_browser: None,
         }
@@ -169,6 +198,7 @@ pub fn load() -> Settings {
         vi_mode: b["vi-mode"].as_bool().unwrap_or(false),
         agent: b["agent"].as_bool().unwrap_or(true),
         bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
+        tab_line: TabLine::from_key(b["tab-line"].as_str().unwrap_or("switching")),
         color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("dark")),
         external_browser: b["external-browser"]
             .as_str()

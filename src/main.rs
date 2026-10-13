@@ -172,6 +172,69 @@ const TAB_CLOSE_W: f32 = 18.0;
 /// label's width up to `FAV_MAX_W`, and the strip simply stops at the bar's
 /// edge — favorites are a handful by design, not a scrolling list.
 const FAV_MAX_W: f32 = 150.0;
+/// How long the tab line stays up after the tab in front changes, under
+/// `browser.tab-line "switching"`: qutebrowser's `tabs.show_switching_delay`.
+const TAB_LINE_FLASH: std::time::Duration = std::time::Duration::from_millis(800);
+/// The narrowest a tab gets on the tab line. Past that the line shows a run
+/// of tabs around the one in front, not every tab cut down to its number.
+const TAB_LINE_MIN_W: f32 = 64.0;
+/// A tab's corner on the tab line: the line plate's corner less the inset,
+/// so the two curves run parallel.
+const TAB_LINE_PILL_R: f32 = 5.0;
+/// The tab line plate's corner, the vi status line's: the two are
+/// qutebrowser's tab bar and status bar, and read as a pair.
+const TAB_LINE_R: f32 = 8.0;
+
+/// The tab line's inset from its plate to the tabs, and between tabs: the
+/// plate's rolled rim, so a tab sits just inside it. The line is a compact
+/// row, below the ladder's control size on purpose.
+fn tab_line_inset() -> f32 {
+    cce_ui::layout::bevel_width().min(3.0)
+}
+
+/// Inset from a tab on the tab line to its label: half the DE's button
+/// padding, for the same reason.
+fn tab_line_pad() -> f32 {
+    text_pad() / 2.0
+}
+
+/// The tabs the tab line shows inside `line`, and where: `(tab index,
+/// pill)`, left to right. They share the line evenly, as qutebrowser's do;
+/// when that would make them narrower than `TAB_LINE_MIN_W`, the line holds
+/// as many as fit — a run that keeps `active` in it, centred where the ends
+/// allow. Draw and hit-test both read this.
+fn tab_line_pills(line: &Rect, count: usize, active: usize) -> Vec<(usize, Rect)> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let inset = tab_line_inset();
+    let avail = (line.width - 2.0 * inset).max(0.0);
+    let fit = (((avail + inset) / (TAB_LINE_MIN_W + inset)).floor() as usize).max(1);
+    let shown = count.min(fit);
+    let first = active.min(count - 1).saturating_sub(shown / 2).min(count - shown);
+    let w = (avail - (shown - 1) as f32 * inset) / shown as f32;
+    (0..shown)
+        .map(|k| {
+            let pill = Rect {
+                x: line.x + inset + k as f32 * (w + inset),
+                y: line.y + inset,
+                width: w,
+                height: line.height - 2.0 * inset,
+            };
+            (first + k, pill)
+        })
+        .collect()
+}
+
+/// The tab in front, as the tab line tells a switch from a repaint: the WPE
+/// host's stable id. The retired Servo host has none, so its index stands
+/// in there, and a tab closed ahead of the front one reads as a switch.
+fn front_tab(host: &Host) -> Option<u64> {
+    #[cfg(feature = "wpe")]
+    return host.tab(host.active_index()).map(|t| t.id);
+    #[cfg(not(feature = "wpe"))]
+    return Some(host.active_index() as u64);
+}
 
 /// The face the bar's labels — tab titles and favorites — are set in.
 ///
@@ -1094,6 +1157,14 @@ struct BrowserApp {
     peek_pointer: (f32, f32),
     /// Pointer over the corner control — its hover emphasis is a repaint.
     dot_hover: bool,
+    /// The tab in front as of the last page-state sync (`front_tab`), for
+    /// telling when it changes.
+    tab_line_front: Option<u64>,
+    /// When a `switching` tab line, up because the tab in front changed,
+    /// goes again.
+    tab_line_flash: Option<std::time::Instant>,
+    /// Wheel travel over the tab line not yet worth a whole tab.
+    tab_line_wheel_rest: f64,
     loading: bool,
     /// Page title; drives the toplevel title (the engine re-applies
     /// `settings().title` whenever it changes).
@@ -2271,6 +2342,9 @@ impl BrowserApp {
     fn open_chrome(&mut self) {
         self.chrome_open = true;
         self.chrome_peek = None;
+        // The bar shows the tabs itself; a flash must not come back when it
+        // folds.
+        self.tab_line_flash = None;
     }
 
     /// Unfold the bar for a moment, to show a tab that just opened behind
@@ -2281,6 +2355,7 @@ impl BrowserApp {
             return;
         }
         self.chrome_open = true;
+        self.tab_line_flash = None;
         self.peek_pointer = self.pointer;
         self.arm_peek();
     }
@@ -2335,6 +2410,105 @@ impl BrowserApp {
         }
     }
 
+    /// The tab line's plate: the corner control's own height and row,
+    /// running from the bar's far end up to the dot. Folded, the dot and the
+    /// line are the bar's tab row in miniature.
+    fn tab_line_rect(&self) -> Rect {
+        let (cx, cy) = self.dot_center();
+        let x = self.bar().x + (DOT_INSET - DOT_R);
+        let right = cx - DOT_R - item_gap();
+        Rect { x, y: cy - DOT_R, width: (right - x).max(0.0), height: 2.0 * DOT_R }
+    }
+
+    /// Whether the tab line is up. Only while the bar is folded — open, its
+    /// own tab row says the same — and then as `browser.tab-line` says.
+    fn tab_line_shown(&self) -> bool {
+        if self.chrome_open || self.chrome_t > 0.0 {
+            return false;
+        }
+        match self.settings.tab_line {
+            settings::TabLine::Never => false,
+            settings::TabLine::Switching => {
+                self.tab_line_flash.is_some_and(|at| std::time::Instant::now() < at)
+            }
+            settings::TabLine::Multiple => self.host.tab_count() > 1,
+            settings::TabLine::Always => true,
+        }
+    }
+
+    /// What a live tab line has under `(x, y)`: `None` off it, `Some(None)`
+    /// between tabs, `Some(Some(i))` tab `i`. Live means up for good
+    /// (`multiple`, `always`): a flash on a switch is a display, there for
+    /// less than a second, and never takes a click aimed at the page.
+    fn tab_line_at(&self, x: f32, y: f32) -> Option<Option<usize>> {
+        let live = matches!(self.settings.tab_line, settings::TabLine::Multiple | settings::TabLine::Always);
+        if !live || !self.tab_line_shown() {
+            return None;
+        }
+        let line = self.tab_line_rect();
+        if !line.contains(x, y) {
+            return None;
+        }
+        let pills = tab_line_pills(&line, self.host.tab_count(), self.host.active_index());
+        Some(pills.into_iter().find(|(_, r)| r.contains(x, y)).map(|(i, _)| i))
+    }
+
+    /// Note which tab is in front. When it changed and the bar was not out
+    /// to show it happen, a `switching` tab line comes up for a moment —
+    /// how a tab switched by key, closed, or opened in front is seen with
+    /// the bar folded.
+    fn note_front_tab(&mut self) {
+        let front = front_tab(&self.host);
+        let was = std::mem::replace(&mut self.tab_line_front, front);
+        if was == front || self.settings.tab_line != settings::TabLine::Switching {
+            return;
+        }
+        if self.chrome_open || self.chrome_t > 0.0 {
+            return;
+        }
+        self.tab_line_flash = Some(std::time::Instant::now() + TAB_LINE_FLASH);
+        // An idle page turns no loop when the time is up.
+        let tx = self.sender.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(TAB_LINE_FLASH);
+            let _ = tx.send(Message::Spin);
+        });
+    }
+
+    /// Forget a flash whose time is up. Returns whether the line went.
+    fn settle_tab_line(&mut self) -> bool {
+        match self.tab_line_flash {
+            Some(at) if std::time::Instant::now() >= at => {
+                self.tab_line_flash = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The wheel over a live tab line moves through the tabs, a notch a tab,
+    /// down to the right, and stops at either end — qutebrowser's
+    /// `tabs.mousewheel_switching`, which is Qt's tab bar. A trackpad's
+    /// pixels add up to a tab a notch's worth at a time.
+    fn tab_line_wheel(&mut self, delta: &MouseScrollDelta) {
+        let travel = match delta {
+            MouseScrollDelta::LineDelta(_, y) => -*y as f64,
+            MouseScrollDelta::PixelDelta(p) => -p.y / LINE_PX,
+        };
+        self.tab_line_wheel_rest += travel;
+        let steps = self.tab_line_wheel_rest.trunc();
+        self.tab_line_wheel_rest -= steps;
+        let count = self.host.tab_count();
+        if steps == 0.0 || count == 0 {
+            return;
+        }
+        let cur = self.host.active_index();
+        let to = (cur as i64 + steps as i64).clamp(0, count as i64 - 1) as usize;
+        if to != cur {
+            self.switch_tab(to);
+        }
+    }
+
     /// The page fills the whole window; the utility bar floats above it.
     fn content_px(&self) -> (u32, u32) {
         (
@@ -2356,6 +2530,9 @@ impl BrowserApp {
                 );
             }
         }
+        // Every change of the tab set comes through here, the engine's own
+        // included (a page opening a tab in front reaches it as dirty).
+        self.note_front_tab();
     }
 
     /// Adopt whatever the engine is blocked on. Returns whether the chrome
@@ -2747,6 +2924,10 @@ impl BrowserApp {
         if let Some(url) = parse_url_input(&self.url.text, &self.settings.search_prefix) {
             if std::mem::take(&mut self.url_new_tab) {
                 self.host.open_tab(url);
+                // Noted while the bar that showed it is still out: the
+                // switch was watched, so it is no flash when the load's
+                // signals sync the page state after the fold.
+                self.note_front_tab();
                 self.persist_session();
             } else {
                 self.host.load(url);
@@ -2942,6 +3123,64 @@ impl BrowserApp {
         self.url_focused = false;
         self.sync_page_state();
         self.persist_session();
+    }
+
+    /// What a tab is called on the bar and the tab line: its page's title,
+    /// else its address, else "New Tab".
+    fn tab_title(&self, i: usize) -> String {
+        let tab = self.host.tab(i);
+        tab.and_then(|t| t.title.clone().filter(|s| !s.is_empty()))
+            .or_else(|| tab.and_then(|t| t.url.clone()).map(|u| u.to_string()))
+            .filter(|s| s != "about:blank")
+            .unwrap_or_else(|| "New Tab".to_string())
+    }
+
+    /// The tab line, when it is up (`tab_line_shown`): a plate of the
+    /// bar's material beside the corner control, holding `n: title` pills
+    /// as qutebrowser's tab bar does — the bar's own tab colors, the one in
+    /// front lifted, a loading tab underlined.
+    fn paint_tab_line(&self, pc: &mut PaintCtx) {
+        if !self.tab_line_shown() {
+            return;
+        }
+        let line = self.tab_line_rect();
+        if line.width < TAB_LINE_MIN_W {
+            return;
+        }
+        pc.plate(
+            line,
+            (TAB_LINE_R, TAB_LINE_R, TAB_LINE_R, TAB_LINE_R),
+            &cce_ui::scene::Material::from_fill(BAR_FILL),
+            cce_ui::layout::bevel_width().min(3.0),
+        );
+        let active = self.host.active_index();
+        let lf = &self.label_font;
+        for (i, pill) in tab_line_pills(&line, self.host.tab_count(), active) {
+            let front = i == active;
+            pc.rounded_rect(
+                pill,
+                TAB_LINE_PILL_R,
+                (true, true, true, true),
+                if front { TAB_ACTIVE_BG } else { TAB_BG },
+            );
+            let text = format!("{}: {}", i + 1, self.tab_title(i));
+            let label = Self::fit_text(&text, &lf.family, lf.size, pill.width - 2.0 * tab_line_pad());
+            pc.text_with(
+                label,
+                pill.x + tab_line_pad(),
+                cce_ui::layout::align_text_y(pill.y, pill.height, lf.size, 0.0),
+                lf.size,
+                if front { TEXT } else { TEXT_LABEL },
+                lf.draw_family(),
+                None,
+            );
+            if self.host.tab(i).is_some_and(|t| t.loading) {
+                pc.quad(
+                    Rect { x: pill.x, y: pill.y + pill.height - 2.0, width: pill.width, height: 2.0 },
+                    ACCENT,
+                );
+            }
+        }
     }
 
     /// Widest prefix of `text` fitting `avail`, with a "…"-style tail cut.
@@ -4082,11 +4321,17 @@ impl BrowserApp {
     }
 
     /// Where the status line goes: the bottom-left corner, clear of the
-    /// dot (which is on the right), lifted over a bottom bar while it shows.
+    /// dot (which is on the right), lifted over a bottom bar — or a bottom
+    /// tab line — while it shows.
     fn vi_line_rect(&self, width: f32) -> Rect {
         let mut y = self.win.1 - bar_margin() - VI_LINE_H;
-        if self.settings.bar_position == settings::BarPosition::Bottom && self.chrome_ease() > 0.0 {
-            y = y.min(self.chrome_plate().0.y - item_gap() - VI_LINE_H);
+        if self.settings.bar_position == settings::BarPosition::Bottom {
+            if self.chrome_ease() > 0.0 {
+                y = y.min(self.chrome_plate().0.y - item_gap() - VI_LINE_H);
+            }
+            if self.tab_line_shown() {
+                y = y.min(self.tab_line_rect().y - item_gap() - VI_LINE_H);
+            }
         }
         let width = width.min(self.win.0 - 2.0 * bar_margin()).max(0.0);
         Rect { x: bar_margin(), y, width, height: VI_LINE_H }
@@ -4274,6 +4519,9 @@ impl Application for BrowserApp {
         let bookmarks = host.bookmarks();
         let font_system = cce_ui::create_font_system();
         let label_font = label_font(font_system.db(), &cce_ui::layout::read_preferred_fonts().0);
+        // Taken now, so the first switch is told from the restored front tab
+        // rather than taken for where the line starts counting.
+        let tab_line_front = front_tab(&host);
         Self {
             host,
             seen_renderer: false,
@@ -4293,6 +4541,9 @@ impl Application for BrowserApp {
             page_press_settle: None,
             peek_pointer: (0.0, 0.0),
             dot_hover: false,
+            tab_line_front,
+            tab_line_flash: None,
+            tab_line_wheel_rest: 0.0,
             loading: true,
             title: None,
             #[cfg(feature = "wpe")]
@@ -4467,7 +4718,37 @@ impl Application for BrowserApp {
                     self.open_background_tab(url);
                     *needs_rebuild = true;
                 }
+                // A window a page opened (`window.open`, a `target=_blank`
+                // link) is a tab, in front: the person clicked for it. One an
+                // agent's click opened stays behind, like the menus above.
+                #[cfg(feature = "wpe")]
+                if let Some(index) = self.host.adopt_popups() {
+                    if self.agent_pressed {
+                        let id = self.host.tab(index).map_or(0, |t| t.id);
+                        self.agent_notes
+                            .push(format!("That opened a new tab, behind the one shown (tabId {id})."));
+                        self.sync_page_state();
+                        self.persist_session();
+                    } else {
+                        self.switch_tab(index);
+                    }
+                    *needs_rebuild = true;
+                }
+                // A page closing the window it was opened in. Never the last
+                // tab: a page does not get to quit the browser.
+                #[cfg(feature = "wpe")]
+                for id in self.host.take_page_closes() {
+                    if let Some(index) = self.host.index_of(id) {
+                        if self.host.tab_count() > 1 {
+                            let _ = self.close_tab(index);
+                            *needs_rebuild = true;
+                        }
+                    }
+                }
                 if self.settle_peek() {
+                    *needs_rebuild = true;
+                }
+                if self.settle_tab_line() {
                     *needs_rebuild = true;
                 }
                 if self.host.take_download_started() {
@@ -4951,7 +5232,7 @@ impl Application for BrowserApp {
             self.fav_hover = over_fav;
             *_needs_rebuild = true;
         }
-        if !self.chrome_hit(pos.x, pos.y) {
+        if !self.chrome_hit(pos.x, pos.y) && self.tab_line_at(pos.x, pos.y).is_none() {
             let s = self.scale as f32;
             self.host.mouse_move(pos.x * s, pos.y * s);
         }
@@ -5234,6 +5515,21 @@ impl Application for BrowserApp {
             return None;
         }
 
+        // A tab line up for good is a tab bar: a click shows that tab, a
+        // middle-click closes it (qutebrowser's), and nothing pressed on the
+        // line — between tabs included — reaches the page under it.
+        if let Some(hit) = self.tab_line_at(pos.x, pos.y) {
+            if pressed {
+                *needs_rebuild = true;
+                match (button, hit) {
+                    (MouseButton::Left, Some(i)) => self.switch_tab(i),
+                    (MouseButton::Middle, Some(i)) => return self.close_tab(i),
+                    _ => {}
+                }
+            }
+            return None;
+        }
+
         // Page area: a click folds the menu (and URL-bar focus with it),
         // then goes to the page. Not a peek, which folds on its own: a run
         // of middle-clicked links keeps it out rather than flapping it.
@@ -5326,6 +5622,11 @@ impl Application for BrowserApp {
             return;
         }
         if self.chrome_hit(pos.x, pos.y) {
+            return;
+        }
+        if self.tab_line_at(pos.x, pos.y).is_some() {
+            self.tab_line_wheel(delta);
+            *needs_rebuild = true;
             return;
         }
         // A wheel notch eases instead of jumping, through the same model
@@ -5742,6 +6043,8 @@ impl Application for BrowserApp {
         // Open: the bar's contents, laid out at their final positions and
         // clipped to the plate, so they are revealed as it unfolds.
         if e > 0.0 {
+            // Ahead of the closure, which also borrows the font system.
+            let titles: Vec<String> = (0..self.host.tab_count()).map(|i| self.tab_title(i)).collect();
             pc.clip_rounded(plate, radius, |pc| {
                 if self.loading {
                     pc.quad(
@@ -5763,11 +6066,7 @@ impl Application for BrowserApp {
                     if is_active { TAB_ACTIVE_BG } else { TAB_BG },
                 );
                 let tab = self.host.tab(i);
-                let title = tab
-                    .and_then(|t| t.title.clone().filter(|s| !s.is_empty()))
-                    .or_else(|| tab.and_then(|t| t.url.clone()).map(|u| u.to_string()))
-                    .filter(|s| s != "about:blank")
-                    .unwrap_or_else(|| "New Tab".to_string());
+                let title = &titles[i];
                 let close = tab_close_rect(&pill);
                 let text_avail = pill.width - 2.0 * text_pad() - close.map_or(0.0, |_| TAB_CLOSE_W - 4.0);
                 let lf = &self.label_font;
@@ -5882,6 +6181,7 @@ impl Application for BrowserApp {
             Some(2.0),
         );
 
+        self.paint_tab_line(&mut pc);
         self.paint_vi(&mut pc, &sans);
         self.paint_bm_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
@@ -6080,6 +6380,44 @@ mod tests {
         m.filter();
         m.step(1, 3);
         assert_eq!(m.selected, 0);
+    }
+
+    #[test]
+    fn the_tab_line_shares_out_its_width_and_keeps_the_front_tab_in_view() {
+        let line = Rect { x: 10.0, y: 0.0, width: 1000.0, height: 28.0 };
+        let inset = tab_line_inset();
+        let inner = (line.x + inset, line.x + line.width - inset);
+
+        // A few tabs share the line evenly, in order, inside the rim.
+        let pills = tab_line_pills(&line, 3, 0);
+        assert_eq!(pills.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1, 2]);
+        let w = pills[0].1.width;
+        assert!(pills.iter().all(|(_, r)| (r.width - w).abs() < 0.01 && r.height == 28.0 - 2.0 * inset));
+        assert!((pills[0].1.x - inner.0).abs() < 0.01);
+        let last = pills[2].1;
+        assert!((last.x + last.width - inner.1).abs() < 0.01);
+
+        // Too many for TAB_LINE_MIN_W: a run that fits, with the front tab
+        // in it — centred, or against whichever end it is near.
+        let fit = (((line.width - 2.0 * inset + inset) / (TAB_LINE_MIN_W + inset)).floor()) as usize;
+        for active in [0, 20, 59] {
+            let pills = tab_line_pills(&line, 60, active);
+            assert_eq!(pills.len(), fit);
+            assert!(pills.iter().all(|(_, r)| r.width >= TAB_LINE_MIN_W));
+            let shown: Vec<usize> = pills.iter().map(|(i, _)| *i).collect();
+            assert!(shown.contains(&active), "front tab {active} not in {shown:?}");
+            assert!(shown.windows(2).all(|p| p[1] == p[0] + 1));
+            assert!(*shown.last().unwrap() < 60);
+        }
+        assert_eq!(tab_line_pills(&line, 60, 0)[0].0, 0);
+        assert_eq!(tab_line_pills(&line, 60, 59).last().unwrap().0, 59);
+        let mid = tab_line_pills(&line, 60, 20);
+        assert_eq!(mid[0].0, 20 - fit / 2);
+
+        // Nothing to show, and a line too narrow for one tab still gets one.
+        assert!(tab_line_pills(&line, 0, 0).is_empty());
+        let narrow = Rect { width: 30.0, ..line };
+        assert_eq!(tab_line_pills(&narrow, 5, 3).iter().map(|(i, _)| *i).collect::<Vec<_>>(), [3]);
     }
 
     #[test]
