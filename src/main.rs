@@ -67,7 +67,7 @@ fn bar_margin() -> f32 {
 }
 
 /// Inset from a plate's rim to its content — the bar's, and every popover's
-/// (bookmarks, accounts, the context menu, a modal).
+/// (bookmarks, accounts, a select's list, a modal).
 fn plate_pad() -> f32 {
     cce_ui::layout::plate_padding()
 }
@@ -535,27 +535,15 @@ impl Modal {
     }
 }
 
-/// The right-click menu, drawn by the chrome at the pointer.
-///
-/// Not modal: the page is not blocked (unlike a script dialog), so this only
-/// intercepts input for as long as it is open, and any click outside closes
-/// it and is otherwise swallowed.
-#[cfg(feature = "wpe")]
-struct CtxMenu {
-    items: Vec<CtxItem>,
-    /// Top-left corner, already clamped to the window.
-    pos: (f32, f32),
-}
-
-#[cfg(feature = "wpe")]
-struct CtxItem {
-    label: String,
-    action: CtxAction,
-    enabled: bool,
-}
-
+/// What a row of the right-click menu does. The menu itself is the shared
+/// one (`cce_ui::widget::context_menu`); the browser keeps these beside its
+/// labels, as `ctx_actions`, and runs the row the menu hands back.
+#[cfg_attr(test, derive(Debug, PartialEq))]
 #[cfg(feature = "wpe")]
 enum CtxAction {
+    /// A `"-"` row: engraved and inert. Keeps the actions parallel to the
+    /// rows, so a row index names its action.
+    Separator,
     Back,
     Forward,
     Reload,
@@ -573,35 +561,90 @@ enum CtxAction {
     ToggleFavorite,
 }
 
+/// The shared menu's target. The browser has no widget tree and runs its own
+/// rows, so the menu's built-in actions never run; the id is a placeholder.
 #[cfg(feature = "wpe")]
-const CTX_ROW_H: f32 = 24.0;
+const CTX_NO_TARGET: cce_ui::widget::WidgetId = cce_ui::widget::WidgetId(0);
+
+/// What the right-click menu's page rows depend on, read from the shown tab.
 #[cfg(feature = "wpe")]
-const CTX_W: f32 = 200.0;
+struct CtxPage {
+    can_go_back: bool,
+    can_go_forward: bool,
+    favorited: bool,
+    /// The page can go on the favorites strip (or already is on it).
+    saveable: bool,
+}
+
+/// The right-click menu's rows: labels, their actions and which are
+/// disabled, all parallel. Groups — the link, the image, the selection or
+/// field, then the page's navigation, then the page itself — with a `"-"`
+/// separator between each two. Rows that cannot run now (Back with no
+/// history, Forward with nothing ahead, Add to Favorites on a page that
+/// cannot be saved) are disabled: the shared menu draws them dim, never
+/// highlights them and runs nothing on a press.
+#[cfg(feature = "wpe")]
+struct CtxRows {
+    labels: Vec<String>,
+    actions: Vec<CtxAction>,
+    disabled: Vec<bool>,
+}
 
 #[cfg(feature = "wpe")]
-impl CtxMenu {
-    fn rect(&self) -> Rect {
-        Rect {
-            x: self.pos.0,
-            y: self.pos.1,
-            width: CTX_W,
-            height: plate_pad() * 2.0 + self.items.len() as f32 * CTX_ROW_H,
+impl CtxRows {
+    fn build(info: wpe::ContextMenuInfo, page: CtxPage) -> Self {
+        let mut groups: Vec<Vec<(&str, CtxAction, bool)>> = Vec::new();
+        if let Some((uri, _label)) = info.link {
+            groups.push(vec![
+                ("Open Link in New Tab", CtxAction::OpenInTab(uri.clone()), true),
+                ("Copy Link", CtxAction::CopyText(uri.clone()), true),
+                ("Download Link", CtxAction::Download(uri), true),
+            ]);
         }
-    }
-
-    fn row_rect(&self, i: usize) -> Rect {
-        // style: deliberate — a 2px hairline keeps the row highlight off the
-        // plate's roll; the rung padding is the vertical one.
-        Rect {
-            x: self.pos.0 + 2.0,
-            y: self.pos.1 + plate_pad() + i as f32 * CTX_ROW_H,
-            width: CTX_W - 4.0,
-            height: CTX_ROW_H,
+        if let Some(uri) = info.image_uri {
+            groups.push(vec![
+                ("Copy Image Address", CtxAction::CopyText(uri.clone()), true),
+                ("Download Image", CtxAction::Download(uri), true),
+            ]);
         }
-    }
+        let mut edit = Vec::new();
+        if info.is_selection {
+            edit.push(("Copy", CtxAction::CopySelection, true));
+        }
+        if info.is_editable {
+            edit.push(("Paste", CtxAction::Paste, true));
+        }
+        if !edit.is_empty() {
+            groups.push(edit);
+        }
+        groups.push(vec![
+            ("Back", CtxAction::Back, page.can_go_back),
+            ("Forward", CtxAction::Forward, page.can_go_forward),
+            ("Reload", CtxAction::Reload, true),
+        ]);
+        groups.push(vec![
+            (
+                if page.favorited { "Remove from Favorites" } else { "Add to Favorites" },
+                CtxAction::ToggleFavorite,
+                page.saveable,
+            ),
+            ("Open in Other Browser", CtxAction::OpenExternal, true),
+        ]);
 
-    fn item_at(&self, x: f32, y: f32) -> Option<usize> {
-        (0..self.items.len()).find(|&i| self.row_rect(i).contains(x, y))
+        let mut rows = CtxRows { labels: Vec::new(), actions: Vec::new(), disabled: Vec::new() };
+        for (g, group) in groups.into_iter().enumerate() {
+            if g > 0 {
+                rows.labels.push("-".to_string());
+                rows.actions.push(CtxAction::Separator);
+                rows.disabled.push(false);
+            }
+            for (label, action, enabled) in group {
+                rows.labels.push(label.to_string());
+                rows.actions.push(action);
+                rows.disabled.push(!enabled);
+            }
+        }
+        rows
     }
 }
 
@@ -1060,9 +1103,11 @@ struct BrowserApp {
     /// for them, which is why they were listed as "not implemented".
     #[cfg(feature = "wpe")]
     modal: Option<Modal>,
-    /// Open right-click menu, if any.
+    /// The right-click menu's rows, parallel to the labels it was shown with,
+    /// and the shared menu's `generation()` of that `show`. Open while
+    /// `ctx_menu_open`; a pick is run only when its generation is this one.
     #[cfg(feature = "wpe")]
-    ctx_menu: Option<CtxMenu>,
+    ctx_actions: Option<(u64, Vec<CtxAction>)>,
     #[cfg(feature = "wpe")]
     opt_menu: Option<OptMenu>,
     /// Kept so the WPE backend's calloop sources can fire `Spin`; Servo
@@ -2537,58 +2582,68 @@ impl BrowserApp {
         }
     }
 
-    /// Build the right-click menu from what the hit test found, placed at
-    /// the pointer and clamped to the window.
+    /// Build the right-click menu from what the hit test found and show it
+    /// as the shared context menu, its top-left at the pointer. No clamping:
+    /// on a toplevel the runner hosts the menu in its own popup, which the
+    /// compositor keeps on the output (flipped up, slid in, or cut short and
+    /// scrolling), and in a window the runner constrains it to the frame.
     #[cfg(feature = "wpe")]
     fn open_ctx_menu(&mut self, info: wpe::ContextMenuInfo) {
-        let mut items = Vec::new();
-        let item = |label: &str, action: CtxAction, enabled: bool| CtxItem {
-            label: label.to_string(),
-            action,
-            enabled,
-        };
-        if let Some((uri, _label)) = info.link {
-            items.push(item("Open Link in New Tab", CtxAction::OpenInTab(uri.clone()), true));
-            items.push(item("Copy Link", CtxAction::CopyText(uri.clone()), true));
-            items.push(item("Download Link", CtxAction::Download(uri), true));
-        }
-        if let Some(uri) = info.image_uri {
-            items.push(item("Copy Image Address", CtxAction::CopyText(uri.clone()), true));
-            items.push(item("Download Image", CtxAction::Download(uri), true));
-        }
-        if info.is_selection {
-            items.push(item("Copy", CtxAction::CopySelection, true));
-        }
-        if info.is_editable {
-            items.push(item("Paste", CtxAction::Paste, true));
-        }
-        items.push(item("Back", CtxAction::Back, self.host.can_go_back()));
-        items.push(item("Forward", CtxAction::Forward, self.host.can_go_forward()));
-        items.push(item("Reload", CtxAction::Reload, true));
         let favorited = self.host.active_favorited();
-        items.push(item(
-            if favorited { "Remove from Favorites" } else { "Add to Favorites" },
-            CtxAction::ToggleFavorite,
-            favorited || self.saveable(),
-        ));
-        items.push(item("Open in Other Browser", CtxAction::OpenExternal, true));
-
-        let h = plate_pad() * 2.0 + items.len() as f32 * CTX_ROW_H;
-        let pos = (
-            self.pointer.0.min(self.win.0 - CTX_W - bar_margin()).max(0.0),
-            self.pointer.1.min(self.win.1 - h - bar_margin()).max(0.0),
+        let rows = CtxRows::build(
+            info,
+            CtxPage {
+                can_go_back: self.host.can_go_back(),
+                can_go_forward: self.host.can_go_forward(),
+                favorited,
+                saveable: favorited || self.saveable(),
+            },
         );
-        self.ctx_menu = Some(CtxMenu { items, pos });
+        cce_ui::widget::context_menu::show(self.pointer.0, self.pointer.1, rows.labels, 0, CTX_NO_TARGET);
+        cce_ui::widget::context_menu::set_rows_disabled(rows.disabled);
+        self.ctx_actions = Some((cce_ui::widget::context_menu::generation(), rows.actions));
+    }
+
+    /// Whether the right-click menu is up: the shared menu is showing the
+    /// rows this app gave it. The runner may have closed it since (Escape,
+    /// the popup dismissed), which is why this asks the menu.
+    #[cfg(feature = "wpe")]
+    fn ctx_menu_open(&self) -> bool {
+        use cce_ui::widget::context_menu;
+        context_menu::is_visible()
+            && self.ctx_actions.as_ref().is_some_and(|(g, _)| *g == context_menu::generation())
     }
 
     #[cfg(feature = "wpe")]
-    fn dispatch_ctx_action(&mut self, index: usize) {
-        let Some(menu) = self.ctx_menu.take() else { return };
-        let Some(it) = menu.items.get(index) else { return };
-        if !it.enabled {
-            return;
+    fn close_ctx_menu(&mut self) {
+        if self.ctx_menu_open() {
+            cce_ui::widget::context_menu::hide();
         }
-        match &it.action {
+        self.ctx_actions = None;
+    }
+
+    /// Run the row the menu handed back — a press, Enter or a screen
+    /// reader's Click on it (`context_menu::take_picked`) — when it was
+    /// picked from this app's rows. Once the menu is down the rows are
+    /// forgotten. `true` when the menu closed (a row ran or not), so the
+    /// chrome needs a redraw.
+    #[cfg(feature = "wpe")]
+    fn take_ctx_pick(&mut self) -> bool {
+        if self.ctx_actions.is_none() || self.ctx_menu_open() {
+            return false;
+        }
+        let Some((generation, actions)) = self.ctx_actions.take() else { return false };
+        let picked = cce_ui::widget::context_menu::take_picked().filter(|&(g, _)| g == generation);
+        if let Some(action) = picked.and_then(|(_, row)| actions.into_iter().nth(row)) {
+            self.dispatch_ctx_action(action);
+        }
+        true
+    }
+
+    #[cfg(feature = "wpe")]
+    fn dispatch_ctx_action(&mut self, action: CtxAction) {
+        match &action {
+            CtxAction::Separator => {}
             CtxAction::Back => self.host.back(),
             CtxAction::Forward => self.host.forward(),
             CtxAction::Reload => self.host.reload(),
@@ -3147,9 +3202,9 @@ impl BrowserApp {
         }
     }
 
-    /// Draw the bookmarks menu: the same plate-and-rows vocabulary as the
-    /// right-click menu, in three sections — what to do with this page, the
-    /// pages already saved, and the way out to the full collection.
+    /// Draw the bookmarks menu: a plate and rows, in three sections — what
+    /// to do with this page, the pages already saved, and the way out to the
+    /// full collection.
     fn paint_bm_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
         let Some(l) = self.bm_layout() else { return };
         // The field's marks are measured here, before painting borrows
@@ -3358,36 +3413,6 @@ impl BrowserApp {
                 1.5,
                 (true, true, true, true),
                 [0.6, 0.62, 0.66, 0.5],
-            );
-        }
-    }
-
-    /// Draw the right-click menu: a small plate at the pointer, rows with a
-    /// hover highlight, disabled rows dimmed. Same primitives as everything
-    /// else in this chrome.
-    #[cfg(feature = "wpe")]
-    fn paint_ctx_menu(&mut self, pc: &mut PaintCtx, sans: &str) {
-        let Some(menu) = self.ctx_menu.as_ref() else { return };
-        let r = menu.rect();
-        pc.plate(
-            r,
-            (8.0, 8.0, 8.0, 8.0),
-            &cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]),
-            cce_ui::layout::bevel_width().min(3.0),
-        );
-        let hovered = menu.item_at(self.pointer.0, self.pointer.1);
-        for (i, it) in menu.items.iter().enumerate() {
-            let row = menu.row_rect(i);
-            if hovered == Some(i) && it.enabled {
-                pc.rounded_rect(row, 5.0, (true, true, true, true), TAB_ACTIVE_BG);
-            }
-            let color = if it.enabled { TEXT } else { TEXT_DIM };
-            pc.text(
-                Self::fit_text(&it.label, sans, 13.0, row.width - 2.0 * text_pad()),
-                row.x + text_pad(),
-                cce_ui::layout::align_text_y(row.y, row.height, 13.0, 0.0),
-                13.0,
-                color,
             );
         }
     }
@@ -4273,7 +4298,7 @@ impl Application for BrowserApp {
             #[cfg(feature = "wpe")]
             modal: None,
             #[cfg(feature = "wpe")]
-            ctx_menu: None,
+            ctx_actions: None,
             #[cfg(feature = "wpe")]
             opt_menu: None,
             #[cfg(feature = "wpe")]
@@ -4718,6 +4743,13 @@ impl Application for BrowserApp {
             self.spin_queued = true;
             let _ = self.sender.send(Message::Spin);
         }
+        // A screen reader's Click on a context-menu row arrives between
+        // events, and so does a dismissal by the runner (Escape, the popup
+        // closed): run the one, forget the rows of the other.
+        #[cfg(feature = "wpe")]
+        if self.take_ctx_pick() {
+            *needs_rebuild = true;
+        }
         // The page's wheel glide, one frame's worth. It feeds the engine, so
         // the frame it produces is what actually redraws; asking for a
         // rebuild here is what keeps the loop turning until it lands.
@@ -4859,10 +4891,12 @@ impl Application for BrowserApp {
             return;
         }
         #[cfg(feature = "wpe")]
-        if self.ctx_menu.is_some() {
-            // Hover highlight tracks the pointer; the page underneath does
-            // not see moves while the menu is up.
-            *_needs_rebuild = true;
+        if self.ctx_menu_open() {
+            // The menu's highlight tracks the pointer; the page underneath
+            // does not see moves while the menu is up.
+            if cce_ui::widget::context_menu::cursor_moved(pos.x, pos.y) {
+                *_needs_rebuild = true;
+            }
             return;
         }
         // The account list tracks hover the same way, and shields the page
@@ -5018,16 +5052,22 @@ impl Application for BrowserApp {
             return None;
         }
 
-        // An open context menu owns the next click: on an item it dispatches,
-        // anywhere else it just closes — either way the click goes no further.
+        // An open context menu owns the next click: a left press on a row
+        // runs it, any other press just closes it (a disabled row, a
+        // separator, off the menu, another button) — either way the click
+        // goes no further. Releases are swallowed while it is up, so the
+        // right-click that opened it never completes on the page.
         #[cfg(feature = "wpe")]
-        if let Some(menu) = self.ctx_menu.as_ref() {
+        if self.ctx_menu_open() {
             if pressed {
                 *needs_rebuild = true;
-                match (button, menu.item_at(pos.x, pos.y)) {
-                    (MouseButton::Left, Some(i)) => self.dispatch_ctx_action(i),
-                    _ => self.ctx_menu = None,
+                cce_ui::widget::context_menu::mouse_input(button, state, pos.x, pos.y, None);
+                // The menu closes on every press (it has no slider or page
+                // rows to keep it up); make sure, then run what was picked.
+                if self.ctx_menu_open() {
+                    cce_ui::widget::context_menu::hide();
                 }
+                self.take_ctx_pick();
             }
             return None;
         }
@@ -5252,6 +5292,15 @@ impl Application for BrowserApp {
             }
             return;
         }
+        // The wheel over the context menu is the menu's (a menu cut short to
+        // fit scrolls its rows); anywhere else the page still scrolls under it.
+        #[cfg(feature = "wpe")]
+        if self.ctx_menu_open() && cce_ui::widget::context_menu::hit_test(pos.x, pos.y) {
+            if cce_ui::widget::context_menu::mouse_wheel(delta, pos.x, pos.y) {
+                *needs_rebuild = true;
+            }
+            return;
+        }
         // The account list moves with its field, so the page keeps the
         // wheel — but not under the plate itself.
         #[cfg(feature = "wpe")]
@@ -5373,11 +5422,29 @@ impl Application for BrowserApp {
             self.opt_reveal();
             return None;
         }
+        // An open context menu has the keyboard: Up/Down walk the rows that
+        // can run, Enter runs the highlighted one, and any other key closes
+        // it. Nothing reaches the page or the chrome's chords while it is up.
+        // (Escape never gets here: the runner closes the menu on it.)
         #[cfg(feature = "wpe")]
-        if self.ctx_menu.is_some() && event.state == ElementState::Pressed {
-            // Any key dismisses; Escape is just the one people will mean.
-            self.ctx_menu = None;
+        if self.ctx_menu_open() && event.state == ElementState::Pressed {
+            use cce_ui::widget::context_menu;
             *needs_rebuild = true;
+            match &event.logical_key {
+                Key::Named(NamedKey::ArrowDown) => {
+                    context_menu::step_hovered(1);
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    context_menu::step_hovered(-1);
+                }
+                Key::Named(NamedKey::Enter) => {
+                    if !context_menu::activate_hovered(None) {
+                        self.close_ctx_menu();
+                    }
+                    self.take_ctx_pick();
+                }
+                _ => self.close_ctx_menu(),
+            }
             return None;
         }
 
@@ -5823,8 +5890,13 @@ impl Application for BrowserApp {
         self.paint_save_offer(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_opt_menu(&mut pc, &sans);
+        // The right-click menu: the shared menu's plate and labels. Hosted in
+        // its popup (a toplevel), the runner paints it there and this draws
+        // nothing.
         #[cfg(feature = "wpe")]
-        self.paint_ctx_menu(&mut pc, &sans);
+        if self.ctx_menu_open() {
+            cce_ui::widget::context_menu::paint_with_labels(&mut pc);
+        }
         #[cfg(feature = "wpe")]
         self.paint_modal(&mut pc, &sans);
 
@@ -6051,6 +6123,90 @@ mod tests {
 
         // Sole user of this directory, so it can go whole.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "wpe")]
+    fn link_info(uri: &str) -> wpe::ContextMenuInfo {
+        wpe::ContextMenuInfo {
+            link: Some((uri.to_string(), None)),
+            image_uri: None,
+            is_selection: false,
+            is_editable: false,
+        }
+    }
+
+    #[cfg(feature = "wpe")]
+    const FRESH_TAB: CtxPage = CtxPage { can_go_back: false, can_go_forward: false, favorited: false, saveable: false };
+
+    #[cfg(feature = "wpe")]
+    #[test]
+    fn a_link_on_a_fresh_tab_dims_back_forward_and_favorites() {
+        let rows = CtxRows::build(link_info("file:///tmp/a.html"), FRESH_TAB);
+        assert_eq!(
+            rows.labels,
+            [
+                "Open Link in New Tab", "Copy Link", "Download Link", "-",
+                "Back", "Forward", "Reload", "-",
+                "Add to Favorites", "Open in Other Browser",
+            ]
+        );
+        assert_eq!(rows.disabled, [false, false, false, false, true, true, false, false, true, false]);
+        // Parallel: a row index names its action, separators included.
+        assert_eq!(rows.actions.len(), rows.labels.len());
+        assert_eq!(rows.actions[1], CtxAction::CopyText("file:///tmp/a.html".into()));
+        assert_eq!(rows.actions[3], CtxAction::Separator);
+        assert_eq!(rows.actions[6], CtxAction::Reload);
+
+        // With history both ways and a saved page, nothing is dim, and the
+        // favorites row offers the way back out.
+        let page = CtxPage { can_go_back: true, can_go_forward: true, favorited: true, saveable: true };
+        let info = wpe::ContextMenuInfo { link: None, image_uri: None, is_selection: true, is_editable: true };
+        let rows = CtxRows::build(info, page);
+        assert_eq!(
+            rows.labels,
+            ["Copy", "Paste", "-", "Back", "Forward", "Reload", "-", "Remove from Favorites", "Open in Other Browser"]
+        );
+        assert!(rows.disabled.iter().all(|d| !d));
+    }
+
+    /// The rows on the shared menu: a press on a disabled row (Back on a
+    /// fresh tab) only closes it, a press on a live one is handed back as
+    /// `(generation, row)`, and the keyboard steps over what cannot run.
+    #[cfg(feature = "wpe")]
+    #[test]
+    fn the_shared_menu_hands_back_only_rows_that_can_run() {
+        use cce_ui::widget::context_menu as cm;
+        let open = || {
+            let rows = CtxRows::build(link_info("https://example.com/"), FRESH_TAB);
+            cm::show(40.0, 40.0, rows.labels, 0, CTX_NO_TARGET);
+            cm::set_rows_disabled(rows.disabled);
+            (cm::generation(), rows.actions)
+        };
+        let press = |row: usize| {
+            let (x, y) = (cm::x() + 20.0, cm::row_y(row) + 4.0);
+            assert_eq!(cm::row_at(x, y), Some(row));
+            cm::mouse_input(MouseButton::Left, ElementState::Pressed, x, y, None);
+        };
+
+        let _ = open();
+        press(4); // Back
+        assert!(!cm::is_visible());
+        assert_eq!(cm::take_picked(), None);
+
+        let (generation, actions) = open();
+        press(1); // Copy Link
+        assert!(!cm::is_visible());
+        assert_eq!(cm::take_picked(), Some((generation, 1)));
+        assert_eq!(actions[1], CtxAction::CopyText("https://example.com/".into()));
+
+        // Up from the bottom: Open in Other Browser, then over the dim
+        // favorites row and the separator to Reload, then over Forward and
+        // Back to the link's rows.
+        let _ = open();
+        assert_eq!(cm::step_hovered(-1), Some(9));
+        assert_eq!(cm::step_hovered(-1), Some(6));
+        assert_eq!(cm::step_hovered(-1), Some(2));
+        cm::hide();
     }
 
     #[cfg(feature = "wpe")]

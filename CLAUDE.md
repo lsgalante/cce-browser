@@ -332,7 +332,8 @@ against the real engine. Points that are choices:
 
 ## The chrome is hand-rolled
 
-There are **no `cce-ui` widgets in this app**. The whole utility bar is emitted as
+There are **no `cce-ui` widgets in this app** (the one toolkit surface it borrows is
+the shared context menu, for the right-click menu — below). The whole utility bar is emitted as
 `PaintCtx` primitives in `display_list` (`display_list_text()` returns `true`), and
 every hit test in `handle_mouse_input` re-derives the same rects from the same
 `bar_rect`/`tab_rect`/`btn_rect`/`url_rect`/`fav_rects` helpers. **Draw and hit-test are two
@@ -498,6 +499,44 @@ Menu semantics, all in `handle_mouse_input` / `handle_key_input`:
 - Folding drops URL-bar focus (`close_chrome`), so an off-screen field never
   keeps eating keystrokes. Wheel and pointer moves over the chrome stay off the
   page, gated by `chrome_hit`, not `bar_rect`.
+
+### The right-click menu
+
+A right-click in the page (WebKit's `context-menu` signal, `take_context_menu`)
+shows the **shared context menu** (`cce_ui::widget::context_menu`), the one
+every cce app uses — its plate, menu font, hover tablet and placement — with
+rows the browser owns. `CtxRows::build` turns the hit test into the rows in
+groups (the link; the image; Copy / Paste; Back, Forward, Reload; favorites
+and Open in Other Browser), a `"-"` separator between each two, and
+`ctx_actions` keeps the `CtxAction`s parallel to the labels with the menu's
+`generation()` of that `show`. Points that are choices:
+
+- **Rows that cannot run now are shown disabled, not left out**: Back with no
+  history, Forward with nothing ahead, Add to Favorites on a page that cannot
+  be saved (`set_rows_disabled`). Dim, never highlighted, stepped over by the
+  keyboard; a press on one only closes the menu.
+- **The menu hands the row back; the browser runs it.** Presses go through
+  `context_menu::mouse_input` (no `UiContext`, the target is a placeholder
+  `CTX_NO_TARGET`), Enter through `activate_hovered`, and a screen reader's
+  Click lands the same way between events — all three end in `take_picked()`,
+  which `take_ctx_pick` runs when the generation is ours (from the press, the
+  key, and `tick`).
+- **It owns the pointer and the keyboard while up**: moves do not reach the
+  page, every press closes it and goes no further, releases are swallowed (so
+  the right-click that opened it never completes on the page); Up/Down walk
+  the rows that can run, Enter runs the highlighted one, any other key closes
+  it. Escape is the runner's (it closes the menu before the app sees it). The
+  wheel over the menu is the menu's; elsewhere the page still scrolls.
+- **Placed at the pointer, not clamped**: on a toplevel the runner hosts the
+  menu in its own `xdg_popup`, which the compositor keeps on the output
+  (flipped up, slid in, or cut short and scrolling), so it can reach past the
+  window's edge; with `CCE_UI_MENU_POPUP=0` it is drawn in `display_list`
+  (`paint_with_labels`) and constrained to the window.
+- `ctx_menu_open` asks the menu (`is_visible` and the generation), never only
+  `ctx_actions`: the runner closes the menu without telling the app.
+
+`a_link_on_a_fresh_tab_dims_back_forward_and_favorites` and
+`the_shared_menu_hands_back_only_rows_that_can_run` are the tests.
 
 ### Select lists
 
