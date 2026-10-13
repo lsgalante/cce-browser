@@ -1072,7 +1072,7 @@ dependencies = [
 [[package]]
 name = "cce-wpe"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-wpe.git?rev=ee3ca3d893f498cde87049fe1d8dcf244be33204#ee3ca3d893f498cde87049fe1d8dcf244be33204"
+source = "git+https://github.com/lsgalante/cce-wpe.git?rev=931be666110a9d2dc82071790750360a16558def#931be666110a9d2dc82071790750360a16558def"
 dependencies = [
  "bindgen",
  "cce-ui",
