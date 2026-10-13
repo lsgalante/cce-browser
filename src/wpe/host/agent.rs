@@ -212,22 +212,13 @@ impl WebKitHost {
 
     /// A precise wheel scroll in tab `index`: `dx`/`dy` in CSS pixels in
     /// cce-ui's convention (positive = toward the top / left), aimed at
-    /// `(x, y)` so whatever scrolls under that point is what moves.
+    /// `(x, y)` so whatever scrolls under that point is what moves. Always a
+    /// plain wheel: an agent's scroll is no gesture, and the phase cce-ui
+    /// published may be a real one's stale `FingerEnd`.
     pub fn agent_wheel(&self, index: usize, dx: f64, dy: f64, x: f64, y: f64) -> Result<(), String> {
         let view = self.tabs.get(index).map(|t| t.view).ok_or("no such tab")?;
         unsafe {
-            let e = wpe_event_scroll_new(
-                view,
-                WPEInputSource::WPE_INPUT_SOURCE_MOUSE,
-                input::now_ms(),
-                0,
-                dx,
-                dy,
-                1,
-                0,
-                x,
-                y,
-            );
+            let e = input::scroll_event(view, cce_ui::widget::ScrollPhase::Wheel, dx, dy, x, y);
             self.send(view, e);
         }
         Ok(())

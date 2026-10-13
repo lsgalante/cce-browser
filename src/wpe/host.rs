@@ -1977,39 +1977,16 @@ impl WebKitHost {
     }
 
     /// Wheel deltas in device pixels, in cce-ui's winit convention (positive
-    /// = scroll up), passed through **unchanged**.
-    ///
-    /// Measured, not assumed: WPE already inverts on the way to the DOM, so a
-    /// negation here double-inverts and the page scrolls backwards. An
-    /// earlier cut negated these and `examples/wpe_input` caught it — the
-    /// page reported `deltaY` of the wrong sign.
+    /// = scroll up), passed through unchanged in the gesture phase cce-ui
+    /// published for this dispatch — `input::scroll_event` has the sign
+    /// measurement and what each phase tells the engine.
     pub fn wheel(&self, dx_px: f64, dy_px: f64, x_px: f32, y_px: f32) {
-        // cce-ui publishes the gesture phase of the wheel event being
-        // dispatched: a trackpad's finger lift arrives as a zero delta in
-        // FingerEnd, which is WebKit's scroll-stop — the signal its own
-        // kinetic scrolling keys off. Finger phases report the touchpad
-        // source so the engine treats the deltas as a gesture, not clicks.
         let phase = cce_ui::widget::scroll_motion::current_scroll_phase();
-        let (source, is_stop) = match phase {
-            cce_ui::widget::ScrollPhase::Wheel => (WPEInputSource::WPE_INPUT_SOURCE_MOUSE, 0),
-            cce_ui::widget::ScrollPhase::Finger => (WPEInputSource::WPE_INPUT_SOURCE_TOUCHPAD, 0),
-            cce_ui::widget::ScrollPhase::FingerEnd => (WPEInputSource::WPE_INPUT_SOURCE_TOUCHPAD, 1),
-        };
+        let s = self.scale as f64;
         unsafe {
             let view = self.active_tab().view;
             let (x, y) = self.to_logical(x_px, y_px);
-            let e = wpe_event_scroll_new(
-                view,
-                source,
-                input::now_ms(),
-                0,
-                dx_px / self.scale as f64,
-                dy_px / self.scale as f64,
-                1, // precise deltas: these are pixels, not notches
-                is_stop,
-                x,
-                y,
-            );
+            let e = input::scroll_event(view, phase, dx_px / s, dy_px / s, x, y);
             self.send(view, e);
         }
     }
