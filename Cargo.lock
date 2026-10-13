@@ -990,8 +990,8 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "calloop",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=388473078207ff41208e8648c04499e94632f20a)",
- "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=8778d0a3f6840b8b3dc1050d89be4cedf6ac95e4)",
+ "cce-core",
+ "cce-ui",
  "cce-wpe",
  "dpi",
  "env_logger",
@@ -1025,20 +1025,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cce-core"
-version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-core.git?rev=5b8dcb30f1b0d7d607ab49d637069560eca0cb14#5b8dcb30f1b0d7d607ab49d637069560eca0cb14"
-dependencies = [
- "fluent-bundle",
- "kdl",
- "libc",
- "log",
- "serde_json",
- "unic-langid",
- "web-time",
-]
-
-[[package]]
 name = "cce-ui"
 version = "0.1.0"
 source = "git+https://github.com/lsgalante/cce-ui.git?rev=8778d0a3f6840b8b3dc1050d89be4cedf6ac95e4#8778d0a3f6840b8b3dc1050d89be4cedf6ac95e4"
@@ -1050,56 +1036,11 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=388473078207ff41208e8648c04499e94632f20a)",
+ "cce-core",
  "chrono",
  "cosmic-text",
  "cursor-icon",
  "dispatch2",
- "gpu-allocator",
- "js-sys",
- "kdl",
- "libc",
- "log",
- "naga",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "objc2-quartz-core",
- "png 0.17.16",
- "raw-window-handle",
- "resvg 0.41.0",
- "serde",
- "serde_json",
- "smithay-client-toolkit",
- "unicode-bidi",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-scanner",
- "web-sys",
- "web-time",
- "xkeysym",
-]
-
-[[package]]
-name = "cce-ui"
-version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=f4777b8acfc6271fe66500d2beb72b5eaf9c4258#f4777b8acfc6271fe66500d2beb72b5eaf9c4258"
-dependencies = [
- "accesskit 0.25.1",
- "ash",
- "bitflags 2.13.1",
- "bytemuck",
- "calloop",
- "calloop-wayland-source",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=5b8dcb30f1b0d7d607ab49d637069560eca0cb14)",
- "chrono",
- "cosmic-text",
- "cursor-icon",
- "dispatch2",
- "glam",
  "gpu-allocator",
  "js-sys",
  "kdl",
@@ -1131,10 +1072,10 @@ dependencies = [
 [[package]]
 name = "cce-wpe"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-wpe.git?rev=d2f700166ae0bbb5431f3e7660bd614a35672ede#d2f700166ae0bbb5431f3e7660bd614a35672ede"
+source = "git+https://github.com/lsgalante/cce-wpe.git?rev=a0de6fedb77f6890eec5d73886f42f3e4dfd714f#a0de6fedb77f6890eec5d73886f42f3e4dfd714f"
 dependencies = [
  "bindgen",
- "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=f4777b8acfc6271fe66500d2beb72b5eaf9c4258)",
+ "cce-ui",
  "log",
  "pkg-config",
  "rustix 0.38.44",
@@ -2751,12 +2692,6 @@ dependencies = [
  "log",
  "xml-rs",
 ]
-
-[[package]]
-name = "glam"
-version = "0.29.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8babf46d4c1c9d92deac9f7be466f76dfc4482b6452fc5024b5e8daf6ffeb3ee"
 
 [[package]]
 name = "gleam"
