@@ -226,6 +226,29 @@ fn tab_line_pills(line: &Rect, count: usize, active: usize) -> Vec<(usize, Rect)
         .collect()
 }
 
+/// Where the label with a tab's whole title goes, for a title `text_w` wide
+/// over `pill` on `line`: on the page's side of the line (above a bottom
+/// line, below a top one), an `item_gap` off it, as tall as the line. Its
+/// text starts where the pill's cut-down label does, so the whole name reads
+/// on from the same point, unless that would run it off the window; a title
+/// wider than the window is the caller's to cut.
+fn tab_tip_rect(
+    pill: &Rect,
+    line: &Rect,
+    text_w: f32,
+    win: (f32, f32),
+    position: settings::BarPosition,
+) -> Rect {
+    let width = text_w + 2.0 * text_pad();
+    let x = pill.x + tab_line_pad() - text_pad();
+    let x = x.min(win.0 - bar_margin() - width).max(bar_margin());
+    let y = match position {
+        settings::BarPosition::Top => line.y + line.height + item_gap(),
+        settings::BarPosition::Bottom => line.y - item_gap() - line.height,
+    };
+    Rect { x, y, width, height: line.height }
+}
+
 /// The tab in front, as the tab line tells a switch from a repaint: the WPE
 /// host's stable id. The retired Servo host has none, so its index stands
 /// in there, and a tab closed ahead of the front one reads as a switch.
@@ -350,6 +373,10 @@ const VI_MSG_TIME: std::time::Duration = std::time::Duration::from_secs(3);
 /// The vi status line: mode, pending keys, messages, the `:` line.
 const VI_LINE_H: f32 = 28.0;
 const VI_FONT: f32 = 13.0;
+/// The opaque plate of the chrome's floating labels — the vi status line, a
+/// tab's whole title over the tab line: text over any page at all needs a
+/// base the page cannot show through.
+const LABEL_PLATE: [f32; 4] = [0.13, 0.14, 0.16, 1.0];
 /// Hint labels over the page: qutebrowser's yellow, because a label has to
 /// read over any page at all, and the chrome's dark plates vanish into a
 /// dark one.
@@ -1165,6 +1192,10 @@ struct BrowserApp {
     tab_line_flash: Option<std::time::Instant>,
     /// Wheel travel over the tab line not yet worth a whole tab.
     tab_line_wheel_rest: f64,
+    /// The tab on a live tab line the pointer is over — a repaint, for the
+    /// label with its whole title (`paint_tab_tip`, which reads the pointer
+    /// itself).
+    tab_line_hover: Option<usize>,
     loading: bool,
     /// Page title; drives the toplevel title (the engine re-applies
     /// `settings().title` whenever it changes).
@@ -3183,6 +3214,42 @@ impl BrowserApp {
         }
     }
 
+    /// The whole title of the tab under the pointer on a live tab line, on a
+    /// label beside it (`tab_tip_rect`): a pill cuts its title to its width.
+    /// Read from the pointer, not the hover field, so it always matches what
+    /// is under it — after a close shifts the tabs, say. Not while a menu or
+    /// a dialog has the pointer.
+    fn paint_tab_tip(&self, pc: &mut PaintCtx) {
+        let Some(Some(i)) = self.tab_line_at(self.pointer.0, self.pointer.1) else { return };
+        #[cfg(feature = "wpe")]
+        if self.modal.is_some() || self.opt_menu.is_some() || self.ctx_menu_open() {
+            return;
+        }
+        let line = self.tab_line_rect();
+        let pills = tab_line_pills(&line, self.host.tab_count(), self.host.active_index());
+        let Some((_, pill)) = pills.into_iter().find(|(j, _)| *j == i) else { return };
+        let lf = &self.label_font;
+        let avail = self.win.0 - 2.0 * bar_margin() - 2.0 * text_pad();
+        let title = Self::fit_text(&self.tab_title(i), &lf.family, lf.size, avail);
+        let text_w = measure_text_width(&title, &lf.family, lf.size);
+        let r = tab_tip_rect(&pill, &line, text_w, self.win, self.settings.bar_position);
+        pc.plate(
+            r,
+            (TAB_LINE_R, TAB_LINE_R, TAB_LINE_R, TAB_LINE_R),
+            &cce_ui::scene::Material::opaque(LABEL_PLATE),
+            cce_ui::layout::bevel_width().min(3.0),
+        );
+        pc.text_with(
+            title,
+            r.x + text_pad(),
+            cce_ui::layout::align_text_y(r.y, r.height, lf.size, 0.0),
+            lf.size,
+            TEXT,
+            lf.draw_family(),
+            None,
+        );
+    }
+
     /// Widest prefix of `text` fitting `avail`, with a "…"-style tail cut.
     fn fit_text(text: &str, sans: &str, size: f32, avail: f32) -> String {
         if measure_text_width(text, sans, size) <= avail {
@@ -4366,7 +4433,7 @@ impl BrowserApp {
             }
         }
 
-        let material = cce_ui::scene::Material::opaque([0.13, 0.14, 0.16, 1.0]);
+        let material = cce_ui::scene::Material::opaque(LABEL_PLATE);
         let bevel = cce_ui::layout::bevel_width().min(3.0);
         if self.vi_mode == vi::Mode::Command {
             let r = self.vi_line_rect((self.win.0 * 0.5).clamp(320.0, 720.0));
@@ -4544,6 +4611,7 @@ impl Application for BrowserApp {
             tab_line_front,
             tab_line_flash: None,
             tab_line_wheel_rest: 0.0,
+            tab_line_hover: None,
             loading: true,
             title: None,
             #[cfg(feature = "wpe")]
@@ -5230,6 +5298,11 @@ impl Application for BrowserApp {
         };
         if over_fav != self.fav_hover {
             self.fav_hover = over_fav;
+            *_needs_rebuild = true;
+        }
+        let over_tab = self.tab_line_at(pos.x, pos.y).flatten();
+        if over_tab != self.tab_line_hover {
+            self.tab_line_hover = over_tab;
             *_needs_rebuild = true;
         }
         if !self.chrome_hit(pos.x, pos.y) && self.tab_line_at(pos.x, pos.y).is_none() {
@@ -6183,6 +6256,9 @@ impl Application for BrowserApp {
 
         self.paint_tab_line(&mut pc);
         self.paint_vi(&mut pc, &sans);
+        // Over the vi status line, which a label above a bottom line can
+        // reach; under every menu.
+        self.paint_tab_tip(&mut pc);
         self.paint_bm_menu(&mut pc, &sans);
         #[cfg(feature = "wpe")]
         self.paint_ac_menu(&mut pc, &sans);
@@ -6418,6 +6494,33 @@ mod tests {
         assert!(tab_line_pills(&line, 0, 0).is_empty());
         let narrow = Rect { width: 30.0, ..line };
         assert_eq!(tab_line_pills(&narrow, 5, 3).iter().map(|(i, _)| *i).collect::<Vec<_>>(), [3]);
+    }
+
+    #[test]
+    fn a_tabs_whole_title_sits_on_the_page_side_and_starts_where_its_pill_does() {
+        use settings::BarPosition::{Bottom, Top};
+        let win = (1200.0, 800.0);
+        let line = Rect { x: 20.0, y: 760.0, width: 1100.0, height: 28.0 };
+        let pill = Rect { x: 300.0, y: 763.0, width: 120.0, height: 22.0 };
+
+        // Above a bottom line, below a top one, a gap off it, as tall as it.
+        let up = tab_tip_rect(&pill, &line, 200.0, win, Bottom);
+        assert_eq!((up.y + up.height + item_gap(), up.height), (line.y, line.height));
+        let top = Rect { y: 20.0, ..line };
+        let down = tab_tip_rect(&pill, &top, 200.0, win, Top);
+        assert_eq!(down.y, top.y + top.height + item_gap());
+
+        // The whole title reads on from where the pill's cut one begins.
+        assert_eq!(up.x + text_pad(), pill.x + tab_line_pad());
+        assert_eq!(up.width, 200.0 + 2.0 * text_pad());
+
+        // Near the right edge it slides left to stay on the window; at the
+        // left edge it keeps the margin.
+        let right = Rect { x: 1100.0, ..pill };
+        let r = tab_tip_rect(&right, &line, 400.0, win, Bottom);
+        assert!((r.x + r.width - (win.0 - bar_margin())).abs() < 0.01);
+        let left = Rect { x: 0.0, ..pill };
+        assert_eq!(tab_tip_rect(&left, &line, 50.0, win, Bottom).x, bar_margin());
     }
 
     #[test]

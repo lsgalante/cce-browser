@@ -530,6 +530,14 @@ Browser page has it as "Tab Line". Points that are choices:
   (qutebrowser's `tabs.mousewheel_switching`), and nothing on the line
   reaches the page. A `switching` flash takes nothing: it appears on its own
   for less than a second, and a click aimed at the page must not land on it.
+- **Hovering a tab on a live line shows its whole title** on an opaque label
+  (`LABEL_PLATE`, the vi status line's) on the page's side of the line —
+  above a bottom line, below a top one (`tab_tip_rect`). The label's text
+  starts where the pill's cut-down one does, so the name reads on from the
+  same point; it slides left only to stay on the window. It is drawn from
+  the pointer (`paint_tab_tip`), not from `tab_line_hover`, which is only
+  the repaint trigger, so it never names a tab that a close shifted away
+  from under a still pointer. None while a menu or dialog has the pointer.
 - **Overlay, not layout.** qutebrowser takes the band away from the page;
   here the page stays full-bleed under all the chrome, so `always` covers a
   28px band of the page's top (or bottom). Reserving space would mean
