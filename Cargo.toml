@@ -55,7 +55,7 @@ png = { version = "0.17", optional = true }
 base64 = { version = "0.22", optional = true }
 # The WPE embedding shared with cce-mail (bindings, subclasses, GLib
 # source, input, damage, IME context); only with the `wpe` feature.
-cce-wpe = { git = "https://github.com/lsgalante/cce-wpe.git", rev = "931be666110a9d2dc82071790750360a16558def", optional = true }
+cce-wpe = { git = "https://github.com/lsgalante/cce-wpe.git", rev = "aaf6d97e2692d9bcf1f8ddd3e94e3656b45ceded", optional = true }
 
 # The desktop entry's Exec target: a forwarder that links (almost) nothing,
 # so the click-to-tab path skips the ~20ms of library loading the full
