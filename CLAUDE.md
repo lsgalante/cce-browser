@@ -635,6 +635,43 @@ side (both link kinds diverted, left-click undisturbed, the tab loading
 behind the page). On the retired Servo backend `open_background_tab` is an
 open followed by switching back, and page middle-clicks are not caught.
 
+### A page's windows are tabs
+
+`window.open` from a click, a left-clicked `target=_blank` link and a form
+with a target all reach WebKit's `create` signal, which wants a webview
+back. WPE has no window to give, and until 2026-10-13 nothing answered:
+every such window was null, and Google's sign-in popup — so "Continue with
+Google" on claude.ai — failed with "There was an error logging you in".
+`on_create` (`src/wpe/host.rs`) now builds one, queues it, and the `Spin`
+handler adopts it (`adopt_popups`) as a tab in front. Points that are
+choices:
+
+- **Built related to the opener** (`related-view`), so it shares the
+  opener's web process and `window.opener` works — that is how a sign-in
+  popup hands its answer back. `related-view` brings the display and
+  network session with it; passing them too draws a WebKit CRITICAL, which
+  is why `new_webview` has two `g_object_new` calls.
+- **Built inside the signal, adopted later.** The host is out of reach in a
+  signal handler, so everything a webview is built from sits in a shared
+  `Builder`, and every webview's `create` connection holds one. WebKit
+  loads the request into the returned view itself; the returned reference
+  is the tab's, dropped with it, as for any tab.
+- **Closing goes back to the opener** (`Tab::opener`, in `close_tab`), not
+  to the tab beside it: a sign-in popup closing itself lands on the site it
+  signed in to. It applies when the person closes such a tab too.
+- **`window.close()` is honoured only for a tab a page opened**
+  (`take_page_closes`), and never for the last tab: a page does not get to
+  close what the person opened, or to quit the browser.
+- **An agent's click opens behind** (`agent_pressed`), with a note naming
+  the new tab, like the menus an agent's press raises.
+- Popup blocking is WebKit's: `window.open` with no gesture behind it never
+  reaches `create`.
+
+`examples/wpe_popup.rs` proves it against the real engine (the blocked
+load-time open, `window.opener` and a message through it, `window.close()`,
+the return to the opener, `target=_blank`, and a page that may not close
+itself).
+
 ### Key routing
 
 `handle_key_input` is a three-stage funnel and the order is load-bearing: Ctrl chords

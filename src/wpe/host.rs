@@ -155,6 +155,31 @@ pub struct Tab {
     /// Under `CCE_BROWSER_DAMAGE_CHECK` only: the picture `image` should
     /// hold, patched region by region alongside it.
     mirror: Option<Vec<u8>>,
+    /// The tab whose page opened this one (`window.open`, a `target=_blank`
+    /// link), by id. Closing this tab goes back there, and only such a tab
+    /// may be closed by its own page.
+    opener: Option<u64>,
+}
+
+/// A window a page opened, built inside WebKit's `create` signal and held
+/// until [`WebKitHost::adopt_popups`] makes it a tab.
+struct Popup {
+    webview: *mut WebKitWebView,
+    view: *mut WPEView,
+    state: Rc<TabState>,
+    /// The webview whose page opened it.
+    opener: *mut WebKitWebView,
+}
+
+/// What building a webview takes, shared rather than borrowed from the host:
+/// a page's popup is built inside WebKit's `create` signal, where the host is
+/// out of reach, and every webview holds one of these for that signal.
+struct Builder {
+    display: *mut WPEDisplay,
+    toplevel: *mut WPEToplevel,
+    ucm: *mut WebKitUserContentManager,
+    session: *mut WebKitNetworkSession,
+    prompts: Rc<RefCell<Prompts>>,
 }
 
 impl Drop for Tab {
@@ -409,6 +434,8 @@ pub struct WebKitHost {
     vi_watcher: Option<*mut WebKitUserScript>,
     /// The id the next tab gets (`Tab::id`).
     next_tab_id: u64,
+    /// What every webview is built from, popups included.
+    builder: Rc<Builder>,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -545,6 +572,14 @@ impl WebKitHost {
             // constructor's size is already logical.
             wpe_toplevel_resized(toplevel, size_px.0 as i32, size_px.1 as i32);
 
+            let ucm = webkit_user_content_manager_new();
+            let builder = Rc::new(Builder {
+                display,
+                toplevel,
+                ucm,
+                session,
+                prompts: prompts.clone(),
+            });
             let mut host = Self {
                 display,
                 toplevel,
@@ -567,7 +602,7 @@ impl WebKitHost {
                 pending_draw: Cell::new(false),
                 prompts,
                 last_pixel: None,
-                ucm: webkit_user_content_manager_new(),
+                ucm,
                 watcher: None,
                 spare: None,
                 window_focused: false,
@@ -575,6 +610,7 @@ impl WebKitHost {
                 deadlock_watch: None,
                 vi_watcher: None,
                 next_tab_id: 1,
+                builder,
             };
             // The account watcher's channel, in its own script world. Both
             // halves are registered here, once, on the shared content
@@ -891,97 +927,7 @@ impl WebKitHost {
 
     fn build_webview(&self, url: &Url, state: &Rc<TabState>) -> (*mut WebKitWebView, *mut WPEView) {
         unsafe {
-            let (p_display, p_ucm, p_session) = (
-                cstr("display"),
-                cstr("user-content-manager"),
-                cstr("network-session"),
-            );
-            let wv = g_object_new(
-                webkit_web_view_get_type(),
-                p_display.as_ptr(),
-                self.display,
-                p_ucm.as_ptr(),
-                self.ucm,
-                p_session.as_ptr(),
-                self.session,
-                std::ptr::null::<c_char>(),
-            ) as *mut WebKitWebView;
-            set_features(wv);
-            let view = webkit_web_view_get_wpe_view(wv);
-            wpe_view_set_toplevel(view, self.toplevel);
-            // Signals, not polling: a background tab has to be able to report
-            // its title without anyone asking the active webview.
-            for sig in ["notify::title", "notify::uri", "notify::is-loading"] {
-                connect_notify(wv, sig, state);
-            }
-            // A dead or hung WebProcess. The first gets an error page in
-            // `pump`; the second is offered to the chrome to ask about.
-            connect_state(wv, "web-process-terminated", on_terminated as *const () as usize, state);
-            connect_state(
-                wv,
-                "notify::is-web-process-responsive",
-                on_responsive as *const () as usize,
-                state,
-            );
-            // A page's alert/confirm/prompt, and HTTP auth challenges. Both
-            // are held open and answered later, so the chrome can draw a real
-            // dialog rather than the handler having to decide inline.
-            connect_raw(
-                wv,
-                "script-dialog",
-                on_script_dialog as *const () as usize,
-                &self.prompts,
-            );
-            connect_raw(
-                wv,
-                "authenticate",
-                on_authenticate as *const () as usize,
-                &self.prompts,
-            );
-            // Right-click reaches the page as button 3; if the page does not
-            // preventDefault, WebKit asks for a menu here. Returning TRUE
-            // claims presentation, so the chrome draws it.
-            connect_raw(
-                wv,
-                "context-menu",
-                on_context_menu as *const () as usize,
-                &self.prompts,
-            );
-            // A `<select>` asking to open. WPE draws no popup of its own: a
-            // select nobody answers here simply never opens.
-            connect_raw(
-                wv,
-                "show-option-menu",
-                on_show_option_menu as *const () as usize,
-                &self.prompts,
-            );
-            // A middle-clicked link is a background tab, not a navigation.
-            connect_raw(
-                wv,
-                "decide-policy",
-                on_decide_policy as *const () as usize,
-                &self.prompts,
-            );
-            // Find-in-page answers on the controller, not the view.
-            let fc = webkit_web_view_get_find_controller(wv);
-            for (signal, cb) in [
-                ("found-text", on_found_text as *const () as usize),
-                ("failed-to-find-text", on_failed_to_find as *const () as usize),
-            ] {
-                let name = cstr(signal);
-                g_signal_connect_data(
-                    fc as *mut _,
-                    name.as_ptr(),
-                    Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(cb)),
-                    Rc::into_raw(self.prompts.clone()) as gpointer,
-                    Some(drop_prompts_ref),
-                    0,
-                );
-            }
-            let (lw, lh) = self.logical_size();
-            wpe_view_resized(view, lw, lh);
-            wpe_view_set_visible(view, 1);
-            wpe_view_map(view);
+            let (wv, view) = new_webview(&self.builder, std::ptr::null_mut(), state);
             let curl = cstr(url.as_str());
             webkit_web_view_load_uri(wv, curl.as_ptr());
             (wv, view)
@@ -1052,6 +998,7 @@ impl WebKitHost {
             loading: true,
             image: None,
             mirror: None,
+            opener: None,
         });
         if show {
             self.activate(self.tabs.len() - 1);
@@ -1071,6 +1018,7 @@ impl WebKitHost {
         }
         let was_active = index == self.active;
         let old_active = self.active;
+        let opener = self.tabs[index].opener;
         self.close_option_menu();
         // Anything still held belongs to a view that may be the one about to
         // be destroyed; hand it back while it is still safe to. Losing that
@@ -1082,7 +1030,12 @@ impl WebKitHost {
             return false;
         }
         let next = if was_active {
-            index.min(self.tabs.len() - 1)
+            // A tab a page opened goes back to that page, if it is still
+            // open: a sign-in popup closing itself lands on the site it
+            // signed in to, not on whatever tab sat beside it.
+            opener
+                .and_then(|id| self.index_of(id))
+                .unwrap_or_else(|| index.min(self.tabs.len() - 1))
         } else if old_active > index {
             old_active - 1
         } else {
@@ -1091,6 +1044,52 @@ impl WebKitHost {
         self.active = usize::MAX; // force activate() to do the work
         self.activate(next);
         true
+    }
+
+    /// Make the windows pages opened since the last call into tabs, at the
+    /// end of the strip and still hidden. Returns the newest one's index, for
+    /// the chrome to bring to the front (or not: an agent's click opens
+    /// behind).
+    pub fn adopt_popups(&mut self) -> Option<usize> {
+        let popups = std::mem::take(&mut self.prompts.borrow_mut().popups);
+        let adopted = !popups.is_empty();
+        for p in popups {
+            // Found before the push, so a popup's own popup — queued in the
+            // same pump — finds the tab its opener has just become.
+            let opener = self.tabs.iter().find(|t| t.webview == p.opener).map(|t| t.id);
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            // What its signals have said so far: it has been loading since
+            // it was built, and the chrome reads these before the next pump.
+            let (title, url) = (p.state.title.borrow().clone(), p.state.url.borrow().clone());
+            let loading = p.state.loading.get();
+            self.tabs.push(Tab {
+                id,
+                webview: p.webview,
+                view: p.view,
+                state: p.state,
+                title,
+                url,
+                loading,
+                image: None,
+                mirror: None,
+                opener,
+            });
+        }
+        adopted.then(|| self.tabs.len() - 1)
+    }
+
+    /// Tabs whose page has closed its own window since the last call, by
+    /// id. Only tabs a page opened: a page may close the window it was
+    /// opened in, never one the person opened.
+    pub fn take_page_closes(&self) -> Vec<u64> {
+        let closes = std::mem::take(&mut self.prompts.borrow_mut().closes);
+        closes
+            .into_iter()
+            .filter_map(|wv| self.tabs.iter().find(|t| t.webview as usize == wv))
+            .filter(|t| t.opener.is_some())
+            .map(|t| t.id)
+            .collect()
     }
 
     /// Give back an unread buffer, if one is being held.
@@ -2407,6 +2406,12 @@ pub(super) struct Prompts {
     /// Links middle-clicked in a page, oldest first, for the chrome to open
     /// as background tabs.
     background_opens: Vec<Url>,
+    /// Windows pages opened (`on_create`), oldest first, waiting for
+    /// [`WebKitHost::adopt_popups`] to make them tabs.
+    popups: Vec<Popup>,
+    /// Webviews whose page closed its own window (`window.close()`), by
+    /// address, for [`WebKitHost::take_page_closes`].
+    closes: Vec<usize>,
     /// Login fields the account watcher reported, oldest first. A queue and
     /// not a slot: a blur followed by a focus is two different states, and
     /// collapsing them would leave the list open over the wrong field.
@@ -2718,6 +2723,182 @@ unsafe extern "C" fn on_decide_policy(
     let prompts = &*(data as *const RefCell<Prompts>);
     prompts.borrow_mut().background_opens.push(url);
     1
+}
+
+/// A page opened a window: `window.open` from a click, a `target=_blank`
+/// link, a form with a target. WPE has no window of its own to give it, so
+/// the window is a webview built here and adopted as a tab by the chrome
+/// ([`WebKitHost::adopt_popups`]); WebKit loads the request into it. Built
+/// related to the opener, so `window.opener` reaches the page that opened it
+/// — which is how a sign-in popup (Google's, on claude.ai) hands its answer
+/// back. Until this existed every such window returned null.
+unsafe extern "C" fn on_create(
+    opener: *mut WebKitWebView,
+    _action: *mut WebKitNavigationAction,
+    data: gpointer,
+) -> *mut WebKitWebView {
+    Rc::increment_strong_count(data as *const Builder);
+    let b = Rc::from_raw(data as *const Builder);
+    let state = Rc::new(TabState::default());
+    let (webview, view) = new_webview(&b, opener, &state);
+    // Hidden until the chrome brings it to the front, the way a background
+    // tab starts.
+    wpe_view_unmap(view);
+    wpe_view_set_visible(view, 0);
+    state.loading.set(true);
+    b.prompts.borrow_mut().popups.push(Popup { webview, view, state, opener });
+    // The reference `g_object_new` returned is the tab's, dropped with it,
+    // exactly as for any other tab: WebKit does not take it.
+    webview
+}
+
+/// The page closed its own window. Only noted here; which tabs a page may
+/// close is the host's call ([`WebKitHost::take_page_closes`]).
+unsafe extern "C" fn on_close(wv: *mut WebKitWebView, data: gpointer) {
+    let prompts = &*(data as *const RefCell<Prompts>);
+    prompts.borrow_mut().closes.push(wv as usize);
+}
+
+/// Releases the `Rc<Builder>` the `create` connection owned.
+unsafe extern "C" fn drop_builder_ref(data: gpointer, _closure: *mut GClosure) {
+    drop(Rc::from_raw(data as *const Builder));
+}
+
+/// Build a webview, mapped and sized to the window, its signals connected,
+/// loading nothing yet. `related` is the opener for a page's popup, null
+/// otherwise.
+unsafe fn new_webview(
+    b: &Rc<Builder>,
+    related: *mut WebKitWebView,
+    state: &Rc<TabState>,
+) -> (*mut WebKitWebView, *mut WPEView) {
+    let (p_display, p_ucm, p_session, p_related) = (
+        cstr("display"),
+        cstr("user-content-manager"),
+        cstr("network-session"),
+        cstr("related-view"),
+    );
+    // A popup must share its opener's web process, or WebKit refuses it
+    // (and `window.opener` would have nothing to reach); `related-view` is
+    // what says so. It brings the display and network session with it, and
+    // WebKit warns (CRITICAL) if they are passed as well.
+    let wv = if related.is_null() {
+        g_object_new(
+            webkit_web_view_get_type(),
+            p_display.as_ptr(),
+            b.display,
+            p_ucm.as_ptr(),
+            b.ucm,
+            p_session.as_ptr(),
+            b.session,
+            std::ptr::null::<c_char>(),
+        )
+    } else {
+        g_object_new(
+            webkit_web_view_get_type(),
+            p_related.as_ptr(),
+            related,
+            p_ucm.as_ptr(),
+            b.ucm,
+            std::ptr::null::<c_char>(),
+        )
+    } as *mut WebKitWebView;
+    set_features(wv);
+    let view = webkit_web_view_get_wpe_view(wv);
+    wpe_view_set_toplevel(view, b.toplevel);
+    // Signals, not polling: a background tab has to be able to report
+    // its title without anyone asking the active webview.
+    for sig in ["notify::title", "notify::uri", "notify::is-loading"] {
+        connect_notify(wv, sig, state);
+    }
+    // A dead or hung WebProcess. The first gets an error page in
+    // `pump`; the second is offered to the chrome to ask about.
+    connect_state(wv, "web-process-terminated", on_terminated as *const () as usize, state);
+    connect_state(
+        wv,
+        "notify::is-web-process-responsive",
+        on_responsive as *const () as usize,
+        state,
+    );
+    // A page's alert/confirm/prompt, and HTTP auth challenges. Both
+    // are held open and answered later, so the chrome can draw a real
+    // dialog rather than the handler having to decide inline.
+    connect_raw(
+        wv,
+        "script-dialog",
+        on_script_dialog as *const () as usize,
+        &b.prompts,
+    );
+    connect_raw(
+        wv,
+        "authenticate",
+        on_authenticate as *const () as usize,
+        &b.prompts,
+    );
+    // Right-click reaches the page as button 3; if the page does not
+    // preventDefault, WebKit asks for a menu here. Returning TRUE
+    // claims presentation, so the chrome draws it.
+    connect_raw(
+        wv,
+        "context-menu",
+        on_context_menu as *const () as usize,
+        &b.prompts,
+    );
+    // A `<select>` asking to open. WPE draws no popup of its own: a
+    // select nobody answers here simply never opens.
+    connect_raw(
+        wv,
+        "show-option-menu",
+        on_show_option_menu as *const () as usize,
+        &b.prompts,
+    );
+    // A middle-clicked link is a background tab, not a navigation.
+    connect_raw(
+        wv,
+        "decide-policy",
+        on_decide_policy as *const () as usize,
+        &b.prompts,
+    );
+    // A page opening a window (`window.open`, a `target=_blank` link). The
+    // signal hands back the webview to load it in; nobody answering is a
+    // popup that never opens.
+    let name = cstr("create");
+    g_signal_connect_data(
+        wv as *mut _,
+        name.as_ptr(),
+        Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(
+            on_create as *const () as usize,
+        )),
+        Rc::into_raw(b.clone()) as gpointer,
+        Some(drop_builder_ref),
+        0,
+    );
+    // And closing one (`window.close()`).
+    connect_raw(wv, "close", on_close as *const () as usize, &b.prompts);
+    // Find-in-page answers on the controller, not the view.
+    let fc = webkit_web_view_get_find_controller(wv);
+    for (signal, cb) in [
+        ("found-text", on_found_text as *const () as usize),
+        ("failed-to-find-text", on_failed_to_find as *const () as usize),
+    ] {
+        let name = cstr(signal);
+        g_signal_connect_data(
+            fc as *mut _,
+            name.as_ptr(),
+            Some(std::mem::transmute::<usize, unsafe extern "C" fn()>(cb)),
+            Rc::into_raw(b.prompts.clone()) as gpointer,
+            Some(drop_prompts_ref),
+            0,
+        );
+    }
+    // The toplevel is kept at the logical size (`resize`), so this is the
+    // size the active tab lays out at.
+    let (mut lw, mut lh) = (0, 0);
+    wpe_toplevel_get_size(b.toplevel, &mut lw, &mut lh);
+    wpe_view_resized(view, lw.max(1), lh.max(1));
+    wpe_view_set_visible(view, 1);
+    wpe_view_map(view);
+    (wv, view)
 }
 
 /// The page asked for a context menu. Stash what the hit test says was under
