@@ -990,7 +990,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "calloop",
- "cce-core",
+ "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=388473078207ff41208e8648c04499e94632f20a)",
  "cce-ui",
  "cce-wpe",
  "dpi",
@@ -1008,6 +1008,18 @@ dependencies = [
  "url",
  "wayland-client",
  "zbus",
+]
+
+[[package]]
+name = "cce-core"
+version = "0.1.0"
+source = "git+https://github.com/lsgalante/cce-core.git?rev=388473078207ff41208e8648c04499e94632f20a#388473078207ff41208e8648c04499e94632f20a"
+dependencies = [
+ "kdl",
+ "libc",
+ "log",
+ "serde_json",
+ "web-time",
 ]
 
 [[package]]
@@ -1036,7 +1048,7 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core",
+ "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=5b8dcb30f1b0d7d607ab49d637069560eca0cb14)",
  "chrono",
  "cosmic-text",
  "cursor-icon",
