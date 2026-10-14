@@ -14,7 +14,7 @@ remote at all, so check `origin/master` after committing). Read the workspace-le
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
-Nineteen files under `src/`, ~16.8k lines. The ones that carry the design:
+Nineteen files under `src/`, ~17.6k lines. The ones that carry the design:
 
 | file | what it owns |
 | --- | --- |
