@@ -8,8 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **embedded WPE WebKit** (since 2026-08-30; the original Servo backend survives behind
 a feature flag — see WPE-PORT.md for the whole port). It is one crate of the multi-repo `cce` workspace (its
 own git repo side-by-side with its siblings; `origin` is GitHub,
-`github.com/lsgalante/cce-browser`, and a post-commit hook pushes each commit there —
-`https://git.lucas.co/cce-browser.git` is only an hourly mirror of GitHub. **Committing
+`github.com/lsgalante/cce-browser`, and a post-commit hook pushes each commit there. **Committing
 is not publishing**: a commit whose push failed (hook missing, network down) is on no
 remote at all, so check `origin/master` after committing). Read the workspace-level
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
