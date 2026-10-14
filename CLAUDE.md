@@ -57,7 +57,8 @@ combined, ~175 MB binary). Only pay for it deliberately. A last-known-good Servo
 binary sits at `~/.local/state/cce/browser/cce-browser-servo-fallback`.
 
 There is **no `Makefile`** here (most siblings have one) — install goes
-through `ccebuild` directly. `Cargo.lock` is gitignored in this crate. Running needs a
+through `ccebuild` directly. `Cargo.lock` is committed here, so refresh it when
+dependencies change (`bump-revs.sh` does that for its repins). Running needs a
 live Wayland session; it will not run headless.
 
 The engine-specific sections below (frame pipeline, tabs, key routing) describe the
