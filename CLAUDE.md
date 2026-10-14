@@ -28,9 +28,8 @@ Nineteen files under `src/`, ~17.6k lines. The ones that carry the design:
 | `src/settings.rs` | the per-app KDL config |
 | `src/vi.rs` | vi mode, after qutebrowser: the modes, the bindings and their parser, hint labels, `:` commands, and the page scripts |
 | `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, which entries a host earns, saving a new login, and the never-save list |
-| `src/wpe/ime.rs` | which page text field is open, as WebKit reports it to the input-method context our display hands out — what `display_list` claims for the on-screen keyboard |
+| `src/wpe/mod.rs` | the WPE backend's entry: `WebKitHost` (`host.rs`), and the embedding itself re-exported from the cce-wpe crate it shares with cce-mail — the bindings, WPEPlatform subclasses, GLib source, input, frame `damage` and the input-method context (`ime`) |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
-| `src/wpe/damage.rs` | what a frame changed: damage accumulated per view across skipped frames, turned into the regions `pump` reads back |
 | `src/agent.rs` | agent control over MCP (`127.0.0.1:3005`): the tools, a thread per call running its steps, the steps done on the loop |
 | `src/agent/page.js` | the page half of the agent tools: the accessibility-style tree and its `ref_N` handles, find, text, form input — in a private script world |
 | `src/wpe/host/agent.rs` | the engine half: script that answers, snapshots, and input aimed at any tab by id, the background ones included |
@@ -167,7 +166,7 @@ Every webview runs with WebKit's `PropagateDamagingInformation` feature on
 (`FEATURES` in `host.rs`), so each frame says what it repainted. The sink keeps
 that per view — *including frames handed back unread*, whose changes the next
 read still has to carry — and `read_frame` copies only those rectangles
-(`src/wpe/damage.rs`) and hands them to `cce_ui::vk::update_pixel_regions`,
+(cce-wpe's `damage.rs`) and hands them to `cce_ui::vk::update_pixel_regions`,
 which writes them into the tab's existing image in one submission. A whole
 frame is read when the tab has no image at that size yet, when a frame said
 nothing (no rectangles = unknown), or when the damage covers half the frame or
@@ -736,7 +735,7 @@ any frame — is claimed from `display_list` as well
 claims last and wins). That is what raises the compositor's on-screen keyboard
 (cce-compositor `osk.rs`) when the field was tapped. WebKit itself says which
 field is open: the display hands it our own input-method context
-(`create_input_method_context`, `src/wpe/ime.rs`), whose `focus_in` /
+(`create_input_method_context`, cce-wpe's `ime.rs`), whose `focus_in` /
 `focus_out` / `set_cursor_area` record the field and its caret per view. No
 script is injected, and nothing else of the context is overridden, so keys
 still reach the page unfiltered. Points that are choices:
