@@ -990,8 +990,8 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "calloop",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=33bc46f1cbede6cda770683932c626667805d326)",
- "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=da044adbcbe32e2443e9626e15cf998b73c7c833)",
+ "cce-core",
+ "cce-ui",
  "cce-wpe",
  "dpi",
  "env_logger",
@@ -1025,64 +1025,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cce-core"
-version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-core.git?rev=6333e4da15b5daa241919df1b057c94e52246391#6333e4da15b5daa241919df1b057c94e52246391"
-dependencies = [
- "fluent-bundle",
- "kdl",
- "libc",
- "log",
- "serde_json",
- "unic-langid",
- "web-time",
-]
-
-[[package]]
-name = "cce-ui"
-version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=87e8287f7240d46ba3340a6c2fe71d223d7f6bd1#87e8287f7240d46ba3340a6c2fe71d223d7f6bd1"
-dependencies = [
- "accesskit 0.25.1",
- "ash",
- "bitflags 2.13.1",
- "bytemuck",
- "calloop",
- "calloop-wayland-source",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=6333e4da15b5daa241919df1b057c94e52246391)",
- "chrono",
- "cosmic-text",
- "cursor-icon",
- "dispatch2",
- "gpu-allocator",
- "js-sys",
- "kdl",
- "libc",
- "log",
- "naga",
- "objc2",
- "objc2-app-kit",
- "objc2-foundation",
- "objc2-quartz-core",
- "png 0.17.16",
- "raw-window-handle",
- "resvg 0.41.0",
- "serde",
- "serde_json",
- "smithay-client-toolkit",
- "unicode-bidi",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
- "wayland-scanner",
- "web-sys",
- "web-time",
- "xkeysym",
-]
-
-[[package]]
 name = "cce-ui"
 version = "0.1.0"
 source = "git+https://github.com/lsgalante/cce-ui.git?rev=da044adbcbe32e2443e9626e15cf998b73c7c833#da044adbcbe32e2443e9626e15cf998b73c7c833"
@@ -1094,7 +1036,7 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=33bc46f1cbede6cda770683932c626667805d326)",
+ "cce-core",
  "chrono",
  "cosmic-text",
  "cursor-icon",
@@ -1130,10 +1072,10 @@ dependencies = [
 [[package]]
 name = "cce-wpe"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-wpe.git?rev=c6e114864074bd004c29f0744edee37e46abf19b#c6e114864074bd004c29f0744edee37e46abf19b"
+source = "git+https://github.com/lsgalante/cce-wpe.git?rev=bb558869ef20c520de2910b9226f7c25cad721fe#bb558869ef20c520de2910b9226f7c25cad721fe"
 dependencies = [
  "bindgen",
- "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=87e8287f7240d46ba3340a6c2fe71d223d7f6bd1)",
+ "cce-ui",
  "log",
  "pkg-config",
  "rustix 0.38.44",
