@@ -3003,6 +3003,8 @@ impl BrowserApp {
         self.host.set_history_enabled(new.history);
         self.host.set_color_scheme_dark(new.color_scheme.is_dark());
         self.host.set_force_dark(new.color_scheme.forces_dark());
+        #[cfg(feature = "wpe")]
+        self.host.set_sleep_after(new.sleep_after());
         self.settings = new;
         true
     }
@@ -3060,10 +3062,11 @@ impl BrowserApp {
     /// which also means a browser left on nothing but "New Tab" starts fresh.
     fn persist_session(&mut self) {
         let active = self.host.active_index();
-        let tabs: Vec<(String, bool)> = (0..self.host.tab_count())
+        let tabs: Vec<(String, bool, Option<String>)> = (0..self.host.tab_count())
             .filter_map(|i| {
-                let url = self.host.tab(i)?.url.as_ref()?.to_string();
-                (url != "about:blank").then_some((url, i == active))
+                let tab = self.host.tab(i)?;
+                let url = tab.url.as_ref()?.to_string();
+                (url != "about:blank").then_some((url, i == active, tab.title.clone()))
             })
             .collect();
         self.session.save(&tabs);
@@ -4531,30 +4534,40 @@ impl Application for BrowserApp {
         let restored = !saved.is_empty();
         let mut queue = saved;
         if queue.is_empty() {
-            queue.push(
+            queue.push((
                 arg.clone()
                     .or_else(|| parse_url_input(&settings.homepage, &settings.search_prefix))
                     .unwrap_or_else(|| {
                         Url::parse(settings::DEFAULT_HOMEPAGE).expect("home url")
                     }),
-            );
+                None,
+            ));
         }
-        let first = queue.remove(0);
 
         #[cfg(all(not(feature = "wpe"), feature = "servo"))]
-        let mut host =
-            Host::new(sender.clone(), first, (1200, 800), settings.color_scheme.forces_dark());
+        let mut host = {
+            let (first, _) = queue.remove(0);
+            let mut host =
+                Host::new(sender.clone(), first, (1200, 800), settings.color_scheme.forces_dark());
+            for (url, _) in queue {
+                host.open_tab(url);
+            }
+            if restored {
+                host.activate(saved_active.min(host.tab_count() - 1));
+            }
+            host
+        };
+        // Only the tab in front loads; the rest come back asleep, under their
+        // saved titles, until they are shown (`wpe/host/sleep.rs`).
         #[cfg(feature = "wpe")]
         let mut host = {
             let _ = &sender; // WPE wakes through register_sources, not a waker
-            Host::new(first, (1200, 800))
+            let mut host = Host::restore(queue, saved_active, (1200, 800));
+            host.set_sleep_after(settings.sleep_after());
+            host
         };
-        for url in queue {
-            host.open_tab(url);
-        }
         if restored {
-            host.activate(saved_active.min(host.tab_count() - 1));
-            if let Some(url) = arg {
+            if let Some(url) = arg.clone() {
                 host.open_tab(url);
             }
         }

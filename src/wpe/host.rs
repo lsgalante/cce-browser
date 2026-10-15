@@ -29,6 +29,7 @@ use super::subclass::{types, FRAME_SINK};
 
 /// What the agent tools drive the engine with (`crate::agent`).
 mod agent;
+mod sleep;
 pub use agent::{AgentImage, PointerKind};
 
 /// Page state a tab's WebKit signals write into.
@@ -64,6 +65,19 @@ struct TabState {
     auto_reload: Cell<bool>,
     /// When this tab was last recovered that way.
     last_auto: Cell<Option<std::time::Instant>>,
+    /// The tab is asleep (`sleep.rs`): no web process, woken by showing it.
+    /// Its termination is not a crash, and its title and URL hold still.
+    asleep: Cell<bool>,
+    /// When the tab last went out of sight, or an agent last used it; `None`
+    /// while it is the one shown.
+    hidden_since: Cell<Option<std::time::Instant>>,
+    /// A form post was decided since the last commit, and the page that
+    /// committed came from one: reloading it would post again, so it is
+    /// never put to sleep.
+    post_pending: Cell<bool>,
+    posted: Cell<bool>,
+    /// The check for unsaved input that comes before sleep.
+    probe: Cell<sleep::Probe>,
 }
 
 /// How long every page process must sit idle while the active tab is
@@ -436,6 +450,13 @@ pub struct WebKitHost {
     next_tab_id: u64,
     /// What every webview is built from, popups included.
     builder: Rc<Builder>,
+    /// How long a tab stays out of sight before it is put to sleep; `None`
+    /// never (`sleep.rs`).
+    sleep_after: Option<std::time::Duration>,
+    /// When the tabs were last looked over for sleep.
+    last_sleep_sweep: Option<std::time::Instant>,
+    /// The GLib source that turns the loop for those sweeps.
+    sleep_timer: Option<u32>,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -448,7 +469,32 @@ impl WebKitHost {
     /// One host per process: the frame sink and the GType registrations are
     /// process-wide. That matches the app (one browser window per process)
     /// but is worth knowing before writing a test that builds two.
+    #[allow(dead_code)] // the examples'; the app boots through `restore`
     pub fn new(url: Url, size_px: (u32, u32)) -> Self {
+        let mut host = Self::boot(size_px);
+        host.open_tab(url);
+        host
+    }
+
+    /// Boot WPE with a saved tab set: `active` loads and is shown, every
+    /// other tab comes back asleep (`sleep.rs`) — in the strip under its
+    /// saved title, loading nothing and holding no web process until it is
+    /// shown. Restoring them all eagerly cost a WebProcess and a full page
+    /// load each at every launch, for tabs that may not be looked at all day.
+    pub fn restore(tabs: Vec<(Url, Option<String>)>, active: usize, size_px: (u32, u32)) -> Self {
+        let mut host = Self::boot(size_px);
+        let active = active.min(tabs.len().saturating_sub(1));
+        for (i, (url, title)) in tabs.into_iter().enumerate() {
+            if i == active {
+                host.open_tab(url);
+            } else {
+                host.add_asleep_tab(url, title);
+            }
+        }
+        host
+    }
+
+    fn boot(size_px: (u32, u32)) -> Self {
         unsafe {
             let t = types();
             let display = g_object_new(t.display, std::ptr::null::<c_char>()) as *mut WPEDisplay;
@@ -580,7 +626,7 @@ impl WebKitHost {
                 session,
                 prompts: prompts.clone(),
             });
-            let mut host = Self {
+            let host = Self {
                 display,
                 toplevel,
                 tabs: Vec::new(),
@@ -611,6 +657,9 @@ impl WebKitHost {
                 vi_watcher: None,
                 next_tab_id: 1,
                 builder,
+                sleep_after: None,
+                last_sleep_sweep: None,
+                sleep_timer: None,
             };
             // The account watcher's channel, in its own script world. Both
             // halves are registered here, once, on the shared content
@@ -619,7 +668,6 @@ impl WebKitHost {
             host.register_vi_channel();
             // Which page fields want no on-screen keyboard (`ime.rs`).
             super::ime::install_watch(host.ucm);
-            host.open_tab(url);
             host
         }
     }
@@ -986,6 +1034,7 @@ impl WebKitHost {
         };
         state.loading.set(true);
         *state.url.borrow_mut() = Some(url.clone());
+        state.hidden_since.set(Some(std::time::Instant::now()));
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.tabs.push(Tab {
@@ -1063,6 +1112,7 @@ impl WebKitHost {
             // it was built, and the chrome reads these before the next pump.
             let (title, url) = (p.state.title.borrow().clone(), p.state.url.borrow().clone());
             let loading = p.state.loading.get();
+            p.state.hidden_since.set(Some(std::time::Instant::now()));
             self.tabs.push(Tab {
                 id,
                 webview: p.webview,
@@ -1115,8 +1165,11 @@ impl WebKitHost {
                 }
                 wpe_view_unmap(old.view);
                 wpe_view_set_visible(old.view, 0);
+                old.state.hidden_since.set(Some(std::time::Instant::now()));
             }
             self.active = index;
+            self.tabs[index].state.hidden_since.set(None);
+            self.wake(index);
             // A select's list belongs to the page going away.
             self.close_option_menu();
             // Login fields reported by, and fill asks from, the tab going
@@ -1217,6 +1270,7 @@ impl WebKitHost {
             p.sync();
         }
         self.watch_deadlock();
+        self.sleep_idle_tabs();
         // Nothing has drawn the last frame yet, so reading another would be
         // copying over a picture that was never shown. Leave the buffer held
         // until the draw. (Its view is waiting on `rendered` meanwhile, so it
@@ -1413,6 +1467,16 @@ impl WebKitHost {
         let mut changed = false;
         for tab in &mut self.tabs {
             if !tab.state.dirty.replace(false) {
+                continue;
+            }
+            if tab.state.asleep.get() {
+                // Put to sleep on purpose (`sleep.rs`): the end of its
+                // process is not a crash, and what the strip says about the
+                // tab stays as it was until it wakes.
+                tab.state.terminated.take();
+                tab.state.loading.set(false);
+                tab.loading = false;
+                changed = true;
                 continue;
             }
             if let Some(reason) = tab.state.terminated.take() {
@@ -2116,8 +2180,19 @@ impl WebKitHost {
 ///   stop. WebKit already stops its `requestAnimationFrame` (checked: 0 a
 ///   second hidden), but not this, and not its timers. A hidden Muji page
 ///   measured 67% of a core with it off and 43% on.
-const FEATURES: &[(&str, bool)] =
-    &[("PropagateDamagingInformation", true), ("HiddenPageCSSAnimationSuspension", true)];
+/// * `HiddenPageDOMTimerThrottling` — and its timers: a background tab's
+///   `setTimeout`/`setInterval` are aligned to about a second, Safari's
+///   background-tab throttle. A hidden page polling every 10 ms measured
+///   3.4% of a core without it and 0.1% with it. Its companion
+///   `HiddenPageDOMTimerThrottlingAutoIncreases`, which keeps stretching a
+///   long-hidden page's timers, stays off: the one-second alignment already
+///   takes nearly all of it, and the stretching would make a background
+///   page's reminders arrive minutes late.
+const FEATURES: &[(&str, bool)] = &[
+    ("PropagateDamagingInformation", true),
+    ("HiddenPageCSSAnimationSuspension", true),
+    ("HiddenPageDOMTimerThrottling", true),
+];
 
 unsafe fn set_features(wv: *mut WebKitWebView) {
     let settings = webkit_web_view_get_settings(wv);
@@ -2859,6 +2934,10 @@ unsafe fn new_webview(
         on_decide_policy as *const () as usize,
         &b.prompts,
     );
+    // Which pages came from a form post, so a reload never posts again
+    // behind the person's back (`sleep.rs`).
+    connect_state(wv, "decide-policy", sleep::on_decide_post as *const () as usize, state);
+    connect_state(wv, "load-changed", sleep::on_load_changed as *const () as usize, state);
     // A page opening a window (`window.open`, a `target=_blank` link). The
     // signal hands back the webview to load it in; nobody answering is a
     // popup that never opens.

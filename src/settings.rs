@@ -134,6 +134,10 @@ pub struct Settings {
     pub tab_line: TabLine,
     /// What pages are told to prefer.
     pub color_scheme: ColorScheme,
+    /// Minutes a tab stays out of sight before it is put to sleep — its web
+    /// process stopped, the page loaded again when it is shown
+    /// (`wpe/host/sleep.rs`). 0 never does.
+    pub sleep_tabs_after: u32,
     /// Command used to hand the current page to another browser. Empty means
     /// "ask XDG", which is right until cce-browser is itself the default.
     pub external_browser: Option<String>,
@@ -153,6 +157,7 @@ impl Default for Settings {
             bar_position: BarPosition::Top,
             tab_line: TabLine::Switching,
             color_scheme: ColorScheme::Dark,
+            sleep_tabs_after: DEFAULT_SLEEP_TABS_AFTER,
             external_browser: None,
         }
     }
@@ -165,6 +170,18 @@ fn search_prefix(key: &str) -> &'static str {
         "bing" => "https://www.bing.com/search?q=",
         "wikipedia" => "https://en.wikipedia.org/wiki/Special:Search?search=",
         _ => "https://duckduckgo.com/html/?q=",
+    }
+}
+
+/// Half an hour out of sight: long enough that a tab being worked between
+/// never sleeps, short enough that a day's leftovers stop costing a process
+/// each. Edge's default is two hours, Chrome's Memory Saver about the same.
+pub const DEFAULT_SLEEP_TABS_AFTER: u32 = 30;
+
+impl Settings {
+    /// [`Self::sleep_tabs_after`] as the host takes it.
+    pub fn sleep_after(&self) -> Option<std::time::Duration> {
+        (self.sleep_tabs_after > 0).then(|| std::time::Duration::from_secs(self.sleep_tabs_after as u64 * 60))
     }
 }
 
@@ -200,6 +217,9 @@ pub fn load() -> Settings {
         bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
         tab_line: TabLine::from_key(b["tab-line"].as_str().unwrap_or("switching")),
         color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("dark")),
+        sleep_tabs_after: b["sleep-tabs-after"]
+            .as_u64()
+            .map_or(DEFAULT_SLEEP_TABS_AFTER, |m| m.min(u32::MAX as u64) as u32),
         external_browser: b["external-browser"]
             .as_str()
             .map(str::trim)

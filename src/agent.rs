@@ -136,6 +136,24 @@ pub enum Op {
     Pointer { tab: Option<u64>, kind: PointerKind, button: u32, x: f64, y: f64, keys: u32 },
     Wheel { tab: Option<u64>, dx: f64, dy: f64, x: f64, y: f64 },
     Key { tab: Option<u64>, keyval: u32, pressed: bool, keys: u32 },
+    /// Wake the tab if it is asleep (the host's `sleep.rs`); answers its id
+    /// and whether it was.
+    Wake(Option<u64>),
+}
+
+impl Op {
+    /// The tab an op reads or drives the page of, which has to be awake
+    /// for it: script, snapshot and input.
+    fn page_tab(&self) -> Option<Option<u64>> {
+        match self {
+            Op::Script { tab, .. }
+            | Op::Snapshot(tab)
+            | Op::Pointer { tab, .. }
+            | Op::Wheel { tab, .. }
+            | Op::Key { tab, .. } => Some(*tab),
+            _ => None,
+        }
+    }
 }
 
 pub enum Answer {
@@ -184,6 +202,9 @@ impl BrowserApp {
                 self.tab_json(i)
             })),
             Op::Navigate(tab, target) => answer(self.agent_index(tab).and_then(|i| {
+                // The navigation is the wake: no need to load the page it
+                // is about to leave.
+                self.host.agent_wake(i, false);
                 match target.as_str() {
                     "back" => self.host.agent_history(i, -1)?,
                     "forward" => self.host.agent_history(i, 1)?,
@@ -234,6 +255,13 @@ impl BrowserApp {
                 }
                 answer(Ok(json!(if accept { "accepted" } else { "dismissed" })))
             }
+            Op::Wake(tab) => answer(self.agent_index(tab).map(|i| {
+                let woke = self.host.agent_wake(i, true);
+                if woke && i == self.host.active_index() {
+                    self.loading = true;
+                }
+                json!({ "tabId": self.host.tab(i).map(|t| t.id), "woke": woke })
+            })),
             Op::Script { tab, source, page_world, call } => {
                 let i = match self.agent_index(tab) {
                     Ok(i) => i,
@@ -303,6 +331,7 @@ impl BrowserApp {
             "title": t.title.clone().unwrap_or_default(),
             "loading": t.loading,
             "active": i == self.host.active_index(),
+            "asleep": t.asleep(),
         })
     }
 }
@@ -362,6 +391,13 @@ fn coord_arg(args: &Value, key: &str) -> Option<(f64, f64)> {
 
 impl Agent {
     fn op(&self, op: Op) -> Result<Answer, String> {
+        if let Some(tab) = op.page_tab() {
+            self.wake(tab)?;
+        }
+        self.send(op)
+    }
+
+    fn send(&self, op: Op) -> Result<Answer, String> {
         let (tx, rx) = mpsc::channel();
         self.tx.send(Message::AgentOp(op, tx)).map_err(|_| "the browser is shutting down".to_string())?;
         rx.recv_timeout(OP_TIMEOUT).map_err(|_| "the page did not answer in time".to_string())?
@@ -372,6 +408,19 @@ impl Agent {
             Answer::Value(v) => Ok(v),
             Answer::Image(..) => Err("unexpected image".into()),
         }
+    }
+
+    /// A tab put to sleep to save memory has no page to read or drive:
+    /// wake it, and wait for it to load before going on.
+    fn wake(&self, tab: Option<u64>) -> Result<(), String> {
+        let v = match self.send(Op::Wake(tab))? {
+            Answer::Value(v) => v,
+            Answer::Image(..) => return Ok(()),
+        };
+        if let (Some(true), Some(id)) = (v["woke"].as_bool(), v["tabId"].as_u64()) {
+            self.wait_load(id, LOAD_WAIT)?;
+        }
+        Ok(())
     }
 
     fn status(&self, tab: Option<u64>) -> Result<Value, String> {
@@ -898,7 +947,7 @@ fn tools() -> Vec<McpTool> {
         cce_ui::mcp::context_tool(),
         tool(
             "tabs_context",
-            "List the browser's open tabs: tabId, url, title, whether it is loading, and which one is shown (active). Call this first.",
+            "List the browser's open tabs: tabId, url, title, whether it is loading, which one is shown (active), and whether it is asleep (unloaded to save memory; any tool that reads or drives it wakes it and waits for the load). Call this first.",
             json!({ "type": "object", "properties": {} }),
         ),
         tool(

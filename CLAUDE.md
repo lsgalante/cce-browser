@@ -14,7 +14,7 @@ remote at all, so check `origin/master` after committing). Read the workspace-le
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
-Nineteen files under `src/`, ~17.6k lines. The ones that carry the design:
+Twenty files under `src/`, ~18.2k lines. The ones that carry the design:
 
 | file | what it owns |
 | --- | --- |
@@ -29,6 +29,7 @@ Nineteen files under `src/`, ~17.6k lines. The ones that carry the design:
 | `src/vi.rs` | vi mode, after qutebrowser: the modes, the bindings and their parser, hint labels, `:` commands, and the page scripts |
 | `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, which entries a host earns, saving a new login, and the never-save list |
 | `src/wpe/mod.rs` | the WPE backend's entry: `WebKitHost` (`host.rs`), and the embedding itself re-exported from the cce-wpe crate it shares with cce-mail — the bindings, WPEPlatform subclasses, GLib source, input, frame `damage` and the input-method context (`ime`) |
+| `src/wpe/host/sleep.rs` | sleeping tabs: a tab out of sight long enough has its web process stopped and reloads when shown; restored tabs start asleep |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
 | `src/agent.rs` | agent control over MCP (`127.0.0.1:3005`, filed in cce-ui's MCP registry): `server()` classes each tool (input, forms, dialogs and script are Outward, so the cce-claude popup asks every time), the brief, companion cce-notes, `context` (the shown tab and the tab list); the tools, a thread per call running its steps, the steps done on the loop |
 | `src/agent/page.js` | the page half of the agent tools: the accessibility-style tree and its `ref_N` handles, find, text, form input — in a private script world |
@@ -186,9 +187,13 @@ every read through loading, idling, scrolling, a resize and Muji. Run it after
 touching any of this.
 
 WebKit also gets `HiddenPageCSSAnimationSuspension`: a background tab's CSS
-animations stop, as its `requestAnimationFrame` already does. Its timers still
-run — WebKit has no hidden-page timer throttling here — which is most of what a
-heavy page costs in the background.
+animations stop, as its `requestAnimationFrame` already does. And
+`HiddenPageDOMTimerThrottling` (off by default in WebKit, there all along —
+this file once said WebKit had no such thing): a background tab's timers are
+aligned to about a second, Safari's throttle. A hidden page polling every
+10 ms went from 3.4% of a core to 0.1%. `…AutoIncreases`, which keeps
+stretching a long-hidden page's timers, is deliberately left off. A tab out
+of sight long enough is put to sleep outright (below).
 
 ### The engine is paced to draws
 
@@ -258,9 +263,10 @@ frame, so switching shows content instantly while the resize refreshes it.
 ### Session restore
 
 The open-tab set persists across restarts: `src/session.rs` writes
-`~/.local/state/cce/browser/tabs.tsv` (one `<active-flag>\t<url>` line per tab)
-and startup restores it, engine-agnostically — the chrome reads tabs back
-through the shared host surface, so both backends get it for free. Points that
+`~/.local/state/cce/browser/tabs.tsv` (one `<active-flag>\t<url>\t<title>`
+line per tab; a line without the title, the older format, restores untitled)
+and startup restores it — the chrome reads tabs back through the shared host
+surface, so both backends get it. Points that
 are choices, not accidents:
 
 - **Saves are eager, not on-exit** — `persist_session()` fires on every tab
@@ -277,9 +283,11 @@ are choices, not accidents:
   (then falling back to the homepage, as before).
 - **`about:blank` tabs are skipped on save** — a "New Tab" is not worth
   resurrecting.
-- Restore is **eager**: every saved tab starts loading at launch (one
-  WebProcess each on WPE). Fine at normal tab counts; lazy restore is the
-  upgrade path if someone lives with dozens.
+- Restore is **lazy** on WPE (`WebKitHost::restore`): only the tab in front
+  loads; every other one comes back asleep (below) under its saved title,
+  with no web process until it is shown. Five saved tabs launch with two web
+  processes (the front tab and the spare) instead of six. The Servo backend
+  still restores eagerly.
 
 ### A dead or hung page
 
@@ -328,6 +336,51 @@ against the real engine. Points that are choices:
   used. Page processes inherit it through bubblewrap. Measured in a scale-2
   shadow scrolling 24 large images: no difference in frame rate or CPU.
   `CCE_BROWSER_CCS=1` turns compression back on.
+
+## Sleeping tabs
+
+A tab out of sight for `browser.sleep-tabs-after` minutes (default 30, 0
+never; no settings-page control yet) is put to sleep: its web process is
+terminated, and showing it reloads it. `src/wpe/host/sleep.rs` holds it all;
+`examples/wpe_sleep.rs` proves it against the real engine. This is Chrome's
+tab discarding / Edge's sleeping tabs, and the reason for it was measured: a
+day's leftover background tabs cost 650-900 MB each in the session that
+prompted it. Points that are choices:
+
+- **Asleep is a terminated process, not a dropped webview.** WebKit keeps the
+  back/forward list in the UI process, so the surviving webview still has
+  its history, and `webkit_web_view_reload` launches a fresh process for the
+  current entry — Back works after a wake. Dropping the webview would lose
+  that and free much less: **WebKit's WebProcessCache** parks the process of
+  a closed or navigated-away page for reuse (capacity 32 on this machine, up
+  to half an hour; `WEBKIT_DEBUG=Process` logs it to the journal), and a
+  closed Muji tab's parked process still held 479 of its 814 MB. The cache
+  model does not size that cache in 2.54 — DOCUMENT_BROWSER, even set first,
+  left it at 32 — and nothing else in the API reaches it.
+- **The termination is not a crash**: `sync_page_state` skips the error page
+  for an asleep tab and holds its title and URL still. The last frame stays
+  in `Tab::image`, so showing a sleeper shows the page at once while the
+  reload replaces it. Waking in the same turn it fell asleep is proven too.
+- **Never put to sleep**: the shown tab; one loading, hung (unanswered ping or
+  WebKit's unresponsive flag), playing audio, or capturing camera, microphone
+  or screen; any while a dialog or sign-in is up; one whose page came from a
+  form post (`posted`, from `decide-policy` + `load-changed`: a reload would
+  post again); and one with unsaved input, which a probe asks the page about
+  first (`PROBE_JS`, private world: a field changed from its served value, a
+  changed choice, a focused contenteditable; same-origin frames included). A
+  select with no `selected` option starts on its first option without that
+  being its default — the first cut took that for an edit, and rust-lang.org
+  never slept.
+- **Tabs tied by `window.open` sleep together or not at all**
+  (`opener_groups`): a popup shares its opener's process, and terminating one
+  kills the other. A popup stays awake while its opener is shown.
+- **The sweep runs on a GLib timer** (`set_sleep_after`), every minute at
+  most, since an idle browser turns no loop: a tab sleeps between one and two
+  minutes after its limit.
+- **An agent's tool wakes a sleeper and waits for its load** (`Op::Wake`, in
+  `Agent::op` before any script, snapshot or input); `navigate` just marks it
+  awake, since it loads anyway. Any agent op on a tab restarts its clock.
+  `tabs_context` reports `asleep`.
 
 ## The chrome is hand-rolled
 
@@ -1165,7 +1218,8 @@ must never carry an index across a lock boundary.
 in `handle_focus_change` — so edits made in **cce-system-interface's Browser page**
 (`../cce-system-interface/src/pages/browser.rs`, which owns the writing side) apply on
 the next switch back. Keep the key names in `settings.rs` and that page in sync;
-`external-browser` is currently read here with no UI writing it.
+`external-browser` and `sleep-tabs-after` are currently read here with no UI
+writing them.
 
 Servo persists per-profile state (cookie jar, auth cache, HSTS) only when given a
 `config_dir` — without one every launch starts logged out of every site. It lives at
