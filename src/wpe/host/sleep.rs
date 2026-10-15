@@ -95,6 +95,13 @@ pub struct Closing {
     since: std::time::Instant,
 }
 
+impl Closing {
+    /// The closing webview's view.
+    pub(super) fn view(&self) -> *mut WPEView {
+        unsafe { webkit_web_view_get_wpe_view(self.webview) }
+    }
+}
+
 /// How long a closing page may take over its unload before its process is
 /// stopped anyway.
 const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -152,6 +159,7 @@ impl WebKitHost {
             url: Some(url),
             loading: false,
             image: None,
+            image_gpu: false,
             mirror: None,
             opener: None,
         });
@@ -232,18 +240,35 @@ impl WebKitHost {
     /// Stop the processes of closed tabs whose pages have unloaded, and let
     /// their webviews go.
     pub(super) fn end_closed(&mut self) {
-        self.closing.retain(|c| unsafe {
-            // Unloaded once `about:blank` has committed and finished; "not
-            // loading" alone would also be true before it had begun.
-            let blank = from_cstr(webkit_web_view_get_uri(c.webview)).as_deref() == Some("about:blank");
-            let unloaded = blank && webkit_web_view_is_loading(c.webview) == 0;
-            if !unloaded && c.since.elapsed() < CLOSE_GRACE {
-                return true;
+        if self.closing.is_empty() {
+            return;
+        }
+        let (ending, waiting): (Vec<Closing>, Vec<Closing>) = std::mem::take(&mut self.closing)
+            .into_iter()
+            .partition(|c| unsafe {
+                // Unloaded once `about:blank` has committed and finished;
+                // "not loading" alone would also be true before it had begun.
+                let blank = from_cstr(webkit_web_view_get_uri(c.webview)).as_deref() == Some("about:blank");
+                let unloaded = blank && webkit_web_view_is_loading(c.webview) == 0;
+                unloaded || c.since.elapsed() >= CLOSE_GRACE
+            });
+        self.closing = waiting;
+        for c in ending {
+            let view = c.view();
+            // A closing view can still hand over a frame (one rendered before
+            // it was unmapped), which then sits held, unread. Give it back
+            // while the view exists: held past the view, it was handed back
+            // to a destroyed one when the next frame superseded it — a
+            // crash in `wpe_view_buffer_released`, 2026-10-15.
+            if self.pending.borrow().held.is_some_and(|(v, _)| v == view) {
+                self.release_held();
             }
-            webkit_web_view_terminate_web_process(c.webview);
-            g_object_unref(c.webview as *mut _);
-            false
-        });
+            self.pending.borrow_mut().damage.remove(&(view as usize));
+            unsafe {
+                webkit_web_view_terminate_web_process(c.webview);
+                g_object_unref(c.webview as *mut _);
+            }
+        }
     }
 
     /// Look the tabs over and put to sleep what may sleep. Called from every

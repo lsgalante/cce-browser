@@ -219,9 +219,12 @@ Frames arrive as `WPEBufferSHM`, ARGB8888, stride `width * 4`, B,G,R,A in memory
 precisely what the registry already accepts.
 
 Phase 2 — dmabuf imported as a Vulkan image via `VK_EXT_external_memory_dma_buf`,
-skipping the CPU roundtrip — is not built yet. It needs a **new `cce-ui` API**
-(the registry only accepts `Vec<u8>`), and `cce-ui` is a **shared crate**: check
-`git status` there and coordinate before touching it.
+skipping the CPU roundtrip — **shipped 2026-10-15** and is the default:
+`src/wpe/host/gpu.rs` here, cce-ui's `vk::image::dmabuf` (import, ownership
+handover, frame serials) and `vk::core::dmabuf` (`probe_dmabuf`), cce-wpe's
+`offer_dmabuf`. CLAUDE.md has the design ("The frame pipeline on WPE"). In a
+shadow, the spinner below at 2400x1600 costs the whole browser 5.8% of a core
+against 31.7% on SHM. What follows is the measurement that made the case.
 
 **It is measured, and it is the largest cost left** (`examples/wpe_dmabuf_cost.rs`,
 2026-10-15). On the SHM path WebKit composites the whole frame and reads it back

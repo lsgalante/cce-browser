@@ -4562,6 +4562,9 @@ impl Application for BrowserApp {
         #[cfg(feature = "wpe")]
         let mut host = {
             let _ = &sender; // WPE wakes through register_sources, not a waker
+            // Before the first webview: page frames as GPU buffers the
+            // window draws where they are (`wpe/host/gpu.rs`).
+            Host::offer_gpu_frames();
             let mut host = Host::restore(queue, saved_active, (1200, 800));
             host.set_sleep_after(settings.sleep_after());
             host

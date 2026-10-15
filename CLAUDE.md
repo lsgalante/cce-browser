@@ -14,7 +14,7 @@ remote at all, so check `origin/master` after committing). Read the workspace-le
 `../cce-compositor/WORKSPACE.md` first: workspace layout, the `cce-ui` toolkit, config
 conventions, and the multi-repo rules all live there.
 
-Twenty files under `src/`, ~18.2k lines. The ones that carry the design:
+Twenty-one files under `src/`, ~18.7k lines. The ones that carry the design:
 
 | file | what it owns |
 | --- | --- |
@@ -29,6 +29,7 @@ Twenty files under `src/`, ~18.2k lines. The ones that carry the design:
 | `src/vi.rs` | vi mode, after qutebrowser: the modes, the bindings and their parser, hint labels, `:` commands, and the page scripts |
 | `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, which entries a host earns, saving a new login, and the never-save list |
 | `src/wpe/mod.rs` | the WPE backend's entry: `WebKitHost` (`host.rs`), and the embedding itself re-exported from the cce-wpe crate it shares with cce-mail — the bindings, WPEPlatform subclasses, GLib source, input, frame `damage` and the input-method context (`ime`) |
+| `src/wpe/host/gpu.rs` | page frames as GPU buffers: offered to WebKit at boot, imported into cce-ui once per buffer, drawn in place, handed back once no frame draws them |
 | `src/wpe/host/sleep.rs` | sleeping tabs: a tab out of sight long enough has its web process stopped and reloads when shown; restored tabs start asleep |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
 | `src/agent.rs` | agent control over MCP (`127.0.0.1:3005`, filed in cce-ui's MCP registry): `server()` classes each tool (input, forms, dialogs and script are Outward, so the cce-claude popup asks every time), the brief, companion cce-notes, `context` (the shown tab and the tab list); the tools, a thread per call running its steps, the steps done on the loop |
@@ -126,9 +127,47 @@ Two consequences worth holding onto:
 
 ## The frame pipeline on WPE
 
+**Since 2026-10-15 page frames are GPU buffers** (`src/wpe/host/gpu.rs`;
+WPE-PORT.md's Phase 2). Before the first webview, `offer_gpu_frames` asks
+cce-ui's `probe_dmabuf` which device the window will render on and what it
+can sample, and offers WebKit dma-bufs there (cce-wpe's `offer_dmabuf`);
+WebKit renders each frame into one, and the chrome draws that buffer as an
+imported cce-ui image — no readback on WebKit's side, no copy or upload on
+ours. Measured with a 24px spinner at 2400x1600 in a shadow: the whole
+browser 5.8% of a core, against 31.7% on the path below (most of it WebKit's
+whole-frame readback, which costs in proportion to the window whatever
+changed). Points that are choices:
+
+- **Imported once per buffer.** WebKit renders into a few buffers in turn; a
+  later frame in a known buffer is only *acquired* (ownership back from the
+  foreign queue). `Tab::image` then names the import, and `image_gpu` says
+  the tab must neither free nor write it.
+- **A replaced buffer goes back only once no frame draws it**: it waits in
+  `retiring` for cce-ui's `frames_finished` to pass the serial it was last
+  shown at, is released in cce-ui, and is handed back
+  (`wpe_view_buffer_released`) when `take_released` lists it. `rendered` —
+  the pacing — is still said when the frame is taken, as below.
+- **Buffers WebKit destroys** (resize, a sleeping tab's stopped process, a
+  closed tab) are seen through a weak reference; the image is freed unless a
+  tab still shows it, which keeps that picture until replaced.
+- **The offer must come before the first webview**: WebKit settles a
+  toplevel's buffer type when it first uses it, and a later offer was not
+  taken up (measured). Mappable memory stays offered behind it.
+  `CCE_BROWSER_SHM=1` keeps the path below; so does a host nothing draws
+  (the examples never offer), and so does a device without the extensions.
+- **Getting it running exposed a cce-wpe bug**: the GLib fd mirror, diffed
+  by fd number, kept a closed-and-reused fd's file registered, and WebKit's
+  GPU path cycles one per frame — 125,000 pumps a second. It is rebuilt
+  every sync now (cce-wpe's `glib_source.rs`).
+
+`CCE_BROWSER_FRAME_DEBUG=1` reports GPU frames, pumps and draws too; paced,
+pumps run at about three per draw.
+
+### The SHM path
+
 WebKit renders into a **mappable SHM buffer** (`toplevel_formats` asks for
-one; DMABuf import is still the Phase 2 in WPE-PORT.md), `read_shm` copies it
-out, and the pixels are drawn as one full-bleed quad. What that path costs is
+one), `read_shm` copies it out, and the pixels are drawn as one full-bleed
+quad. What that path costs is
 worth knowing, because it is paid on **every frame of every scroll** and this
 display is 3840x2400 — 35 MB a frame fullscreen.
 
@@ -359,8 +398,10 @@ prompted it. Points that are choices:
   left it at 32 — and nothing else in the API reaches it.
 - **The termination is not a crash**: `sync_page_state` skips the error page
   for an asleep tab and holds its title and URL still. The last frame stays
-  in `Tab::image`, so showing a sleeper shows the page at once while the
-  reload replaces it. Waking in the same turn it fell asleep is proven too.
+  in `Tab::image` while it sleeps, but showing it does not show that frame
+  for long: WebKit's first frame after the reload is blank white, on the SHM
+  path as on the GPU one (compared in a shadow). Waking in the same turn it
+  fell asleep is proven too.
 - **Never put to sleep**: the shown tab; one loading, hung (unanswered ping or
   WebKit's unresponsive flag), playing audio, or capturing camera, microphone
   or screen; any while a dialog or sign-in is up; one whose page came from a
@@ -386,7 +427,12 @@ prompted it. Points that are choices:
   tab in a `window.open` group: closing a sign-in popup that way showed its
   opener the crash page. What this cannot reach is the process still holding
   one of the tab's *earlier* pages for Back; WebKit parks those in its cache
-  when the webview goes, with no API handle on them.
+  when the webview goes, with no API handle on them. **A closing view's held
+  frame is handed back before the view is destroyed**: a closing view can
+  still deliver one frame (rendered before it was unmapped), which sat held
+  past the view's end and was handed back to the destroyed view when the
+  next frame superseded it — a crash in `wpe_view_buffer_released`, caught
+  by a tab open/resize/close churn in a shadow.
 - **An agent's tool wakes a sleeper and waits for its load** (`Op::Wake`, in
   `Agent::op` before any script, snapshot or input); `navigate` just marks it
   awake, since it loads anyway. Any agent op on a tab restarts its clock.

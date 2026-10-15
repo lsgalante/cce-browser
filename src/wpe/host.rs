@@ -29,6 +29,7 @@ use super::subclass::{types, FRAME_SINK};
 
 /// What the agent tools drive the engine with (`crate::agent`).
 mod agent;
+mod gpu;
 mod sleep;
 pub use agent::{AgentImage, PointerKind};
 
@@ -166,6 +167,9 @@ pub struct Tab {
     pub url: Option<Url>,
     pub loading: bool,
     image: Option<(u32, u32, u32)>,
+    /// `image` is a GPU buffer's import (`gpu.rs`), which that owns: never
+    /// freed or written through the tab.
+    image_gpu: bool,
     /// Under `CCE_BROWSER_DAMAGE_CHECK` only: the picture `image` should
     /// hold, patched region by region alongside it.
     mirror: Option<Vec<u8>>,
@@ -203,7 +207,7 @@ impl Drop for Tab {
         // the state before the object that can still emit into it would be a
         // use-after-free.
         unsafe { g_object_unref(self.webview as *mut _) };
-        if let Some((id, ..)) = self.image {
+        if let (Some((id, ..)), false) = (self.image, self.image_gpu) {
             cce_ui::vk::free_image(id);
         }
     }
@@ -341,6 +345,11 @@ struct FrameCounts {
     partial: u64,
     /// Bytes copied out of the engine's buffers.
     bytes: u64,
+    /// Of `read`, how many were GPU buffers, drawn where they are (`gpu.rs`).
+    gpu: u64,
+    /// Pumps, and draws (`frame_drawn`).
+    pumps: u64,
+    draws: u64,
 }
 
 /// Read whole frames only, ignoring damage. The escape hatch if a page is
@@ -460,6 +469,9 @@ pub struct WebKitHost {
     /// Closed tabs' webviews, kept until their page has heard it is going
     /// and their process can be stopped (`sleep.rs`, `end_closed`).
     closing: Vec<sleep::Closing>,
+    /// Page frames that are GPU buffers (`gpu.rs`): what is imported, shown,
+    /// and on its way back to WebKit.
+    gpu: RefCell<gpu::GpuFrames>,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -664,6 +676,7 @@ impl WebKitHost {
                 last_sleep_sweep: None,
                 sleep_timer: None,
                 closing: Vec::new(),
+                gpu: RefCell::new(gpu::GpuFrames::default()),
             };
             // The account watcher's channel, in its own script world. Both
             // halves are registered here, once, on the shared content
@@ -1050,6 +1063,7 @@ impl WebKitHost {
             url: Some(url),
             loading: true,
             image: None,
+            image_gpu: false,
             mirror: None,
             opener: None,
         });
@@ -1080,6 +1094,8 @@ impl WebKitHost {
         // Before it goes: arrange for its process to go too, rather than sit
         // in WebKit's cache holding most of what the page used.
         self.end_on_close(index);
+        // Its picture, if a GPU buffer, retires like a replaced frame.
+        self.unshow_gpu_frame(self.tabs[index].view);
         // Dropping the Tab unrefs the webview and frees its registry image.
         drop(self.tabs.remove(index));
         if self.tabs.is_empty() {
@@ -1129,6 +1145,7 @@ impl WebKitHost {
                 url,
                 loading,
                 image: None,
+                image_gpu: false,
                 mirror: None,
                 opener,
             });
@@ -1250,6 +1267,9 @@ impl WebKitHost {
         if let Some(p) = &self.poll {
             p.drain();
         }
+        if frame_debug() {
+            self.pending.borrow_mut().counts.pumps += 1;
+        }
         // `cce://cookies/clear` runs on WebKit's fetch path and cannot reach
         // the session from there, so it sets the flag and this acts on it —
         // the same relay `ServoHost::pump` uses. Timespan 0 clears them all.
@@ -1279,6 +1299,7 @@ impl WebKitHost {
         self.watch_deadlock();
         self.sleep_idle_tabs();
         self.end_closed();
+        self.retire_gpu_frames();
         // Nothing has drawn the last frame yet, so reading another would be
         // copying over a picture that was never shown. Leave the buffer held
         // until the draw. (Its view is waiting on `rendered` meanwhile, so it
@@ -1305,6 +1326,23 @@ impl WebKitHost {
             }
             return (false, dirty);
         };
+        if unsafe { gpu::is_dmabuf(buffer) } {
+            // A GPU buffer: drawn where it is, handed back once nothing
+            // draws it any more (`gpu.rs`). Paced exactly as below.
+            let taken = unsafe { self.take_gpu_frame(index, view, buffer) };
+            unsafe {
+                wpe_view_buffer_rendered(view, buffer);
+                if !taken {
+                    wpe_view_buffer_released(view, buffer);
+                }
+            }
+            self.note_frame_read(taken.then_some((0, false)), true);
+            if !taken || index != self.active {
+                return (false, true);
+            }
+            self.pending_draw.set(true);
+            return (true, true);
+        }
         let read = unsafe {
             let read = self.read_frame(index, buffer, damage);
             // Read now and drawn at the next frame: as good as on screen, so
@@ -1319,9 +1357,21 @@ impl WebKitHost {
             wpe_view_buffer_released(view, buffer);
             read
         };
+        self.note_frame_read(read, false);
+        if read.is_none() || index != self.active {
+            return (false, true);
+        }
+        self.pending_draw.set(true);
+        (true, true)
+    }
+
+    /// Count a frame taken, and once a second say what the engine produced
+    /// against what was read (`CCE_BROWSER_FRAME_DEBUG`).
+    fn note_frame_read(&self, read: Option<(usize, bool)>, gpu: bool) {
         if frame_debug() {
             let mut p = self.pending.borrow_mut();
             p.counts.read += 1;
+            p.counts.gpu += (gpu && read.is_some()) as u64;
             if let Some((bytes, partial)) = read {
                 p.counts.bytes += bytes as u64;
                 p.counts.partial += partial as u64;
@@ -1333,20 +1383,19 @@ impl WebKitHost {
                 let c = std::mem::take(&mut p.counts);
                 log::info!(
                     "frames: engine produced {}, read back {} ({} handed back unread), \
-                     {} of them only their damage; {:.1} MB copied",
+                     {} of them only their damage, {} GPU buffers drawn in place; {:.1} MB copied; \
+                     {} pumps, {} draws",
                     c.produced,
                     c.read,
                     c.produced.saturating_sub(c.read),
                     c.partial,
-                    c.bytes as f64 / 1e6
+                    c.gpu,
+                    c.bytes as f64 / 1e6,
+                    c.pumps,
+                    c.draws
                 );
             }
         }
-        if read.is_none() || index != self.active {
-            return (false, true);
-        }
-        self.pending_draw.set(true);
-        (true, true)
     }
 
     /// Copy a finished frame into tab `index`'s image: only the damaged
@@ -1366,6 +1415,12 @@ impl WebKitHost {
         // to serve a three-byte question cost 7 ms of every frame.
         let p0 = std::slice::from_raw_parts(shm.data, 4);
         self.last_pixel = Some((p0[2], p0[1], p0[0]));
+        if self.tabs[index].image_gpu {
+            // Frames come this way now: the GPU picture is not ours to write.
+            self.unshow_gpu_frame(self.tabs[index].view);
+            self.tabs[index].image = None;
+            self.tabs[index].image_gpu = false;
+        }
         let tab = &mut self.tabs[index];
         // Regions only make sense against the picture they change: this
         // tab's image, at this size. No damage at all means nothing changed.
@@ -1428,6 +1483,7 @@ impl WebKitHost {
     /// A buffer still held from the old session is deliberately kept: its
     /// pixels are fine, and the next `pump` uploads them under a fresh id.
     pub fn renderer_replaced(&mut self) {
+        self.reset_gpu_frames();
         for tab in &mut self.tabs {
             if let Some((id, ..)) = tab.image.take() {
                 // A free for an id the new renderer never had is a no-op, and
@@ -1463,6 +1519,11 @@ impl WebKitHost {
     /// second frame.
     pub fn frame_drawn(&self) -> bool {
         self.pending_draw.set(false);
+        if frame_debug() {
+            self.pending.borrow_mut().counts.draws += 1;
+        }
+        // A draw is when frames finish and releases run (`gpu.rs`).
+        self.retire_gpu_frames();
         self.pending.borrow().held.is_some()
     }
 
