@@ -12,7 +12,10 @@
 //!   awake — and untouched choices are not taken for edits;
 //! * a popup and its opener sleep only together: not while the opener is
 //!   shown, both once neither is;
-//! * a hidden page's 10 ms timer runs about once a second.
+//! * a hidden page's 10 ms timer runs about once a second;
+//! * closing a tab stops its process once its page has unloaded — the
+//!   page's `pagehide` beacon still goes out — but closing a popup leaves
+//!   the opener it shares a process with alone.
 //!
 //! `cargo run --release -p cce-browser --example wpe_sleep`
 
@@ -63,6 +66,10 @@ fn page(path: &str) -> String {
         "/opener" => "<!doctype html><title>opener</title><p style='height:2000px'>press\
                       <script>addEventListener('mousedown', () => window.open('/c'), {once: true})</script>"
             .into(),
+        // Says goodbye on its way out.
+        "/leaving" => "<!doctype html><title>leaving</title>\
+                       <script>addEventListener('pagehide', () => navigator.sendBeacon('/beacon'))</script>"
+            .into(),
         // Counts its timer's runs in the title.
         "/timer" => "<!doctype html><title>n0</title>\
                      <script>let n = 0; setInterval(() => { document.title = 'n' + ++n }, 10)</script>"
@@ -70,6 +77,10 @@ fn page(path: &str) -> String {
         p => format!("<!doctype html><title>{}</title><p>{p}", p.trim_start_matches('/')),
     }
 }
+
+/// The `/leaving` page's beacon arrived.
+#[cfg(feature = "wpe")]
+static BEACON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "wpe")]
 fn serve() -> u16 {
@@ -83,6 +94,9 @@ fn serve() -> u16 {
             let n = s.read(&mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
             let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+            if path == "/beacon" {
+                BEACON.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let body = page(&path);
             let _ = write!(
                 s,
@@ -273,6 +287,37 @@ fn main() {
     settle(&mut host, 1000);
     let runs = count(&host) - before;
     check("and freely once shown", runs >= 30, format!("{runs} runs in 1 s"));
+
+    // Closing. A tab of its own: the prewarmed spare becomes it and a new
+    // spare is built, so closing it should bring the count back to before.
+    let before = web_processes().len();
+    host.open_tab(url("/leaving"));
+    settle(&mut host, 1500);
+    host.close_tab(host.tab_count() - 1);
+    settle(&mut host, 2500);
+    let after = web_processes().len();
+    check("closing a tab stops its process", after == before, format!("{before} -> {after} processes"));
+    check("after its page has said goodbye", BEACON.load(std::sync::atomic::Ordering::SeqCst), String::new());
+    // A popup shares its opener's process: closing it must not take the
+    // opener down.
+    host.open_tab(url("/opener"));
+    settle(&mut host, 1500);
+    let opener = host.tab_count() - 1;
+    host.mouse_move(100.0, 100.0);
+    host.mouse_button_ui(MouseButton::Left, true, 100.0, 100.0);
+    host.mouse_button_ui(MouseButton::Left, false, 100.0, 100.0);
+    settle(&mut host, 1000);
+    let popup = host.adopt_popups();
+    settle(&mut host, 1000);
+    if let Some(p) = popup {
+        host.close_tab(p);
+    }
+    settle(&mut host, 2500);
+    check(
+        "closing a popup leaves its opener running",
+        popup.is_some() && title(&host, opener) == "opener" && !asleep(&host, opener),
+        title(&host, opener),
+    );
 
     println!("\n{}", if ok { "all OK" } else { "FAILED" });
     std::process::exit(if ok { 0 } else { 1 });

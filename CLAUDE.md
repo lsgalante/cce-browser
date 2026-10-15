@@ -377,6 +377,16 @@ prompted it. Points that are choices:
 - **The sweep runs on a GLib timer** (`set_sleep_after`), every minute at
   most, since an idle browser turns no loop: a tab sleeps between one and two
   minutes after its limit.
+- **A closed tab's process is stopped too** (`end_on_close`), once its page
+  has unloaded: `about:blank` is loaded into the closing webview (same site,
+  no swap), and `end_closed` terminates the process when that has finished
+  (or after `CLOSE_GRACE`), then lets the webview go. Dropped straight away
+  the process went to WebKit's cache; terminated straight away, the page
+  never got its `pagehide` (its `sendBeacon` was lost — measured). Not for a
+  tab in a `window.open` group: closing a sign-in popup that way showed its
+  opener the crash page. What this cannot reach is the process still holding
+  one of the tab's *earlier* pages for Back; WebKit parks those in its cache
+  when the webview goes, with no API handle on them.
 - **An agent's tool wakes a sleeper and waits for its load** (`Op::Wake`, in
   `Agent::op` before any script, snapshot or input); `navigate` just marks it
   awake, since it loads anyway. Any agent op on a tab restarts its clock.

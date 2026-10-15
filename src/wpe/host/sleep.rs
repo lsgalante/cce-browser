@@ -20,6 +20,12 @@
 //! Such a group sleeps only together, once every tab in it may.
 //!
 //! The sweep runs on a GLib timer, since an idle browser turns no loop.
+//!
+//! A tab being **closed** has its process stopped the same way
+//! (`end_on_close`), once its page has unloaded. What that cannot reach is
+//! a process holding one of the tab's earlier pages for Back: WebKit parks
+//! those in its cache when the webview goes, and the API has no handle on
+//! them.
 
 use super::*;
 
@@ -81,6 +87,17 @@ pub enum Probe {
     Clean,
     Edited,
 }
+
+/// A closed tab's webview, held until its page has unloaded: `about:blank`
+/// was loaded into it, so the page had its `pagehide` and `unload`.
+pub struct Closing {
+    webview: *mut WebKitWebView,
+    since: std::time::Instant,
+}
+
+/// How long a closing page may take over its unload before its process is
+/// stopped anyway.
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Tab {
     /// Out of sight with no web process; showing it loads it again.
@@ -184,6 +201,49 @@ impl WebKitHost {
         }
         t.state.probe.set(Probe::None);
         t.state.asleep.replace(false)
+    }
+
+    /// Tab `index` is closing: unless it shares its process with another
+    /// tab (`opener_groups`), take its process down with it — after its page
+    /// has unloaded. Dropped as it was, the webview's process went to
+    /// WebKit's cache holding most of what the page used; stopped at once,
+    /// the page never heard it was closing (its `pagehide` beacon was lost).
+    /// So `about:blank` goes into it first — the same site, no process swap
+    /// — and `end_closed` stops the process once that has loaded.
+    pub(super) fn end_on_close(&mut self, index: usize) {
+        let alone = self.opener_groups().iter().any(|g| g.len() == 1 && g[0] == index);
+        let t = &self.tabs[index];
+        // Asleep already has no process to stop.
+        if !alone || t.state.asleep.get() {
+            return;
+        }
+        // Its termination is not a crash, should anything still look.
+        t.state.asleep.set(true);
+        unsafe {
+            wpe_view_unmap(t.view);
+            wpe_view_set_visible(t.view, 0);
+            g_object_ref(t.webview as *mut _);
+            let blank = cstr("about:blank");
+            webkit_web_view_load_uri(t.webview, blank.as_ptr());
+        }
+        self.closing.push(Closing { webview: t.webview, since: std::time::Instant::now() });
+    }
+
+    /// Stop the processes of closed tabs whose pages have unloaded, and let
+    /// their webviews go.
+    pub(super) fn end_closed(&mut self) {
+        self.closing.retain(|c| unsafe {
+            // Unloaded once `about:blank` has committed and finished; "not
+            // loading" alone would also be true before it had begun.
+            let blank = from_cstr(webkit_web_view_get_uri(c.webview)).as_deref() == Some("about:blank");
+            let unloaded = blank && webkit_web_view_is_loading(c.webview) == 0;
+            if !unloaded && c.since.elapsed() < CLOSE_GRACE {
+                return true;
+            }
+            webkit_web_view_terminate_web_process(c.webview);
+            g_object_unref(c.webview as *mut _);
+            false
+        });
     }
 
     /// Look the tabs over and put to sleep what may sleep. Called from every

@@ -457,6 +457,9 @@ pub struct WebKitHost {
     last_sleep_sweep: Option<std::time::Instant>,
     /// The GLib source that turns the loop for those sweeps.
     sleep_timer: Option<u32>,
+    /// Closed tabs' webviews, kept until their page has heard it is going
+    /// and their process can be stopped (`sleep.rs`, `end_closed`).
+    closing: Vec<sleep::Closing>,
 }
 
 unsafe fn cstr(s: &str) -> CString {
@@ -660,6 +663,7 @@ impl WebKitHost {
                 sleep_after: None,
                 last_sleep_sweep: None,
                 sleep_timer: None,
+                closing: Vec::new(),
             };
             // The account watcher's channel, in its own script world. Both
             // halves are registered here, once, on the shared content
@@ -1073,6 +1077,9 @@ impl WebKitHost {
         // be destroyed; hand it back while it is still safe to. Losing that
         // frame costs a repaint, which the tab change causes anyway.
         self.release_held();
+        // Before it goes: arrange for its process to go too, rather than sit
+        // in WebKit's cache holding most of what the page used.
+        self.end_on_close(index);
         // Dropping the Tab unrefs the webview and frees its registry image.
         drop(self.tabs.remove(index));
         if self.tabs.is_empty() {
@@ -1271,6 +1278,7 @@ impl WebKitHost {
         }
         self.watch_deadlock();
         self.sleep_idle_tabs();
+        self.end_closed();
         // Nothing has drawn the last frame yet, so reading another would be
         // copying over a picture that was never shown. Leave the buffer held
         // until the draw. (Its view is waiting on `rendered` meanwhile, so it
