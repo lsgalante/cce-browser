@@ -219,10 +219,36 @@ Frames arrive as `WPEBufferSHM`, ARGB8888, stride `width * 4`, B,G,R,A in memory
 precisely what the registry already accepts.
 
 Phase 2 — dmabuf imported as a Vulkan image via `VK_EXT_external_memory_dma_buf`,
-skipping the CPU roundtrip — remains available and unstarted. It needs a **new
-`cce-ui` API** (the registry only accepts `Vec<u8>`), and `cce-ui` is a **shared
-crate**: check `git status` there and coordinate before touching it. It is an
-optimisation, not a correctness fix; the port works without it.
+skipping the CPU roundtrip — is not built yet. It needs a **new `cce-ui` API**
+(the registry only accepts `Vec<u8>`), and `cce-ui` is a **shared crate**: check
+`git status` there and coordinate before touching it.
+
+**It is measured, and it is the largest cost left** (`examples/wpe_dmabuf_cost.rs`,
+2026-10-15). On the SHM path WebKit composites the whole frame and reads it back
+into the mappable buffer *every frame*, whatever the damage — so a visible page's
+cheapest animation costs in proportion to the window: a 24px CSS spinner at 60 Hz
+took the web process 7.6% of a core at 1200x800, 19.4% at 2400x1600 and 37.2% at
+3600x2200. Rendering into DMABufs it was flat, 1.6-1.8%, at every size. Our own
+damage-only copy and upload come on top of the SHM figure, and go too.
+(`UseDamagingInformationForCompositing` does not help the SHM path: measured, no
+change.) What the experiment established for the real thing:
+
+- **WebKit needs a DRM device** — on the display (`get_drm_device`) and on the
+  format group — or it ignores a DMABuf offer and quietly stays on SHM. The
+  Intel GPU is `card1` / `renderD128` here, the device cce-ui's Vulkan uses.
+- Offered Intel's tiled modifiers and linear, it **picked Y-tiled XR24**
+  (`0x0100000000000002`). The real format list should be what Vulkan can
+  sample (`vkGetPhysicalDeviceFormatProperties2` with the DRM modifier list).
+- **Pacing carries over unchanged**: hold the buffer, say `rendered` +
+  `released` at the draw. Today's host drops a non-SHM frame unread *and
+  unpaced*, which let the engine run at 420 frames/s.
+- The Iris Xe driver has every extension the import needs:
+  `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier`,
+  `VK_EXT_queue_family_foreign`, `VK_KHR_external_semaphore_fd`. The open
+  questions are sync (WebKit's render must be finished before the chrome
+  samples it: the dma-buf's implicit fence, exported as a sync_file into a
+  semaphore) and lifetime (a buffer goes back only once the GPU is done
+  drawing it).
 
 ## Bindings: hand-rolled, like wlroots
 
