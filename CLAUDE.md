@@ -30,7 +30,7 @@ Nineteen files under `src/`, ~17.6k lines. The ones that carry the design:
 | `src/accounts.rs` | accounts from cce-secrets: the Secret Service worker, which entries a host earns, saving a new login, and the never-save list |
 | `src/wpe/mod.rs` | the WPE backend's entry: `WebKitHost` (`host.rs`), and the embedding itself re-exported from the cce-wpe crate it shares with cce-mail — the bindings, WPEPlatform subclasses, GLib source, input, frame `damage` and the input-method context (`ime`) |
 | `src/wpe/formwatch.rs` | the page half of account autocomplete: the watcher every frame runs (fields, frame-offset relay, fill asks, sign-in capture) and the events it sends |
-| `src/agent.rs` | agent control over MCP (`127.0.0.1:3005`): the tools, a thread per call running its steps, the steps done on the loop |
+| `src/agent.rs` | agent control over MCP (`127.0.0.1:3005`, filed in cce-ui's MCP registry): `server()` classes each tool (input, forms, dialogs and script are Outward, so the cce-claude popup asks every time), the brief, companion cce-notes, `context` (the shown tab and the tab list); the tools, a thread per call running its steps, the steps done on the loop |
 | `src/agent/page.js` | the page half of the agent tools: the accessibility-style tree and its `ref_N` handles, find, text, form input — in a private script world |
 | `src/wpe/host/agent.rs` | the engine half: script that answers, snapshots, and input aimed at any tab by id, the background ones included |
 | `src/raindrop/` | bookmark sync with Raindrop.io's Unsorted: the three-way merge (`mod.rs`), the REST client (`api.rs`), the worker and status line (`sync.rs`) — design in RAINDROP-SYNC.md |
