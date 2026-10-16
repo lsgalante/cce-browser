@@ -991,7 +991,7 @@ dependencies = [
  "base64",
  "calloop",
  "cce-core",
- "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=f43befa06cc91e99ca4494ca59c08531f2cc6053)",
+ "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=81f5253dca43d2f1d0f15a9cda93a04541036e37)",
  "cce-wpe",
  "dpi",
  "env_logger",
@@ -1027,9 +1027,10 @@ dependencies = [
 [[package]]
 name = "cce-ui"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=da044adbcbe32e2443e9626e15cf998b73c7c833#da044adbcbe32e2443e9626e15cf998b73c7c833"
+source = "git+https://github.com/lsgalante/cce-ui.git?rev=81f5253dca43d2f1d0f15a9cda93a04541036e37#81f5253dca43d2f1d0f15a9cda93a04541036e37"
 dependencies = [
  "accesskit 0.25.1",
+ "accesskit_unix",
  "ash",
  "bitflags 2.13.1",
  "bytemuck",
@@ -1071,10 +1072,9 @@ dependencies = [
 [[package]]
 name = "cce-ui"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=f43befa06cc91e99ca4494ca59c08531f2cc6053#f43befa06cc91e99ca4494ca59c08531f2cc6053"
+source = "git+https://github.com/lsgalante/cce-ui.git?rev=da044adbcbe32e2443e9626e15cf998b73c7c833#da044adbcbe32e2443e9626e15cf998b73c7c833"
 dependencies = [
  "accesskit 0.25.1",
- "accesskit_unix",
  "ash",
  "bitflags 2.13.1",
  "bytemuck",
