@@ -15,6 +15,7 @@ mod agent;
 mod downloads;
 mod instance;
 mod pages;
+mod portal_scheme;
 mod raindrop;
 mod session;
 mod settings;
@@ -1132,6 +1133,9 @@ pub enum Message {
     /// One step of an agent tool call, done on this loop.
     #[cfg(feature = "wpe")]
     AgentOp(agent::Op, agent::Reply),
+    /// The desktop's color scheme, from the Settings portal
+    /// (`portal_scheme.rs`): whether it prefers dark.
+    SystemScheme(bool),
 }
 
 struct BrowserApp {
@@ -1142,6 +1146,9 @@ struct BrowserApp {
     seen_renderer: bool,
     /// Loaded from the app config; re-read when the window regains focus.
     settings: settings::Settings,
+    /// The desktop's preference, last heard from the Settings portal: what
+    /// a `System` color scheme reports to pages.
+    system_dark: bool,
     win: (f32, f32),
     scale: f64,
     pointer: (f32, f32),
@@ -3001,7 +3008,7 @@ impl BrowserApp {
             self.raindrop_started = true;
         }
         self.host.set_history_enabled(new.history);
-        self.host.set_color_scheme_dark(new.color_scheme.is_dark());
+        self.host.set_color_scheme_dark(new.color_scheme.is_dark(self.system_dark));
         self.host.set_force_dark(new.color_scheme.forces_dark());
         #[cfg(feature = "wpe")]
         self.host.set_sleep_after(new.sleep_after());
@@ -4581,7 +4588,10 @@ impl Application for BrowserApp {
             .filter(|s| s != "about:blank")
             .unwrap_or_default();
         host.set_history_enabled(settings.history);
-        host.set_color_scheme_dark(settings.color_scheme.is_dark());
+        host.set_color_scheme_dark(settings.color_scheme.is_dark(portal_scheme::FALLBACK_DARK));
+        // The portal's answer arrives as Message::SystemScheme; until then a
+        // System scheme reports the fallback.
+        portal_scheme::spawn(sender.clone());
         #[cfg(feature = "wpe")]
         host.set_force_dark(settings.color_scheme.forces_dark());
         #[cfg(feature = "wpe")]
@@ -4609,6 +4619,7 @@ impl Application for BrowserApp {
             host,
             seen_renderer: false,
             settings,
+            system_dark: portal_scheme::FALLBACK_DARK,
             win: (1200.0, 800.0),
             scale: 1.0,
             pointer: (0.0, 0.0),
@@ -4944,6 +4955,14 @@ impl Application for BrowserApp {
                 }
             }
             Message::Quit => *exit = true,
+            Message::SystemScheme(dark) => {
+                if dark != self.system_dark {
+                    self.system_dark = dark;
+                    if self.settings.color_scheme == settings::ColorScheme::System {
+                        self.host.set_color_scheme_dark(dark);
+                    }
+                }
+            }
             Message::OpenExternal(arg) => {
                 match arg {
                     Some(arg) => {

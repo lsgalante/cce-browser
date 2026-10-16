@@ -58,7 +58,11 @@ impl TabLine {
 /// a signal, not a filter over their colors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorScheme {
+    /// Whatever the desktop prefers: the Settings portal's `color-scheme`
+    /// (`portal_scheme.rs`), which the system-interface Appearance page sets
+    /// for every app at once.
     #[default]
+    System,
     Dark,
     Light,
     /// Dark by force: a user stylesheet inverts the page, for sites that
@@ -67,41 +71,34 @@ pub enum ColorScheme {
 }
 
 impl ColorScheme {
-    /// Config keys as written by the system-interface Browser page.
+    /// Config keys as written by the system-interface Browser page. An
+    /// absent or unknown key follows the system.
     fn from_key(key: &str) -> Self {
         match key {
+            "dark" => Self::Dark,
             "light" => Self::Light,
             "force-dark" => Self::ForceDark,
-            _ => Self::Dark,
+            _ => Self::System,
         }
     }
 
-    /// What to report for `prefers-color-scheme`, backend-neutrally.
+    /// What to report for `prefers-color-scheme`, backend-neutrally, given
+    /// what the desktop currently prefers.
     ///
     /// Force-dark reports **light** on purpose: the filter inverts
     /// unconditionally, so a site with a real dark theme would be handed an
     /// already-dark page and inverted back into a light one.
-    pub fn is_dark(self) -> bool {
-        matches!(self, Self::Dark)
+    pub fn is_dark(self, system_dark: bool) -> bool {
+        match self {
+            Self::System => system_dark,
+            Self::Dark => true,
+            Self::Light | Self::ForceDark => false,
+        }
     }
 
     /// Whether the inverting user stylesheet is installed.
     pub fn forces_dark(self) -> bool {
         matches!(self, Self::ForceDark)
-    }
-}
-
-#[cfg(feature = "servo")]
-impl From<ColorScheme> for servo::Theme {
-    fn from(scheme: ColorScheme) -> Self {
-        match scheme {
-            ColorScheme::Dark => servo::Theme::Dark,
-            // Force-dark inverts unconditionally, so pages have to render
-            // their LIGHT theme underneath: reporting dark to a site that
-            // has one would hand the filter an already-dark page and invert
-            // it back into a light one.
-            ColorScheme::Light | ColorScheme::ForceDark => servo::Theme::Light,
-        }
     }
 }
 
@@ -156,7 +153,7 @@ impl Default for Settings {
             agent: true,
             bar_position: BarPosition::Top,
             tab_line: TabLine::Switching,
-            color_scheme: ColorScheme::Dark,
+            color_scheme: ColorScheme::System,
             sleep_tabs_after: DEFAULT_SLEEP_TABS_AFTER,
             external_browser: None,
         }
@@ -216,7 +213,7 @@ pub fn load() -> Settings {
         agent: b["agent"].as_bool().unwrap_or(true),
         bar_position: BarPosition::from_key(b["bar-position"].as_str().unwrap_or("top")),
         tab_line: TabLine::from_key(b["tab-line"].as_str().unwrap_or("switching")),
-        color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("dark")),
+        color_scheme: ColorScheme::from_key(b["color-scheme"].as_str().unwrap_or("system")),
         sleep_tabs_after: b["sleep-tabs-after"]
             .as_u64()
             .map_or(DEFAULT_SLEEP_TABS_AFTER, |m| m.min(u32::MAX as u64) as u32),
@@ -225,5 +222,32 @@ pub fn load() -> Settings {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config that never chose a scheme follows the desktop; the explicit
+    /// keys the system-interface Browser page writes still override it.
+    #[test]
+    fn color_scheme_keys_and_the_system_default() {
+        assert_eq!(ColorScheme::from_key("system"), ColorScheme::System);
+        assert_eq!(ColorScheme::from_key(""), ColorScheme::System);
+        assert_eq!(ColorScheme::from_key("dark"), ColorScheme::Dark);
+        assert_eq!(ColorScheme::from_key("light"), ColorScheme::Light);
+        assert_eq!(ColorScheme::from_key("force-dark"), ColorScheme::ForceDark);
+        assert_eq!(Settings::default().color_scheme, ColorScheme::System);
+    }
+
+    #[test]
+    fn only_system_listens_to_the_desktop() {
+        for system_dark in [true, false] {
+            assert_eq!(ColorScheme::System.is_dark(system_dark), system_dark);
+            assert!(ColorScheme::Dark.is_dark(system_dark));
+            assert!(!ColorScheme::Light.is_dark(system_dark));
+            assert!(!ColorScheme::ForceDark.is_dark(system_dark), "force-dark inverts a light page");
+        }
     }
 }
