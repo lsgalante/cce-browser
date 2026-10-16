@@ -3261,19 +3261,28 @@ impl BrowserApp {
     }
 
     /// Widest prefix of `text` fitting `avail`, with a "…"-style tail cut.
+    ///
+    /// A measurement is not arithmetic — `measure_text_width` renders the run
+    /// and finds its ink — so this bisects over the cuts instead of trying
+    /// one per character, and never measures more than could be on screen.
+    /// Cutting a character at a time, an untitled tab's 15,000-character
+    /// OAuth URL (`tab_title` falls back to the URL) held the main thread
+    /// for six minutes, each pass rendering a pixmap tens of MB wide
+    /// (2026-10-16).
     fn fit_text(text: &str, sans: &str, size: f32, avail: f32) -> String {
-        if measure_text_width(text, sans, size) <= avail {
+        // No glyph is narrower than a tenth of an em, so a character past
+        // this many cannot be on screen.
+        let visible = (avail.max(0.0) / (0.1 * size).max(0.5)).ceil() as usize;
+        let ends: Vec<usize> = text.char_indices().map(|(i, _)| i).take(visible.saturating_add(1)).collect();
+        if ends.len() <= visible && measure_text_width(text, sans, size) <= avail {
             return text.to_string();
         }
-        let mut end = text.len();
-        while end > 0 {
-            end = cce_ui::widget::line_edit::prev_boundary(text, end);
-            let cut = format!("{}...", &text[..end]);
-            if measure_text_width(&cut, sans, size) <= avail {
-                return cut;
-            }
+        // A longer prefix is never narrower, so the cuts that fit come first.
+        let cut = |end: usize| format!("{}...", &text[..end]);
+        match ends.partition_point(|&end| measure_text_width(&cut(end), sans, size) <= avail) {
+            0 => String::new(),
+            n => cut(ends[n - 1]),
         }
-        String::new()
     }
 
     /// A cce-icons glyph `size` px square, centred in `r` and tinted
@@ -6491,6 +6500,31 @@ mod tests {
         m.filter();
         m.step(1, 3);
         assert_eq!(m.selected, 0);
+    }
+
+    #[test]
+    fn a_label_cut_from_a_huge_url_is_quick_and_matches_a_cut_a_character_at_a_time() {
+        let fits = |s: &str, avail: f32| measure_text_width(s, "Noto Sans", 14.0) <= avail;
+        // The consent URL that froze the browser was ~15,000 characters; cut
+        // a character at a time it took six minutes.
+        let url = format!("https://dash.cloudflare.com/oauth/consent-form?consent_challenge={}", "Tg4qUnct".repeat(1900));
+        let start = std::time::Instant::now();
+        let label = BrowserApp::fit_text(&format!("11: {url}"), "Noto Sans", 14.0, 180.0);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5), "took {:?}", start.elapsed());
+        assert!(label.starts_with("11: https://") && label.ends_with("..."), "{label}");
+        assert!(fits(&label, 180.0));
+
+        // An ordinary title: the same cut the old linear search made.
+        let title = "Authorize Claude Code | Cloudflare — Consent Application";
+        let linear = (0..title.len())
+            .rev()
+            .filter(|&e| title.is_char_boundary(e))
+            .map(|e| format!("{}...", &title[..e]))
+            .find(|cut| fits(cut, 120.0))
+            .unwrap_or_default();
+        assert_eq!(BrowserApp::fit_text(title, "Noto Sans", 14.0, 120.0), linear);
+        assert_eq!(BrowserApp::fit_text("Muji", "Noto Sans", 14.0, 120.0), "Muji");
+        assert_eq!(BrowserApp::fit_text(title, "Noto Sans", 14.0, 0.0), "");
     }
 
     #[test]
