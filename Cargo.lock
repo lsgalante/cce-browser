@@ -991,7 +991,7 @@ dependencies = [
  "base64",
  "calloop",
  "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=cfe7a9307866896bdd1dd4319c44a6cb6f33db21)",
- "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=dc5eee9ae67076a9945e1edd8ffc82714987f1ef)",
+ "cce-ui 0.1.0 (git+https://github.com/lsgalante/cce-ui.git?rev=bfafde060f994e35e7c1fcd5ae177125f6bcaa99)",
  "cce-wpe",
  "dpi",
  "env_logger",
@@ -1041,15 +1041,16 @@ dependencies = [
 [[package]]
 name = "cce-ui"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=da044adbcbe32e2443e9626e15cf998b73c7c833#da044adbcbe32e2443e9626e15cf998b73c7c833"
+source = "git+https://github.com/lsgalante/cce-ui.git?rev=bfafde060f994e35e7c1fcd5ae177125f6bcaa99#bfafde060f994e35e7c1fcd5ae177125f6bcaa99"
 dependencies = [
  "accesskit 0.25.1",
+ "accesskit_unix",
  "ash",
  "bitflags 2.13.1",
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=33bc46f1cbede6cda770683932c626667805d326)",
+ "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=cfe7a9307866896bdd1dd4319c44a6cb6f33db21)",
  "chrono",
  "cosmic-text",
  "cursor-icon",
@@ -1085,16 +1086,15 @@ dependencies = [
 [[package]]
 name = "cce-ui"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=dc5eee9ae67076a9945e1edd8ffc82714987f1ef#dc5eee9ae67076a9945e1edd8ffc82714987f1ef"
+source = "git+https://github.com/lsgalante/cce-ui.git?rev=da044adbcbe32e2443e9626e15cf998b73c7c833#da044adbcbe32e2443e9626e15cf998b73c7c833"
 dependencies = [
  "accesskit 0.25.1",
- "accesskit_unix",
  "ash",
  "bitflags 2.13.1",
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=cfe7a9307866896bdd1dd4319c44a6cb6f33db21)",
+ "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=33bc46f1cbede6cda770683932c626667805d326)",
  "chrono",
  "cosmic-text",
  "cursor-icon",
